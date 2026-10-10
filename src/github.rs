@@ -1,0 +1,492 @@
+use crate::config::{AppConfig, SourceConfig};
+use crate::downloader::Downloader;
+use crate::error::AppError;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+
+const MAX_PAGES: i64 = 10;
+
+#[derive(Debug, Clone)]
+pub struct GhAsset {
+    pub name: String,
+    pub size: i64,
+    pub browser_download_url: String,
+    pub api_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhRelease {
+    pub tag: String,
+    pub prerelease: bool,
+    pub draft: bool,
+    pub body: String,
+    pub published_at: Option<DateTime<Utc>>,
+    pub assets: Vec<GhAsset>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhRun {
+    // The id is part of the API shape but not needed by the orchestration.
+    #[allow(dead_code)]
+    pub id: i64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: String,
+    pub run_number: i64,
+    pub created_at: Option<DateTime<Utc>>,
+    pub artifacts_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhArtifact {
+    // The id is part of the API shape but not needed by the orchestration.
+    #[allow(dead_code)]
+    pub id: i64,
+    pub name: String,
+    pub size: i64,
+    pub archive_download_url: String,
+    pub expired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetJson {
+    #[serde(default, deserialize_with = "null_string")]
+    name: String,
+    #[serde(default, deserialize_with = "null_i64")]
+    size: i64,
+    #[serde(default, deserialize_with = "null_string", rename = "browser_download_url")]
+    browser_download_url: String,
+    #[serde(default, deserialize_with = "null_string", rename = "url")]
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseJson {
+    #[serde(default, deserialize_with = "null_string", rename = "tag_name")]
+    tag_name: String,
+    #[serde(default, deserialize_with = "null_bool")]
+    prerelease: bool,
+    #[serde(default, deserialize_with = "null_bool")]
+    draft: bool,
+    #[serde(default, deserialize_with = "null_string")]
+    body: String,
+    #[serde(default, rename = "published_at")]
+    published_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    assets: Vec<AssetJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunsJson {
+    #[serde(default, rename = "workflow_runs")]
+    workflow_runs: Vec<RunJson>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RunJson {
+    #[serde(default, deserialize_with = "null_i64")]
+    id: i64,
+    #[serde(default, deserialize_with = "null_string")]
+    name: String,
+    #[serde(default, deserialize_with = "null_string")]
+    status: String,
+    #[serde(default, deserialize_with = "null_string")]
+    conclusion: String,
+    #[serde(default, deserialize_with = "null_i64", rename = "run_number")]
+    run_number: i64,
+    #[serde(default, rename = "created_at")]
+    created_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "null_string", rename = "artifacts_url")]
+    artifacts_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactsJson {
+    #[serde(default)]
+    artifacts: Vec<ArtifactJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactJson {
+    #[serde(default, deserialize_with = "null_i64")]
+    id: i64,
+    #[serde(default, deserialize_with = "null_string")]
+    name: String,
+    #[serde(default, deserialize_with = "null_i64", rename = "size_in_bytes")]
+    size_in_bytes: i64,
+    #[serde(default, deserialize_with = "null_string", rename = "archive_download_url")]
+    archive_download_url: String,
+    #[serde(default, deserialize_with = "null_bool")]
+    expired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserJson {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+// The GitHub API emits explicit nulls (e.g. "conclusion": null for
+// in-progress runs, "body": null for notes-less releases). serde's
+// #[serde(default)] only covers *missing* keys, so these helpers map null
+// to "", 0 or false instead of failing the whole batch.
+fn null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+fn null_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
+}
+
+pub async fn get_releases(
+    http: &Downloader,
+    config: &AppConfig,
+    source: &SourceConfig,
+    token: Option<&str>,
+    per_page: i64,
+) -> Result<Vec<GhRelease>, AppError> {
+    let wants_all = source.tag.trim().eq_ignore_ascii_case("all");
+    let mut releases = Vec::new();
+    for page in 1.. {
+        let batch = get_release_page(http, config, source, token, per_page, page).await?;
+        let full = batch.len() as i64 >= per_page;
+        releases.extend(batch);
+        if !wants_all || !full || page >= MAX_PAGES {
+            break;
+        }
+    }
+    Ok(releases)
+}
+
+async fn get_release_page(
+    http: &Downloader,
+    config: &AppConfig,
+    source: &SourceConfig,
+    token: Option<&str>,
+    per_page: i64,
+    page: i64,
+) -> Result<Vec<GhRelease>, AppError> {
+    let url = format!(
+        "{}/repos/{}/{}/releases?per_page={per_page}&page={page}",
+        config.github_api_url, source.owner, source.repo
+    );
+    let body = http
+        .get_string(&url, token)
+        .await
+        .map_err(|ex| match &ex {
+            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
+                AppError::Auth(format!(
+                    "GitHub rejected the request for {}/{} (HTTP {status}). \
+                     The token is missing, invalid, or lacks the 'repo' scope. Run 'saishin --login' to replace it.",
+                    source.owner, source.repo
+                ))
+            }
+            _ => ex,
+        })?;
+    let parsed: Vec<ReleaseJson> = serde_json::from_str(&body)
+        .map_err(|_| AppError::Download { status: 0, message: format!("Unexpected releases payload from {url}.") })?;
+    Ok(parsed
+        .into_iter()
+        .map(|item| GhRelease {
+            tag: item.tag_name,
+            prerelease: item.prerelease,
+            draft: item.draft,
+            body: item.body,
+            published_at: item.published_at,
+            assets: item
+                .assets
+                .into_iter()
+                .map(|asset| GhAsset {
+                    name: asset.name,
+                    size: asset.size,
+                    browser_download_url: asset.browser_download_url,
+                    api_url: asset.url,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+pub async fn get_runs(
+    http: &Downloader,
+    config: &AppConfig,
+    source: &SourceConfig,
+    token: Option<&str>,
+    per_page: i64,
+    max_runs: i64,
+    filter: impl Fn(&GhRun) -> bool,
+) -> Result<Vec<GhRun>, AppError> {
+    let mut runs = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "{}/repos/{}/{}/actions/runs?per_page={per_page}&page={page}",
+            config.github_api_url, source.owner, source.repo
+        );
+        let batch = get_run_page(http, config, &url, token).await?;
+        let full = batch.len() as i64 >= per_page;
+        runs.extend(batch.into_iter().filter(|run| filter(run)));
+        if !full || runs.len() as i64 >= max_runs {
+            break;
+        }
+    }
+    runs.truncate(max_runs as usize);
+    Ok(runs)
+}
+
+async fn get_run_page(
+    http: &Downloader,
+    config: &AppConfig,
+    url: &str,
+    token: Option<&str>,
+) -> Result<Vec<GhRun>, AppError> {
+    let body = http
+        .get_string(url, token)
+        .await
+        .map_err(|ex| match &ex {
+            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
+                AppError::Auth(format!(
+                    "GitHub rejected the request for {}/repos/.../actions/runs (HTTP {status}). \
+                     The token is missing, invalid, or lacks the 'repo' scope. Run 'saishin --login' to replace it.",
+                    config.github_api_url
+                ))
+            }
+            _ => ex,
+        })?;
+    let parsed: RunsJson = serde_json::from_str(&body)
+        .map_err(|_| AppError::Download { status: 0, message: format!("Unexpected runs payload from {url}.") })?;
+    Ok(parsed.workflow_runs.into_iter().map(convert_run).collect())
+}
+
+/// Maps one raw workflow run to the model. Split out so tests can feed
+/// recorded payloads through the exact production mapping.
+pub(crate) fn convert_run(item: RunJson) -> GhRun {
+    GhRun {
+        id: item.id,
+        name: item.name,
+        status: item.status,
+        conclusion: item.conclusion,
+        run_number: item.run_number,
+        created_at: item.created_at,
+        artifacts_url: item.artifacts_url,
+    }
+}
+
+/// The completed/successful/workflow filter from resolving `actions`
+/// sources. An empty workflow matches every run.
+pub(crate) fn run_matches(run: &GhRun, workflow: &str) -> bool {
+    run.status.eq_ignore_ascii_case("completed")
+        && run.conclusion.eq_ignore_ascii_case("success")
+        && (workflow.is_empty() || crate::glob::matches(&run.name, workflow))
+}
+
+pub async fn get_artifacts(
+    http: &Downloader,
+    run: &GhRun,
+    token: Option<&str>,
+    per_page: i64,
+) -> Result<Vec<GhArtifact>, AppError> {
+    let mut artifacts = Vec::new();
+    for page in 1.. {
+        let url = format!("{}?per_page={per_page}&page={page}", run.artifacts_url);
+        let body = http.get_string(&url, token).await?;
+        let parsed: ArtifactsJson = serde_json::from_str(&body)
+            .map_err(|_| AppError::Download { status: 0, message: format!("Unexpected artifacts payload from {url}.") })?;
+        let full = parsed.artifacts.len() as i64 >= per_page;
+        artifacts.extend(parsed.artifacts.into_iter().map(|item| GhArtifact {
+            id: item.id,
+            name: item.name,
+            size: item.size_in_bytes,
+            archive_download_url: item.archive_download_url,
+            expired: item.expired,
+        }));
+        if !full {
+            break;
+        }
+    }
+    Ok(artifacts)
+}
+
+/// Selects releases by tag: latest stable (falling back to newest), newest
+/// prerelease, everything, or one exact tag.
+pub fn select(releases: &[GhRelease], tag: &str) -> Vec<GhRelease> {
+    let published: Vec<&GhRelease> = releases.iter().filter(|r| !r.draft).collect();
+    if published.is_empty() {
+        return Vec::new();
+    }
+    let selector = tag.trim();
+    if selector.is_empty() || selector.eq_ignore_ascii_case("latest") {
+        let stable = published.iter().find(|r| !r.prerelease);
+        return vec![(*stable.unwrap_or(&published[0])).clone()];
+    }
+    if selector.eq_ignore_ascii_case("prerelease") || selector.eq_ignore_ascii_case("pre") {
+        let pre = published.iter().find(|r| r.prerelease);
+        return vec![(*pre.unwrap_or(&published[0])).clone()];
+    }
+    if selector.eq_ignore_ascii_case("all") {
+        return published.into_iter().cloned().collect();
+    }
+    published
+        .into_iter()
+        .filter(|r| r.tag == selector)
+        .cloned()
+        .collect()
+}
+
+pub async fn validate_token(
+    http: &Downloader,
+    config: &AppConfig,
+    token: &str,
+) -> Result<String, AppError> {
+    let url = format!("{}/user", config.github_api_url);
+    let body = http.get_string(&url, Some(token)).await?;
+    let parsed: UserJson = serde_json::from_str(&body).unwrap_or(UserJson { login: None });
+    Ok(parsed.login.unwrap_or_else(|| "unknown".to_string()))
+}
+
+pub async fn check_repository_access(
+    http: &Downloader,
+    config: &AppConfig,
+    source: &SourceConfig,
+    token: &str,
+) -> Result<(), AppError> {
+    let url = format!(
+        "{}/repos/{}/{}",
+        config.github_api_url, source.owner, source.repo
+    );
+    match http.get_string(&url, Some(token)).await {
+        Ok(_) => Ok(()),
+        Err(AppError::Download { status, .. }) if status == 401 || status == 403 || status == 404 => {
+            Err(AppError::Auth(format!(
+                "The token cannot read {}/{} (HTTP {status}). \
+                 Give the token the 'repo' scope and confirm your account has access to the repository.",
+                source.owner, source.repo
+            )))
+        }
+        Err(ex) => Err(ex),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag: &str, prerelease: bool, draft: bool) -> GhRelease {
+        GhRelease {
+            tag: tag.to_string(),
+            prerelease,
+            draft,
+            body: String::new(),
+            published_at: None,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_mirrors_csharp_tag_rules() {
+        let releases = vec![
+            release("v2-pre", true, false),
+            release("v1", false, false),
+            release("v0-draft", false, true),
+        ];
+        // latest skips drafts and prefers the newest stable release.
+        assert_eq!(select(&releases, "latest").iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(), vec!["v1"]);
+        assert_eq!(select(&releases, "").iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(), vec!["v1"]);
+        // prerelease (or pre) picks the newest prerelease.
+        assert_eq!(select(&releases, "prerelease")[0].tag, "v2-pre");
+        assert_eq!(select(&releases, "pre")[0].tag, "v2-pre");
+        // all returns every non-draft release.
+        assert_eq!(select(&releases, "all").len(), 2);
+        // exact tag matches literally.
+        assert_eq!(select(&releases, "v2-pre").len(), 1);
+        assert!(select(&releases, "nope").is_empty());
+        // No published releases at all.
+        assert!(select(&[release("d", false, true)], "latest").is_empty());
+        assert!(select(&[], "latest").is_empty());
+    }
+
+    #[test]
+    fn parses_real_workflow_runs_payload() {
+        let body = include_str!("../tests/fixtures/runs.json");
+        let parsed: RunsJson = serde_json::from_str(body).expect("runs payload parses");
+        assert_eq!(parsed.workflow_runs.len(), 2);
+        for run in &parsed.workflow_runs {
+            assert!(!run.name.is_empty());
+            assert!(!run.status.is_empty());
+            assert!(run.run_number > 0);
+            assert!(!run.artifacts_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn parses_real_artifacts_payload() {
+        let body = include_str!("../tests/fixtures/artifacts.json");
+        let parsed: ArtifactsJson = serde_json::from_str(body).expect("artifacts payload parses");
+        assert!(!parsed.artifacts.is_empty());
+        for artifact in &parsed.artifacts {
+            assert!(!artifact.name.is_empty());
+            assert!(!artifact.archive_download_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn in_progress_runs_have_null_conclusions() {
+        // Regression test: vpinball/pinmame has in-progress runs whose
+        // "conclusion" is null. Those must be tolerated and filtered
+        // out; the whole batch must still parse.
+        let body = include_str!("../tests/fixtures/pinmame-runs.json");
+        let parsed: RunsJson = serde_json::from_str(body).expect("runs payload parses");
+        assert!(parsed.workflow_runs.len() > 5);
+        let unfinished = parsed
+            .workflow_runs
+            .iter()
+            .filter(|run| run.conclusion.is_empty())
+            .count();
+        assert!(unfinished > 0, "fixture must contain null conclusions");
+    }
+
+    #[test]
+    fn pinmame_fixture_yields_matchable_vpinmame_runs() {
+        // End-to-end through the production mapping + filter with the
+        // workflow from the reported config (workflow = vpinmame).
+        let body = include_str!("../tests/fixtures/pinmame-runs.json");
+        let parsed: RunsJson = serde_json::from_str(body).expect("runs payload parses");
+        let runs: Vec<GhRun> = parsed.workflow_runs.into_iter().map(convert_run).collect();
+        let matched: Vec<&GhRun> = runs
+            .iter()
+            .filter(|run| run_matches(run, "vpinmame"))
+            .collect();
+        assert!(!matched.is_empty(), "vpinmame workflow must match runs");
+        for run in matched {
+            assert!(run.status.eq_ignore_ascii_case("completed"));
+            assert!(run.conclusion.eq_ignore_ascii_case("success"));
+            assert!(!run.artifacts_url.is_empty());
+        }
+    }
+
+        #[test]
+    fn null_body_and_missing_fields_fall_back_to_defaults() {        let parsed: ReleaseJson = serde_json::from_str(
+            r#"{"tag_name": "v1", "body": null, "prerelease": null, "assets": [{"name": "a.zip"}]}"#,
+        )
+        .expect("release payload parses");
+        assert_eq!(parsed.tag_name, "v1");
+        assert!(parsed.body.is_empty());
+        assert!(!parsed.prerelease);
+        assert!(!parsed.draft);
+        assert_eq!(parsed.assets.len(), 1);
+        assert_eq!(parsed.assets[0].size, 0);
+        assert!(parsed.assets[0].browser_download_url.is_empty());
+    }
+}

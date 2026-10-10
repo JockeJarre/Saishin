@@ -1,11 +1,7 @@
 # Saishin
 
-> There is also a Rust port with the same configuration file, options and
-> behaviour under [`rust/`](rust/) (`cargo build --release`). It keeps its
-> own keyring entry — see `rust/README.md` before switching binaries.
-
-A small cross-platform .NET command line tool that keeps files up to date from
-official GitHub releases — or from any other URL — using an INI configuration file.
+A small cross-platform Rust command line tool that keeps files up to date from
+official GitHub releases/actions — or from any other URL — using an INI configuration file.
 
 It runs on **Windows, macOS and Linux** from the same source, downloads release
 assets, and can unpack ZIP archives according to per-source rules.
@@ -35,9 +31,10 @@ including scheduled ones — reuse it without ever prompting again.
 
 ## Requirements
 
-- [.NET SDK 8.0](https://dotnet.microsoft.com/download) or newer.
+- [Rust toolchain](https://rustup.rs/) (stable). Install via `rustup`, then
+  the `cargo` command below just works.
 
-Nothing else. There is no runtime dependency on Mono, on Windows-only APIs, or on
+Nothing else. There is no dependency on Windows-only APIs or on
 platform-specific tooling.
 
 ---
@@ -48,24 +45,34 @@ platform-specific tooling.
 git clone <this-repo>
 cd saishin
 
-dotnet build -c Release
-dotnet run -c Release -- --config config.ini
+cargo build --release
+./target/release/saishin --config config.ini
 ```
 
-To get a self-contained binary for a given platform:
+During development, `cargo run -- --config config.ini` builds (debug) and runs
+in one step, and `cargo test` runs the test suite.
+
+To target another platform, install its target once and cross-compile:
 
 ```bash
-# Linux x64
-dotnet publish -c Release -r linux-x64 --self-contained true -o out/linux-x64
+# Linux x64 (from any host with the target installed)
+rustup target add x86_64-unknown-linux-gnu
+cargo build --release --target x86_64-unknown-linux-gnu
 
 # Windows x64
-dotnet publish -c Release -r win-x64   --self-contained true -o out/win-x64
+rustup target add x86_64-pc-windows-msvc
+cargo build --release --target x86_64-pc-windows-msvc
 
 # macOS arm64
-dotnet publish -c Release -r osx-arm64 --self-contained true -o out/osx-arm64
+rustup target add aarch64-apple-darwin
+cargo build --release --target aarch64-apple-darwin
 ```
 
-Replace the identifiers with `linux-arm64`, `win-arm64` or `osx-x64` as needed.
+Replace the identifiers with `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`
+or `x86_64-apple-darwin` as needed. The Windows executable embeds
+`saishin-png-icon-set/saishin.ico` at build time (see `build.rs`); to
+regenerate it after artwork changes, run
+`python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow).
 
 ---
 
@@ -80,13 +87,13 @@ Replace the identifiers with `linux-arm64`, `win-arm64` or `osx-x64` as needed.
 2. Check what would happen without downloading anything:
 
    ```bash
-   dotnet run -- --config config.ini --dry-run
+   ./target/release/saishin --config config.ini --dry-run
    ```
 
 3. Run it:
 
    ```bash
-   dotnet run -- --config config.ini
+   ./target/release/saishin --config config.ini
    ```
 
 Start with `--help` for the full option list.
@@ -103,7 +110,7 @@ The token is a GitHub **personal access token** with the `repo` scope. Create on
 <https://github.com/settings/tokens>.
 
 ```bash
-dotnet run -- --login
+./target/release/saishin --login
 ```
 
 You are prompted once, the token is verified against the GitHub API, and it is then
@@ -118,14 +125,14 @@ written to the platform's credential store:
 Remove it again with:
 
 ```bash
-dotnet run -- --logout
+./target/release/saishin --logout
 ```
 
 ### Where the token is looked up
 
 In order:
 
-1. Environment variables `SAISHIN_TOKEN`
+1. Environment variables `SAISHIN_TOKEN`, `GITHUB_TOKEN` or `GH_TOKEN`.
    Useful for CI, where no keyring is available.
 2. The OS secure store, as written by `--login`.
 3. Otherwise, if any selected source is `private = true`, an interactive prompt.
@@ -399,18 +406,24 @@ later run would mistake for current.
 
 ```
 saishin/
-├── saishin.csproj      project definition and package references
+├── Cargo.toml            crate definition and dependencies
+├── Cargo.lock            pinned dependency versions
+├── build.rs              embeds the .ico into the Windows executable
 ├── config.ini.example      annotated example configuration
 ├── README.md
-└── src/
-    ├── Program.cs          argument parsing, orchestration, exit codes
-    ├── Config.cs           INI model and validation
-    ├── Glob.cs             glob to regular expression
-    ├── Secrets.cs          token prompt, storage and lookup order
-    ├── GitHub.cs           release discovery and asset selection
-    ├── Downloader.cs       HTTP transfer, skip detection, progress
-    ├── ZipHandler.cs       archive extraction rules
-    └── Log.cs              output helpers
+├── src/
+│   ├── main.rs           argument parsing, orchestration, exit codes
+│   ├── config.rs         INI model and validation
+│   ├── glob.rs           glob to regular expression
+│   ├── secrets.rs        token prompt, storage and lookup order
+│   ├── github.rs         release discovery and asset selection
+│   ├── downloader.rs     HTTP transfer, skip detection, progress
+│   ├── zip_handler.rs    archive extraction rules
+│   ├── notifier.rs       desktop notifications and sounds
+│   ├── log.rs            output helpers
+│   └── error.rs          error type and exit codes
+└── tests/
+    └── fixtures/         recorded GitHub API payloads for parser tests
 ```
 
 ---
@@ -419,11 +432,17 @@ saishin/
 
 | Package | Licence | Why |
 | --- | --- | --- |
-| [`ini-parser-netstandard`](https://www.nuget.org/packages/ini-parser-netstandard) (2.5.3) | MIT | INI parsing. Pure managed code, no platform calls |
-| [`keyring-dotnet`](https://www.nuget.org/packages/keyring-dotnet) (1.2.0) | MIT | Cross-platform access to Credential Manager, Keychain and GNOME Keyring |
+| [`tokio`](https://crates.io/crates/tokio) | MIT | Async runtime for HTTP and parallel downloads |
+| [`reqwest`](https://crates.io/crates/reqwest) | MIT/Apache-2.0 | HTTP client with compression and streaming |
+| [`serde` / `serde_json`](https://crates.io/crates/serde) | MIT/Apache-2.0 | GitHub API payloads |
+| [`rust-ini`](https://crates.io/crates/rust-ini) | MIT | INI parsing |
+| [`keyring`](https://crates.io/crates/keyring) | MIT/Apache-2.0 | Cross-platform access to Credential Manager, Keychain and GNOME Keyring |
+| [`zip`](https://crates.io/crates/zip) | MIT/Apache-2.0 | Archive extraction |
+| [`regex`](https://crates.io/crates/regex) | MIT/Apache-2.0 | Glob matching |
+| [`chrono`](https://crates.io/crates/chrono) | MIT/Apache-2.0 | Release date parsing and timestamps |
+| [`rpassword`](https://crates.io/crates/rpassword) | MIT/Apache-2.0 | Hidden token prompt |
+| [`url`](https://crates.io/crates/url) | MIT/Apache-2.0 | File names from plain URLs |
+| [`winres`](https://crates.io/crates/winres) (Windows only) | MIT | Embeds the icon into the executable |
 
-ZIP handling uses `System.IO.Compression`, which ships with .NET, so no third-party
-archive library is required.
-
-Both packages are pulled from NuGet on first restore, so the initial build needs
-network access. Subsequent builds use the local NuGet cache.
+The exact versions are pinned in `Cargo.lock`. The initial build needs network
+access for crates.io; subsequent builds use the local cargo cache.

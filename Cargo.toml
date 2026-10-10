@@ -1,0 +1,38 @@
+[package]
+name = "saishin"
+version = "1.0.0"
+edition = "2021"
+description = "Keep files up to date from official GitHub releases, actions or any other URL, using an INI configuration file"
+license = "MIT"
+
+[[bin]]
+name = "saishin"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-ini = "0.21"
+zip = "2"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rpassword = "7"
+url = "2"
+futures-util = "0.3"
+
+# Platform credential stores: Credential Manager on Windows, Keychain on
+# macOS, Secret Service on Linux. Without these the keyring crate silently
+# falls back to an in-memory mock store.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

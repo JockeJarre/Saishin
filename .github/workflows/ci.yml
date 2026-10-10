@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # --locked fails if Cargo.lock is missing or out of date, so the
+      # committed lockfile stays the single source of truth.
+      - run: cargo test --locked --all-targets
+
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: saishin
+          - os: windows-latest
+            binary: saishin.exe
+          - os: macos-latest
+            binary: saishin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.os }}
+          path: target/release/${{ matrix.binary }}
+
+  icon:
+    # The Windows executable embeds saishin-png-icon-set/saishin.ico, which is
+    # generated from the masters. Regenerate it here and fail if the
+    # committed .ico differs, so artwork changes can never be forgotten.
+    name: icon freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pillow
+      - run: python3 saishin-png-icon-set/make_saishin_ico.py
+      - run: git diff --exit-code -- saishin-png-icon-set/saishin.ico
