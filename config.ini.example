@@ -1,0 +1,76 @@
+; Saishin configuration
+;
+; Every section except [general] defines exactly one source.
+; Relative paths are resolved against the directory containing this file.
+; Comments start with ; or #
+
+[general]
+; Default download directory for sources that do not set their own 'out'.
+out_dir = ./downloads
+
+; Optional. Point at GitHub Enterprise instead of github.com.
+; github_api_url = https://github.example.com/api/v3
+
+; Optional. Name under which the token is filed in the OS secure store.
+; keyring_service = saishin
+
+; Optional. Show one desktop notification per run, after all sources,
+; listing the files that were downloaded. Default: false.
+; notify = true
+
+; Optional. Play this sound file after a run that downloaded something.
+; Default player: 'afplay' (macOS), 'ffplay' (Windows, Linux).
+; sound = ./sounds/update.mp3
+
+; Optional. Command used to play the sound file. The sound file is appended
+; as the last argument.
+; sound_player = ffplay -nodisp -autoexit
+
+
+; ---------------------------------------------------------------------------
+; Public GitHub releases
+; ---------------------------------------------------------------------------
+[territory_tables]
+type = github
+owner = vpinball
+repo = vpin-mame-tables
+tag = latest
+filters = *.vpt, *.vpin
+out = ./tables
+changelog = true
+; version_suffix = true
+
+; Uncomment to unpack what was downloaded.
+; extract = *
+; extract_to = ./tables/vpin-mame-tables
+; strip_prefix = 1
+; overwrite = true
+; keep_zip = true
+
+
+; ---------------------------------------------------------------------------
+; Account-gated builds (private repository or authenticated action artifacts)
+; Requires a stored token: run 'saishin --login' once.
+; ---------------------------------------------------------------------------
+[nightly_builds]
+type = github
+owner = my-organisation
+repo = private-builds
+private = true
+tag = all
+filters = *.zip
+out = ./builds
+extract = *
+strip_prefix = 1
+overwrite = true
+keep_zip = false
+
+
+; ---------------------------------------------------------------------------
+; Anything else: plain URLs
+; ---------------------------------------------------------------------------
+[extra_media]
+type = url
+urls = https://example.invalid/media-pack.zip
+out = ./extras
+filters = *.zip
