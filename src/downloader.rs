@@ -3,7 +3,7 @@ use crate::log;
 use futures_util::StreamExt;
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -109,6 +109,7 @@ impl Downloader {
         expected_size: Option<u64>,
         force: bool,
         json_accept: bool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<bool, AppError> {
         if !force && Path::new(destination).exists() {
             let actual = safe_file_length(destination);
@@ -139,12 +140,12 @@ impl Downloader {
         if let Some(total) = expected_size {
             if total > PARALLEL_MIN_BYTES && self.supports_range(url, token, json_accept).await {
                 return self
-                    .download_parallel(url, token, json_accept, destination, total)
+                    .download_parallel(url, token, json_accept, destination, total, cancel)
                     .await;
             }
         }
 
-        self.download_single(url, token, json_accept, destination, expected_size)
+        self.download_single(url, token, json_accept, destination, expected_size, cancel)
             .await
     }
 
@@ -155,6 +156,7 @@ impl Downloader {
         json_accept: bool,
         destination: &str,
         total: u64,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<bool, AppError> {
         let chunk_size = total.div_ceil(PARALLEL_CHUNKS as u64);
         let written = Arc::new(AtomicU64::new(0));
@@ -187,10 +189,11 @@ impl Downloader {
             let token = token.map(str::to_string);
             let name = name.clone();
             let written = Arc::clone(&written);
+            let cancel_arc = Arc::clone(cancel);
             handles.push(tokio::spawn(async move {
                 download_range(
                     &client, &url, token.as_deref(), json_accept, &part, resume_from, end, &name,
-                    total, &written,
+                    total, &written, &*cancel_arc,
                 )
                 .await
             }));
@@ -201,6 +204,10 @@ impl Downloader {
                 status: 0,
                 message: format!("chunk task failed: {ex}"),
             })??;
+        }
+
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
         }
 
         for i in 0..PARALLEL_CHUNKS {
@@ -246,6 +253,7 @@ impl Downloader {
         json_accept: bool,
         destination: &str,
         expected_size: Option<u64>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<bool, AppError> {
         let temporary = format!("{destination}.part");
         let existing = if Path::new(&temporary).exists() {
@@ -281,7 +289,7 @@ impl Downloader {
         }
 
         let result = self
-            .download_single_response(request, url, destination, &temporary, existing, expected_size)
+            .download_single_response(request, url, destination, &temporary, existing, expected_size, cancel)
             .await;
         if result.is_err() {
             try_delete(&temporary);
@@ -297,6 +305,7 @@ impl Downloader {
         temporary: &str,
         existing: u64,
         expected_size: Option<u64>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<bool, AppError> {
         let response = request.send().await.map_err(|ex| AppError::Download {
             status: status_of(&ex),
@@ -339,6 +348,9 @@ impl Downloader {
 
         let name = file_name_of(destination);
         while let Some(chunk) = source.next().await {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(false);
+            }
             let chunk = chunk.map_err(|ex| AppError::Download {
                 status: 0,
                 message: format!("GET {url} failed mid-transfer: {}", first_line(&ex.to_string())),
@@ -373,6 +385,7 @@ async fn download_range(
     name: &str,
     total: u64,
     written: &Arc<AtomicU64>,
+    cancel: &AtomicBool,
 ) -> Result<(), AppError> {
     if start > end {
         if !Path::new(file).exists() {
@@ -433,6 +446,9 @@ async fn download_range(
             message: format!("Could not write {file}: {ex}"),
         })?;
     while let Some(chunk) = stream.next().await {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let chunk = chunk.map_err(|ex| AppError::Download {
             status: 0,
             message: format!("GET {url} failed mid-transfer: {}", first_line(&ex.to_string())),

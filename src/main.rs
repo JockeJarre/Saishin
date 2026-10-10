@@ -3,6 +3,7 @@ mod downloader;
 mod error;
 mod github;
 mod glob;
+mod gui;
 mod log;
 mod notifier;
 mod secrets;
@@ -13,22 +14,27 @@ use config::{AppConfig, SourceConfig, SourceKind};
 use downloader::{format_bytes, Downloader};
 use error::AppError;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, UNIX_EPOCH};
 
 const GENERATION_GAP_HOURS: i64 = 6;
 
 #[derive(Debug, Clone)]
-struct PendingFile {
+pub(crate) struct PendingFile {
+    source_name: String,
     url: String,
+    link_url: String,
     file_name: String,
     size: Option<u64>,
     release_tag: String,
     changelog: String,
     published_at: Option<DateTime<Utc>>,
     json_accept: bool,
+    destination: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Options {
     config_path: Option<String>,
     sources: Vec<String>,
@@ -39,6 +45,7 @@ struct Options {
     logout: bool,
     show_help: bool,
     quiet: bool,
+    gui: bool,
 }
 
 impl Options {
@@ -54,6 +61,7 @@ impl Options {
                 "--login" => options.login = true,
                 "--logout" => options.logout = true,
                 "-q" | "--quiet" => options.quiet = true,
+                "--gui" => options.gui = true,
                 "-c" | "--config" => {
                     options.config_path = Some(next_value(args, &mut i)?);
                 }
@@ -162,9 +170,40 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     let token = resolve_token(&config, &selected, &http, options).await?;
 
     let mut updated: Vec<String> = Vec::new();
-    for source in &selected {
-        let names = run_source(source, &config, &http, token.as_deref(), options).await?;
-        updated.extend(names.into_iter().map(|name| format!("{}: {name}", source.name)));
+    if options.gui {
+        let mut pending: Vec<PendingFile> = Vec::new();
+        for source in &selected {
+            log::info(&format!("[{}]", source.name));
+            match source.kind {
+                SourceKind::GitHub => log::detail(&format!(
+                    "github {}/{}, tag '{}'",
+                    source.owner, source.repo, source.tag
+                )),
+                SourceKind::Actions => log::detail(&format!(
+                    "actions {}/{}, workflow '{}'",
+                    source.owner, source.repo, source.workflow
+                )),
+                SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+            }
+            pending.extend(collect_pending(source, &config, &http, token.as_deref()).await?);
+        }
+
+        let mut new_entries: Vec<PendingFile> = Vec::new();
+        for file in pending {
+            if file.file_name.is_empty() {
+                continue;
+            }
+            if is_new_artifact(&http, &file, token.as_deref(), options.force).await {
+                new_entries.push(file.clone());
+            }
+        }
+
+        updated.extend(gui::run_gui(new_entries, selected.clone(), config.clone(), token.clone(), options.clone())?);
+    } else {
+        for source in &selected {
+            let names = run_source(source, &config, &http, token.as_deref(), options).await?;
+            updated.extend(names.into_iter().map(|name| format!("{}: {name}", source.name)));
+        }
     }
 
     if config.notify && !updated.is_empty() {
@@ -308,6 +347,14 @@ async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
     }
 }
 
+trait ProgressSink {
+    fn report(&self, _file: &PendingFile, _started: bool) {}
+}
+
+struct NullSink {}
+
+impl ProgressSink for NullSink {}
+
 async fn run_source(
     source: &SourceConfig,
     config: &AppConfig,
@@ -317,40 +364,53 @@ async fn run_source(
 ) -> Result<Vec<String>, AppError> {
     log::info(&format!("[{}]", source.name));
 
-    let files = match source.kind {
-        SourceKind::GitHub => {
-            log::detail(&format!(
-                "github {}/{}, tag '{}'",
-                source.owner, source.repo, source.tag
-            ));
-            resolve_github(source, config, http, token).await?
-        }
-        SourceKind::Actions => {
-            log::detail(&format!(
-                "actions {}/{}, workflow '{}'",
-                source.owner, source.repo, source.workflow
-            ));
-            resolve_actions(source, config, http, token).await?
-        }
-        SourceKind::Url => resolve_urls(source),
-    };
+    match source.kind {
+        SourceKind::GitHub => log::detail(&format!(
+            "github {}/{}, tag '{}'",
+            source.owner, source.repo, source.tag
+        )),
+        SourceKind::Actions => log::detail(&format!(
+            "actions {}/{}, workflow '{}'",
+            source.owner, source.repo, source.workflow
+        )),
+        SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+    }
 
+    let files = collect_pending(source, config, http, token).await?;
     if files.is_empty() {
         log::info("    nothing matched");
         return Ok(Vec::new());
     }
 
-    let mut downloaded_names = Vec::new();
+    let null_sink = NullSink {};
+    let never_cancel = Arc::new(AtomicBool::new(false));
+    let downloaded_names = download_pending(source, config, http, token, &files, options, &never_cancel, &null_sink).await?;
 
-    for file in files {
-        let mut name = sanitize_file_name(&file.file_name);
-        if name.is_empty() {
-            log::warn(&format!("[{}] unusable file name, skipped.", source.name));
-            continue;
-        }
+    if !options.dry_run && source.keep > 0 {
+        prune_old_files(&source.out_dir, source.keep);
+    }
 
-        if source.version_suffix && !file.release_tag.trim().is_empty() {
-            let version = sanitize_file_name(file.release_tag.trim());
+    Ok(downloaded_names)
+}
+
+async fn collect_pending(
+    source: &SourceConfig,
+    config: &AppConfig,
+    http: &Downloader,
+    token: Option<&str>,
+) -> Result<Vec<PendingFile>, AppError> {
+    let raw = match source.kind {
+        SourceKind::GitHub => resolve_github(source, config, http, token).await?,
+        SourceKind::Actions => resolve_actions(source, config, http, token).await?,
+        SourceKind::Url => resolve_urls(source),
+    };
+
+    let mut files = Vec::new();
+    for file in raw {
+        let mut out = file.clone();
+        let mut name = sanitize_file_name(&out.file_name);
+        if source.version_suffix && !out.release_tag.trim().is_empty() {
+            let version = sanitize_file_name(out.release_tag.trim());
             if !version.is_empty() {
                 let path = Path::new(&name);
                 let stem = path
@@ -364,11 +424,40 @@ async fn run_source(
                 name = format!("{stem}-{version}{extension}");
             }
         }
-
-        let destination = Path::new(&source.out_dir)
+        out.file_name = name.clone();
+        out.destination = Path::new(&source.out_dir)
             .join(&name)
             .to_string_lossy()
             .to_string();
+        files.push(out);
+    }
+
+    Ok(files)
+}
+
+async fn download_pending(
+    source: &SourceConfig,
+    _config: &AppConfig,
+    http: &Downloader,
+    token: Option<&str>,
+    files: &[PendingFile],
+    options: &Options,
+    cancel: &Arc<AtomicBool>,
+    report: &dyn ProgressSink,
+) -> Result<Vec<String>, AppError> {
+    let mut downloaded_names = Vec::new();
+
+    for file in files {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(downloaded_names);
+        }
+        let name = file.file_name.clone();
+        if name.is_empty() {
+            log::warn(&format!("[{}] unusable file name, skipped.", source.name));
+            continue;
+        }
+
+        let destination = file.destination.clone();
 
         if options.dry_run {
             let size = match file.size {
@@ -379,8 +468,9 @@ async fn run_source(
             continue;
         }
 
+        report.report(file, true);
         let downloaded = match http
-            .download(&file.url, token, &destination, file.size, options.force, file.json_accept)
+            .download(&file.url, token, &destination, file.size, options.force, file.json_accept, cancel)
             .await
         {
             Ok(done) => done,
@@ -444,13 +534,50 @@ async fn run_source(
                 }
             }
         }
-    }
 
-    if !options.dry_run && source.keep > 0 {
-        prune_old_files(&source.out_dir, source.keep);
+        report.report(file, false);
     }
 
     Ok(downloaded_names)
+}
+
+async fn is_new_artifact(
+    http: &Downloader,
+    file: &PendingFile,
+    token: Option<&str>,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
+    }
+
+    if Path::new(&file.destination).exists() {
+        let actual = std::fs::metadata(&file.destination).ok().map(|meta| meta.len());
+        let target = match file.size {
+            Some(size) => Some(size),
+            None => http.try_get_content_length(&file.url, token).await,
+        };
+        if let Some(have) = actual {
+            if target.is_none_or(|want| have == want) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn github_web_base(config: &AppConfig) -> String {
+    match url::Url::parse(&config.github_api_url) {
+        Err(_) => "https://github.com".to_string(),
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("github.com");
+            if host == "api.github.com" {
+                return "https://github.com".to_string();
+            }
+            format!("{}://{}", parsed.scheme(), host)
+        }
+    }
 }
 
 async fn resolve_actions(
@@ -471,6 +598,7 @@ async fn resolve_actions(
     )
     .await?;
 
+    let web_base = github_web_base(config);
     let mut files = Vec::new();
     for run in &runs {
         let artifacts = github::get_artifacts(http, run, token, 100).await?;
@@ -494,13 +622,19 @@ async fn resolve_actions(
                 continue;
             }
             files.push(PendingFile {
+                source_name: source.name.clone(),
                 url: artifact.archive_download_url.clone(),
+                link_url: format!(
+                    "{web_base}/{}/{}/actions/runs/{}",
+                    source.owner, source.repo, run.id
+                ),
                 file_name: name,
                 size: Some(artifact.size as u64),
                 release_tag: run.run_number.to_string(),
                 changelog: String::new(),
                 published_at: run.created_at,
                 json_accept: true,
+                destination: String::new(),
             });
         }
     }
@@ -530,6 +664,7 @@ async fn resolve_github(
         return Ok(Vec::new());
     }
 
+    let web_base = github_web_base(config);
     let mut files = Vec::new();
     for release in &selected {
         for asset in &release.assets {
@@ -545,13 +680,19 @@ async fn resolve_github(
                 continue;
             }
             files.push(PendingFile {
+                source_name: source.name.clone(),
                 url,
+                link_url: format!(
+                    "{web_base}/{}/{}/releases/tag/{}",
+                    source.owner, source.repo, release.tag
+                ),
                 file_name: asset.name.clone(),
                 size: Some(asset.size as u64),
                 release_tag: release.tag.clone(),
                 changelog: release.body.clone(),
                 published_at: release.published_at,
                 json_accept: false,
+                destination: String::new(),
             });
         }
     }
@@ -572,13 +713,16 @@ fn resolve_urls(source: &SourceConfig) -> Vec<PendingFile> {
             continue;
         }
         files.push(PendingFile {
+            source_name: source.name.clone(),
             url: url.clone(),
+            link_url: url.clone(),
             file_name: name,
             size: None,
             release_tag: String::new(),
             changelog: String::new(),
             published_at: None,
             json_accept: false,
+            destination: String::new(),
         });
     }
     log::detail(&format!("matched {} url(s)", files.len()));
@@ -677,6 +821,41 @@ fn prune_old_files(out_dir: &str, keep: i64) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_web_base_default_is_github_com() {
+        let config = AppConfig {
+            base_directory: String::new(),
+            default_out_dir: String::new(),
+            github_api_url: "https://api.github.com".to_string(),
+            keyring_service: "saishin".to_string(),
+            notify: false,
+            sound: String::new(),
+            sound_player: String::new(),
+            sources: Vec::new(),
+        };
+        assert_eq!(github_web_base(&config), "https://github.com");
+    }
+
+    #[test]
+    fn github_web_base_enterprise_keeps_web_host() {
+        let config = AppConfig {
+            base_directory: String::new(),
+            default_out_dir: String::new(),
+            github_api_url: "https://ghe.example.com/api/v3".to_string(),
+            keyring_service: "saishin".to_string(),
+            notify: false,
+            sound: String::new(),
+            sound_player: String::new(),
+            sources: Vec::new(),
+        };
+        assert_eq!(github_web_base(&config), "https://ghe.example.com");
+    }
+}
+
 fn print_usage() {
     println!(
         "\
@@ -694,6 +873,7 @@ OPTIONS
       --login            Store or replace the GitHub token, then exit
       --logout           Remove the stored GitHub token, then exit
   -q, --quiet            Suppress progress and informational output
+      --gui              Show a selection window for new artifacts before downloading
   -h, --help             Show this help
 
 EXIT CODES

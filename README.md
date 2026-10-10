@@ -375,11 +375,27 @@ saishin [config.ini] [options]
 | `--non-interactive` | Never prompt. Fail with exit code `3` if credentials are missing |
 | `--login` | Prompt for a token, verify it, store it, then exit |
 | `--logout` | Remove the stored token, then exit |
+| `--gui` | Show a selection window for new artifacts before downloading |
 | `-q`, `--quiet` | Suppress progress and informational output |
 | `-h`, `--help` | Show usage |
 
 The configuration path may also be given positionally, as in
 `saishin config.ini`.
+
+### GUI selection
+
+```bash
+./target/release/saishin --config config.ini --gui
+```
+
+Instead of downloading every new artifact, `--gui` opens a window listing the
+new artifacts — each with a checkbox (checked by default), a hyperlink to its
+GitHub release, workflow run, or source page, and its size. Uncheck the ones
+you do not want, then press **Download selected**. **Cancel** aborts the run;
+**Select all** / **Select none** reset the checkboxes. Only the checked
+artifacts are downloaded; the rest of the run (changelogs, archive handling,
+notifications) proceeds as usual. The window needs a display server, so use
+the plain CLI mode for headless scheduled runs.
 
 ---
 

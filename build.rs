@@ -8,8 +8,12 @@
 fn main() {
     // The icon lives outside the crate, so watch it explicitly.
     println!("cargo::rerun-if-changed=saishin-png-icon-set/saishin.ico");
+    let icon = std::env::current_dir()
+        .expect("current dir")
+        .join("saishin-png-icon-set/saishin.ico");
+    let icon_path = icon.to_string_lossy().to_string();
     winres::WindowsResource::new()
-        .set_icon("saishin-png-icon-set/saishin.ico")
+        .set_icon(&icon_path)
         .compile()
         .expect("embed saishin icon");
 }
