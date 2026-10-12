@@ -66,7 +66,8 @@ struct SelectionApp {
     result: Arc<GuiResult>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<GuiProgress>>,
-    window_width: f32,
+    centered: bool,
+    window_centered: bool,
 }
 
 fn error_message(ex: AppError) -> String {
@@ -90,13 +91,16 @@ impl ProgressSink for GuiSink {
             let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
             if index < progress.rows.len() {
                 progress.rows[index] = if started { RowState::Downloading } else { RowState::Done };
+                if !started {
+                    progress.done += 1;
+                }
             }
         }
     }
 }
 
 impl SelectionApp {
-    fn new(entries: Vec<PendingFile>, job: Arc<GuiJob>, result: Arc<GuiResult>, cancel: Arc<AtomicBool>, progress: Arc<Mutex<GuiProgress>>) -> SelectionApp {
+    fn new(entries: Vec<PendingFile>, job: Arc<GuiJob>, result: Arc<GuiResult>, cancel: Arc<AtomicBool>, progress: Arc<Mutex<GuiProgress>>, window_centered: bool) -> SelectionApp {
         SelectionApp {
             entries: entries
                 .into_iter()
@@ -106,7 +110,8 @@ impl SelectionApp {
             result,
             cancel,
             progress,
-            window_width: 0.0,
+            centered: false,
+            window_centered,
         }
     }
 
@@ -171,8 +176,6 @@ impl SelectionApp {
                                     for name in names.iter() {
                                         result.updated.lock().unwrap_or_else(|guard| guard.into_inner()).push(format!("{}: {name}", source.name));
                                     }
-                                    let mut seen = progress_arc.lock().unwrap_or_else(|guard| guard.into_inner());
-                                    seen.done += files.len();
                                 }
                                 Err(ex) => {
                                     let mut seen = progress_arc.lock().unwrap_or_else(|guard| guard.into_inner());
@@ -187,7 +190,7 @@ impl SelectionApp {
                                 return;
                             }
                             if !job.options.dry_run && source.keep > 0 {
-                                prune_old_files(&source.out_dir, source.keep);
+                                prune_old_files(&source.out_dir, source.keep, &source.filters);
                             }
                         }
                         let mut seen = progress_arc.lock().unwrap_or_else(|guard| guard.into_inner());
@@ -204,6 +207,19 @@ impl SelectionApp {
 impl App for SelectionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         install_image_loaders(ctx);
+
+        if self.window_centered && !self.centered {
+            let (monitor, outer) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.monitor_size, v.outer_rect)
+            });
+            if let (Some(m), Some(o)) = (monitor, outer) {
+                let size = o.size();
+                let pos = egui::pos2(m.x / 2.0 - size.x / 2.0, m.y / 2.0 - size.y / 2.0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.centered = true;
+            }
+        }
 
         let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
 
@@ -228,6 +244,18 @@ impl App for SelectionApp {
         match phase {
             Phase::Selecting => {
                 egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Select all").clicked() {
+                            for entry in self.entries.iter_mut() {
+                                entry.selected = true;
+                            }
+                        }
+                        if ui.button("Select none").clicked() {
+                            for entry in self.entries.iter_mut() {
+                                entry.selected = false;
+                            }
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Download selected").clicked() {
                             let chosen = self.entries
@@ -254,22 +282,9 @@ impl App for SelectionApp {
 
                     ui.label(format!("{} new artifact(s)", self.entries.len()));
 
-                    ui.horizontal(|ui| {
-                        if ui.button("Select all").clicked() {
-                            for entry in self.entries.iter_mut() {
-                                entry.selected = true;
-                            }
-                        }
-                        if ui.button("Select none").clicked() {
-                            for entry in self.entries.iter_mut() {
-                                entry.selected = false;
-                            }
-                        }
-                    });
-
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .max_height(160.0)
+                        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
                             egui::Grid::new("artifact_list")
                                 .spacing(egui::vec2(8.0, 4.0))
@@ -286,13 +301,6 @@ impl App for SelectionApp {
                                         ui.end_row();
                                     }
                                 });
-                            let desired = (ui.min_rect().right() + 16.0).max(320.0);
-                            if (desired - self.window_width).abs() > 4.0 {
-                                self.window_width = desired;
-                                ctx.send_viewport_cmd(
-                                    egui::ViewportCommand::InnerSize(egui::vec2(desired, 420.0)),
-                                );
-                            }
                         });
                 });
             }
@@ -313,7 +321,7 @@ impl App for SelectionApp {
 
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .max_height(160.0)
+                        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
                             egui::Grid::new("download_list")
                                 .spacing(egui::vec2(8.0, 4.0))
@@ -324,7 +332,7 @@ impl App for SelectionApp {
                                         match state {
                                             RowState::Downloading => egui::Spinner::new().size(16.0).paint_at(ui, rect),
                                             RowState::Done => {
-                                                let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 180, 90));
+                                                let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(60, 180, 90));
                                                 ui.painter().line_segment([egui::pos2(rect.left() + 3.0, rect.center().y), egui::pos2(rect.center().x, rect.bottom() - 4.0)], stroke);
                                                 ui.painter().line_segment([egui::pos2(rect.center().x, rect.bottom() - 4.0), egui::pos2(rect.right() - 3.0, rect.top() + 3.0)], stroke);
                                             }
@@ -375,6 +383,7 @@ pub fn run_gui(
     token: Option<String>,
     options: Options,
 ) -> Result<Vec<String>, AppError> {
+    let window_centered = config.window_centered;
     let job = Arc::new(GuiJob { sources, entries: entries.clone(), config, token, options });
     let result = Arc::new(GuiResult { updated: Mutex::new(Vec::new()) });
     let cancel = Arc::new(AtomicBool::new(false));
@@ -389,12 +398,13 @@ pub fn run_gui(
     };
     native_options.viewport = egui::ViewportBuilder::default()
         .with_inner_size([520.0, 420.0])
+        .with_min_inner_size([520.0, 420.0])
         .with_icon(app_icon);
     let gui_result = Arc::clone(&result);
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(|_| Box::new(SelectionApp::new(entries, job, gui_result, cancel, progress))),
+        Box::new(move |_| Box::new(SelectionApp::new(entries, job, gui_result, cancel, progress, window_centered))),
     );
 
     if let Err(ex) = outcome {

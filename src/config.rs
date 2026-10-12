@@ -48,6 +48,7 @@ pub struct AppConfig {
     pub github_api_url: String,
     pub keyring_service: String,
     pub notify: bool,
+    pub window_centered: bool,
     pub sound: String,
     pub sound_player: String,
     pub sources: Vec<SourceConfig>,
@@ -85,6 +86,7 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         github_api_url,
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
         notify: get_bool(&sections, GENERAL_SECTION, "notify", false)?,
+        window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
         sound: resolve_sound(&sections, GENERAL_SECTION, &base_dir),
         sound_player: get_string(&sections, GENERAL_SECTION, "sound_player", "")
             .trim()

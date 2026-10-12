@@ -387,7 +387,7 @@ async fn run_source(
     let downloaded_names = download_pending(source, config, http, token, &files, options, &never_cancel, &null_sink).await?;
 
     if !options.dry_run && source.keep > 0 {
-        prune_old_files(&source.out_dir, source.keep);
+        prune_old_files(&source.out_dir, source.keep, &source.filters);
     }
 
     Ok(downloaded_names)
@@ -767,7 +767,7 @@ fn set_mtime(path: &str, published: DateTime<Utc>) {
     }
 }
 
-fn prune_old_files(out_dir: &str, keep: i64) {
+fn prune_old_files(out_dir: &str, keep: i64, filters: &[String]) {
     let dir = Path::new(out_dir);
     if !dir.is_dir() {
         return;
@@ -779,6 +779,13 @@ fn prune_old_files(out_dir: &str, keep: i64) {
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !filters.is_empty() && !glob::matches_any(&name, filters) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -833,6 +840,7 @@ mod tests {
             github_api_url: "https://api.github.com".to_string(),
             keyring_service: "saishin".to_string(),
             notify: false,
+            window_centered: true,
             sound: String::new(),
             sound_player: String::new(),
             sources: Vec::new(),
@@ -848,6 +856,7 @@ mod tests {
             github_api_url: "https://ghe.example.com/api/v3".to_string(),
             keyring_service: "saishin".to_string(),
             notify: false,
+            window_centered: true,
             sound: String::new(),
             sound_player: String::new(),
             sources: Vec::new(),
