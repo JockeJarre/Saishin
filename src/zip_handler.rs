@@ -100,10 +100,16 @@ pub fn extract(
             }
         })?;
         written += 1;
-        log::detail(&format!("extracted {relative}"));
+        log::progress(&format!("extracted {relative}"));
     }
 
-    log::info(&format!("    archive: {written} extracted, {skipped} skipped"));
+    let summary = format!("archive: {written} extracted, {skipped} skipped");
+    if written > 0 {
+        log::progress(&summary);
+        log::progress_done();
+    } else {
+        log::info(&format!("    {summary}"));
+    }
     Ok(())
 }
 

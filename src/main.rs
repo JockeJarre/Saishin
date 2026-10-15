@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use config::{AppConfig, SourceConfig, SourceKind};
 use downloader::{format_bytes, Downloader};
 use error::AppError;
+use futures_util::future::join_all;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -171,8 +172,15 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
 
     let mut updated: Vec<String> = Vec::new();
     if options.gui {
+        let per_source = join_all(
+            selected
+                .iter()
+                .map(|source| collect_pending(source, &config, &http, token.as_deref())),
+        )
+        .await;
         let mut pending: Vec<PendingFile> = Vec::new();
-        for source in &selected {
+        for (source, result) in selected.iter().zip(per_source) {
+            let (files, summary) = result?;
             log::info(&format!("[{}]", source.name));
             match source.kind {
                 SourceKind::GitHub => log::detail(&format!(
@@ -185,18 +193,28 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
                 )),
                 SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
             }
-            pending.extend(collect_pending(source, &config, &http, token.as_deref()).await?);
+            if !summary.is_empty() {
+                log::detail(&summary);
+            }
+            pending.extend(files);
         }
 
-        let mut new_entries: Vec<PendingFile> = Vec::new();
-        for file in pending {
-            if file.file_name.is_empty() {
-                continue;
-            }
-            if is_new_artifact(&http, &file, token.as_deref(), options.force).await {
-                new_entries.push(file.clone());
-            }
-        }
+        let candidates: Vec<PendingFile> = pending
+            .into_iter()
+            .filter(|file| !file.file_name.is_empty())
+            .collect();
+        let flags = join_all(
+            candidates
+                .iter()
+                .map(|file| is_new_artifact(&http, file, token.as_deref(), options.force)),
+        )
+        .await;
+        let new_entries: Vec<PendingFile> = candidates
+            .into_iter()
+            .zip(flags)
+            .filter(|(_, is_new)| *is_new)
+            .map(|(file, _)| file)
+            .collect();
 
         updated.extend(gui::run_gui(new_entries, selected.clone(), config.clone(), token.clone(), options.clone())?);
     } else {
@@ -376,7 +394,10 @@ async fn run_source(
         SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
     }
 
-    let files = collect_pending(source, config, http, token).await?;
+    let (files, summary) = collect_pending(source, config, http, token).await?;
+    if !summary.is_empty() {
+        log::detail(&summary);
+    }
     if files.is_empty() {
         log::info("    nothing matched");
         return Ok(Vec::new());
@@ -398,8 +419,8 @@ async fn collect_pending(
     config: &AppConfig,
     http: &Downloader,
     token: Option<&str>,
-) -> Result<Vec<PendingFile>, AppError> {
-    let raw = match source.kind {
+) -> Result<(Vec<PendingFile>, String), AppError> {
+    let (raw, summary) = match source.kind {
         SourceKind::GitHub => resolve_github(source, config, http, token).await?,
         SourceKind::Actions => resolve_actions(source, config, http, token).await?,
         SourceKind::Url => resolve_urls(source),
@@ -432,7 +453,7 @@ async fn collect_pending(
         files.push(out);
     }
 
-    Ok(files)
+    Ok((files, summary))
 }
 
 async fn download_pending(
@@ -446,8 +467,9 @@ async fn download_pending(
     report: &dyn ProgressSink,
 ) -> Result<Vec<String>, AppError> {
     let mut downloaded_names = Vec::new();
+    let total = files.len();
 
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(downloaded_names);
         }
@@ -469,6 +491,11 @@ async fn download_pending(
         }
 
         report.report(file, true);
+        log::info(&format!(
+            "Downloading {} of {}: {name}",
+            index + 1,
+            total
+        ));
         let downloaded = match http
             .download(&file.url, token, &destination, file.size, options.force, file.json_accept, cancel)
             .await
@@ -585,7 +612,7 @@ async fn resolve_actions(
     config: &AppConfig,
     http: &Downloader,
     token: Option<&str>,
-) -> Result<Vec<PendingFile>, AppError> {
+) -> Result<(Vec<PendingFile>, String), AppError> {
     let workflow = source.workflow.clone();
     let runs = github::get_runs(
         http,
@@ -639,12 +666,12 @@ async fn resolve_actions(
         }
     }
 
-    log::detail(&format!(
+    let summary = format!(
         "matched {} artifact(s) across {} run(s)",
         files.len(),
         runs.len()
-    ));
-    Ok(files)
+    );
+    Ok((files, summary))
 }
 
 async fn resolve_github(
@@ -652,7 +679,7 @@ async fn resolve_github(
     config: &AppConfig,
     http: &Downloader,
     token: Option<&str>,
-) -> Result<Vec<PendingFile>, AppError> {
+) -> Result<(Vec<PendingFile>, String), AppError> {
     let releases = github::get_releases(http, config, source, token, 100).await?;
     let selected = github::select(&releases, &source.tag);
 
@@ -661,7 +688,7 @@ async fn resolve_github(
             "[{}] no release matched tag '{}'.",
             source.name, source.tag
         ));
-        return Ok(Vec::new());
+        return Ok((Vec::new(), String::new()));
     }
 
     let web_base = github_web_base(config);
@@ -697,15 +724,15 @@ async fn resolve_github(
         }
     }
 
-    log::detail(&format!(
+    let summary = format!(
         "matched {} asset(s) across {} release(s)",
         files.len(),
         selected.len()
-    ));
-    Ok(files)
+    );
+    Ok((files, summary))
 }
 
-fn resolve_urls(source: &SourceConfig) -> Vec<PendingFile> {
+fn resolve_urls(source: &SourceConfig) -> (Vec<PendingFile>, String) {
     let mut files = Vec::new();
     for url in &source.urls {
         let name = file_name_from_url(url);
@@ -725,8 +752,8 @@ fn resolve_urls(source: &SourceConfig) -> Vec<PendingFile> {
             destination: String::new(),
         });
     }
-    log::detail(&format!("matched {} url(s)", files.len()));
-    files
+    let summary = format!("matched {} url(s)", files.len());
+    (files, summary)
 }
 
 fn file_name_from_url(url: &str) -> String {

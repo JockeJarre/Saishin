@@ -3580,6 +3580,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "windows 0.52.0",
  "winres",
  "zip",
 ]

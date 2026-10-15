@@ -66,7 +66,8 @@ struct SelectionApp {
     result: Arc<GuiResult>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<GuiProgress>>,
-    centered: bool,
+    shown: bool,
+    centered_at_startup: bool,
     window_centered: bool,
 }
 
@@ -100,7 +101,7 @@ impl ProgressSink for GuiSink {
 }
 
 impl SelectionApp {
-    fn new(entries: Vec<PendingFile>, job: Arc<GuiJob>, result: Arc<GuiResult>, cancel: Arc<AtomicBool>, progress: Arc<Mutex<GuiProgress>>, window_centered: bool) -> SelectionApp {
+    fn new(entries: Vec<PendingFile>, job: Arc<GuiJob>, result: Arc<GuiResult>, cancel: Arc<AtomicBool>, progress: Arc<Mutex<GuiProgress>>, window_centered: bool, centered_at_startup: bool) -> SelectionApp {
         SelectionApp {
             entries: entries
                 .into_iter()
@@ -110,7 +111,8 @@ impl SelectionApp {
             result,
             cancel,
             progress,
-            centered: false,
+            shown: false,
+            centered_at_startup,
             window_centered,
         }
     }
@@ -208,16 +210,24 @@ impl App for SelectionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         install_image_loaders(ctx);
 
-        if self.window_centered && !self.centered {
-            let (monitor, outer) = ctx.input(|i| {
-                let v = i.viewport();
-                (v.monitor_size, v.outer_rect)
-            });
-            if let (Some(m), Some(o)) = (monitor, outer) {
-                let size = o.size();
-                let pos = egui::pos2(m.x / 2.0 - size.x / 2.0, m.y / 2.0 - size.y / 2.0);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.centered = true;
+        if self.window_centered && !self.shown {
+            if self.centered_at_startup {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.shown = true;
+            } else {
+                let (monitor, outer) = ctx.input(|i| {
+                    let v = i.viewport();
+                    (v.monitor_size, v.outer_rect)
+                });
+                if let (Some(m), Some(o)) = (monitor, outer) {
+                    let size = o.size();
+                    let target = egui::pos2(m.x / 2.0 - size.x / 2.0, m.y / 2.0 - size.y / 2.0);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                    if (o.min.x - target.x).abs() < 2.0 && (o.min.y - target.y).abs() < 2.0 {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        self.shown = true;
+                    }
+                }
             }
         }
 
@@ -376,6 +386,40 @@ impl App for SelectionApp {
     }
 }
 
+#[cfg(windows)]
+fn centered_position(width: f32, height: f32) -> Option<[f32; 2]> {
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWORKAREA,
+    };
+    let mut rect = RECT::default();
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut RECT as *mut c_void),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForSystem() } as f32;
+    let scale = if dpi > 0.0 { dpi / 96.0 } else { 1.0 };
+    let left = rect.left as f32 / scale;
+    let top = rect.top as f32 / scale;
+    let work_w = (rect.right - rect.left) as f32 / scale;
+    let work_h = (rect.bottom - rect.top) as f32 / scale;
+    Some([left + (work_w - width) / 2.0, top + (work_h - height) / 2.0])
+}
+
+#[cfg(not(windows))]
+fn centered_position(_width: f32, _height: f32) -> Option<[f32; 2]> {
+    None
+}
+
 pub fn run_gui(
     entries: Vec<PendingFile>,
     sources: Vec<SourceConfig>,
@@ -390,21 +434,33 @@ pub fn run_gui(
     let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Selecting, done: 0, total: 0, message: "".to_string(), rows: Vec::new() }));
 
     let mut native_options = eframe::NativeOptions::default();
+    native_options.centered = false;
     let app_icon = match eframe::icon_data::from_png_bytes(
         include_bytes!("../saishin-png-icon-set/saishin-master-1024.png")
     ) {
         Ok(icon) => Arc::new(icon),
         Err(_) => Arc::new(egui::IconData::default()),
     };
-    native_options.viewport = egui::ViewportBuilder::default()
+    let startup_center = if window_centered {
+        centered_position(520.0, 420.0)
+    } else {
+        None
+    };
+    let centered_at_startup = startup_center.is_some();
+    let mut builder = egui::ViewportBuilder::default()
         .with_inner_size([520.0, 420.0])
         .with_min_inner_size([520.0, 420.0])
         .with_icon(app_icon);
+    builder = match startup_center {
+        Some([x, y]) => builder.with_position([x, y]).with_visible(false),
+        None => builder.with_visible(!window_centered),
+    };
+    native_options.viewport = builder;
     let gui_result = Arc::clone(&result);
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Box::new(SelectionApp::new(entries, job, gui_result, cancel, progress, window_centered))),
+        Box::new(move |_| Box::new(SelectionApp::new(entries, job, gui_result, cancel, progress, window_centered, centered_at_startup))),
     );
 
     if let Err(ex) = outcome {
