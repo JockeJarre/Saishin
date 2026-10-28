@@ -20,10 +20,18 @@ jobs:
         include:
           - os: windows-latest
             binary: saishin.exe
+            # platform and arch go into the artifact name, spelled the way the
+            # names of the release bundles are spelled.
+            platform: windows
+            arch: x64
           - os: ubuntu-latest
             binary: saishin
+            platform: linux
+            arch: x64
           - os: macos-latest
             binary: saishin
+            platform: macos
+            arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -63,10 +71,57 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
+      # The name is the whole identity of the build in one string: version from
+      # Cargo.toml, six characters of the commit, the CI run number as the build
+      # number (Actions has no separate build counter; the run number is the #NN
+      # in the run list), platform and architecture. build.rs stamps its sha from
+      # the same GITHUB_SHA, so the six characters here are the first six of the
+      # sha `-V` prints. On a pull request both are the merge commit, so the two
+      # never disagree.
+      - name: Name the artifact
+        id: name
+        shell: bash
+        run: |
+          sha="${GITHUB_SHA:0:6}"
+          if [ "${#sha}" -ne 6 ]; then
+            echo "::error::GITHUB_SHA is not a commit sha: '$GITHUB_SHA'"
+            exit 1
+          fi
+          stem="saishin-${{ steps.version.outputs.version }}-${sha}-r${GITHUB_RUN_NUMBER}-${{ matrix.platform }}-${{ matrix.arch }}"
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          echo "- $stem.zip" >> "$GITHUB_STEP_SUMMARY"
+
+      # The binary and the annotated sample configuration, zipped under the name
+      # the job just picked. The artifact gets that same name, and GitHub hands
+      # out an artifact as a zip named after the artifact, so the file that
+      # arrives in the browser is named exactly like the artifact.
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          STEM: ${{ steps.name.outputs.stem }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          Move-Item -Path config.ini.example -Destination config.ini.template
+          & "target/release/$env:BINARY" -V
+          Compress-Archive -Path "target/release/$env:BINARY",config.ini.template -DestinationPath "${env:STEM}.zip"
+
+      - name: Package
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        env:
+          STEM: ${{ steps.name.outputs.stem }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          cp config.ini.example config.ini.template
+          "./target/release/$BINARY" -V
+          # -j: the two files go into the root of the zip, not under target/.
+          zip -X -q -j "$STEM.zip" "target/release/$BINARY" config.ini.template
+
       - uses: actions/upload-artifact@v4
         with:
-          name: saishin-${{ steps.version.outputs.version }}-${{ matrix.os }}
-          path: target/release/${{ matrix.binary }}
+          name: ${{ steps.name.outputs.stem }}
+          path: ${{ steps.name.outputs.stem }}.zip
           if-no-files-found: error
 
   icon:
