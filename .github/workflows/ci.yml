@@ -72,18 +72,18 @@ jobs:
         run: cargo build --locked --release
 
       # The name is the whole identity of the build in one string: version from
-      # Cargo.toml, six characters of the commit, the CI run number as the build
-      # number (Actions has no separate build counter; the run number is the #NN
-      # in the run list), platform and architecture. build.rs stamps its sha from
-      # the same GITHUB_SHA, so the six characters here are the first six of the
-      # sha `-V` prints. On a pull request both are the merge commit, so the two
-      # never disagree.
+      # Cargo.toml, the short commit sha, the CI run number as the build number
+      # (Actions has no separate build counter; the run number is the #NN in the
+      # run list), platform and architecture. build.rs takes its sha from the
+      # same GITHUB_SHA and cuts it to the same seven characters, so the sha in
+      # the name is the sha `-V` prints. On a pull request both are the merge
+      # commit, so the two never disagree.
       - name: Name the artifact
         id: name
         shell: bash
         run: |
-          sha="${GITHUB_SHA:0:6}"
-          if [ "${#sha}" -ne 6 ]; then
+          sha="${GITHUB_SHA:0:7}"
+          if [ "${#sha}" -ne 7 ]; then
             echo "::error::GITHUB_SHA is not a commit sha: '$GITHUB_SHA'"
             exit 1
           fi
