@@ -21,8 +21,8 @@ chrono = { version = "0.4", features = ["serde"] }
 rpassword = "7"
 url = "2"
 futures-util = "0.3"
-eframe = "0.27"
-egui_extras = { version = "0.27", features = ["all_loaders"] }
+eframe = "0.37"
+egui_extras = { version = "0.37", features = ["all_loaders"] }
 
 # Platform credential stores: Credential Manager on Windows, Keychain on
 # macOS, Secret Service on Linux. Without these the keyring crate silently

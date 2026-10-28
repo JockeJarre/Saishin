@@ -352,7 +352,9 @@ impl SelectionApp {
 }
 
 impl App for SelectionApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// egui 0.37 split `update` in two: `logic` runs on the context (viewport
+    /// commands belong here), `ui` gets the root `Ui` the panels are drawn into.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         install_image_loaders(ctx);
 
         if self.window_centered && !self.shown {
@@ -375,10 +377,12 @@ impl App for SelectionApp {
                 }
             }
         }
+    }
 
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
 
-        egui::TopBottomPanel::top("header_logo").exact_height(128.0).show_separator_line(false).show(ctx, |ui| {
+        egui::Panel::top("header_logo").exact_size(128.0).show_separator_line(false).show(ui, |ui| {
             ui.centered_and_justified(|ui| {
                 ui.add(
                     egui::Image::new(egui::include_image!("../saishin-png-icon-set/saishin-master-1024.png"))
@@ -387,7 +391,7 @@ impl App for SelectionApp {
             });
         });
 
-        egui::TopBottomPanel::top("header_kanji").exact_height(60.0).show_separator_line(false).show(ctx, |ui| {
+        egui::Panel::top("header_kanji").exact_size(60.0).show_separator_line(false).show(ui, |ui| {
             ui.centered_and_justified(|ui| {
                 ui.add(
                     egui::Image::new(egui::include_image!("../saishin-png-icon-set/saishin-kanji-strip-inverted.png"))
@@ -398,7 +402,7 @@ impl App for SelectionApp {
 
         match phase {
             Phase::Selecting => {
-                egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+                egui::Panel::bottom("actions").show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("Select all").clicked() {
                             for entry in self.entries.iter_mut() {
@@ -422,12 +426,12 @@ impl App for SelectionApp {
                             self.start_download(chosen);
                         }
                         if ui.button("Cancel").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
                 });
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.heading("Saishin - new artifacts");
 
                     if self.entries.is_empty() {
@@ -488,7 +492,7 @@ impl App for SelectionApp {
                                                     });
                                                 let versions = entry.versions.clone();
                                                 let mut current = picked;
-                                                egui::ComboBox::from_id_source((index, &entry.file.source_name, &entry.file.group_key))
+                                                egui::ComboBox::from_id_salt((index, &entry.file.source_name, &entry.file.group_key))
                                                     .selected_text(version_cell_label(&entry.file, false))
                                                     .show_ui(ui, |ui| {
                                                         for (i, label) in labels.iter().enumerate() {
@@ -518,7 +522,7 @@ impl App for SelectionApp {
                 });
             }
             Phase::Downloading => {
-                egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+                egui::Panel::bottom("actions").show(ui, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Cancel").clicked() {
                             self.cancel.store(true, Ordering::Relaxed);
@@ -526,7 +530,7 @@ impl App for SelectionApp {
                     });
                 });
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
                     let rows = progress.rows.clone();
                     ui.heading("Downloading...");
@@ -565,7 +569,7 @@ impl App for SelectionApp {
                 });
             }
             _ => {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
                     match progress.phase {
                         Phase::Done => {
@@ -583,7 +587,7 @@ impl App for SelectionApp {
                         _ => {}
                     }
                 });
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -665,7 +669,7 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup))),
+        Box::new(move |_| Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup)))),
     );
 
     if let Err(ex) = outcome {
