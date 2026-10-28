@@ -1,0 +1,127 @@
+name: Release
+
+# Tag a version and the release publishes itself:
+#   scripts/release 1.1.0   (bumps Cargo.toml, commits, tags)
+#   git push main --follow-tags
+# The tag must match the version in Cargo.toml, because that is the version
+# the binary reports with -V.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: version matches the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          tag=${GITHUB_REF_NAME#v}
+          if [ -z "$version" ]; then
+            echo "::error::No version line in Cargo.toml"
+            exit 1
+          fi
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version). Bump Cargo.toml, commit, then tag again."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: package (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            binary: saishin.exe
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: ubuntu-latest
+            binary: saishin
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            binary: saishin
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: saishin-v1
+
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev libssl-dev pkg-config \
+            libegl1-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Build
+        run: cargo build --locked --release
+
+      # A bundle the user can unpack anywhere: the binary, the annotated
+      # sample configuration, and the README.
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          bundle="saishin-$version-$TARGET"
+          mkdir -p "$bundle"
+          cp "target/release/$BINARY" "$bundle/"
+          cp config.ini.example README.md "$bundle/"
+          # The packaged binary carries the build identity build.rs stamped in.
+          "./$bundle/$(basename "$BINARY")" --version
+          if [ "$ARCHIVE" = "zip" ]; then
+            # bsdtar on the Windows runner writes a zip from the .zip suffix.
+            tar -a -c -f "$bundle.zip" "$bundle"
+          else
+            tar -czf "$bundle.tar.gz" "$bundle"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: saishin-*-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bundle-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: saishin ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: "true"
+          files: dist/*

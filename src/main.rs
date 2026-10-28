@@ -22,6 +22,19 @@ use std::time::{Duration, UNIX_EPOCH};
 
 const GENERATION_GAP_HOURS: i64 = 6;
 
+/// Build identity stamped by build.rs: the version from Cargo.toml, the
+/// commit, the target triple and the profile. Cargo.toml is the only place
+/// a version is ever written.
+const BUILD_VERSION: &str = env!("SAISHIN_VERSION");
+const BUILD_GIT: &str = env!("SAISHIN_GIT");
+const BUILD_TARGET: &str = env!("SAISHIN_TARGET");
+const BUILD_PROFILE: &str = env!("SAISHIN_PROFILE");
+
+/// One line for `-V`, and the tail of `--help`.
+fn version_string() -> String {
+    format!("saishin {BUILD_VERSION} ({BUILD_GIT}, {BUILD_TARGET}, {BUILD_PROFILE})")
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFile {
     source_name: String,
@@ -62,6 +75,7 @@ struct Options {
     login: bool,
     logout: bool,
     show_help: bool,
+    show_version: bool,
     quiet: bool,
     gui: bool,
 }
@@ -73,6 +87,7 @@ impl Options {
         while i < args.len() {
             match args[i].as_str() {
                 "-h" | "--help" => options.show_help = true,
+                "-V" | "--version" => options.show_version = true,
                 "--dry-run" => options.dry_run = true,
                 "-f" | "--force" => options.force = true,
                 "--non-interactive" => options.non_interactive = true,
@@ -129,6 +144,11 @@ fn run() -> i32 {
 
     if options.show_help {
         print_usage();
+        return 0;
+    }
+
+    if options.show_version {
+        println!("{}", version_string());
         return 0;
     }
 
@@ -1358,14 +1378,46 @@ mod tests {
         };
         apply_names(&source, &mut file);
         // Only the last path segment survives, and path-hostile characters
-        // become underscores. Key and file name stay in step.
-        assert_eq!(file.file_name, "game_win.zip");
+        // become underscores. Key and file name stay in step. ':' is hostile
+        // on Windows only, so it survives on unix.
+        let sanitized = if cfg!(windows) {
+            "game_win.zip"
+        } else {
+            "game:win.zip"
+        };
+        assert_eq!(file.file_name, sanitized);
         // The group key is name-only: separators normalize, case folds.
-        assert_eq!(file.group_key, "game-win.zip");
+        assert_eq!(
+            file.group_key,
+            if cfg!(windows) {
+                "game-win.zip"
+            } else {
+                "game:win.zip"
+            }
+        );
         assert_eq!(
             file.destination,
-            Path::new("out").join("game_win.zip").to_string_lossy()
+            Path::new("out").join(sanitized).to_string_lossy()
         );
+    }
+
+    #[test]
+    fn options_parse_the_version_switch() {
+        let options = Options::parse(&["-V".to_string()]).expect("parses");
+        assert!(options.show_version);
+        assert!(!options.gui);
+        assert!(Options::parse(&["--version".to_string()])
+            .expect("parses")
+            .show_version);
+    }
+
+    #[test]
+    fn version_string_names_the_build() {
+        let line = version_string();
+        assert!(line.starts_with("saishin "));
+        assert!(line.contains(env!("SAISHIN_VERSION")));
+        // Same shape as Cargo.toml, so a release tag can be checked against it.
+        assert_eq!(env!("SAISHIN_VERSION"), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1571,6 +1623,7 @@ OPTIONS
       --logout           Remove the stored GitHub token, then exit
   -q, --quiet            Suppress progress and informational output
       --gui              Show a selection window for new artifacts before downloading
+  -V, --version          Show the version, commit and target, then exit
   -h, --help             Show this help
 
 EXIT CODES

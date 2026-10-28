@@ -16,6 +16,7 @@ including scheduled ones — reuse it without ever prompting again.
 
 - [Requirements](#requirements)
 - [Build and run](#build-and-run)
+- [Version and releases](#version-and-releases)
 - [Quick start](#quick-start)
 - [Authentication](#authentication)
 - [Scheduled runs](#scheduled-runs)
@@ -34,8 +35,18 @@ including scheduled ones — reuse it without ever prompting again.
 - [Rust toolchain](https://rustup.rs/) (stable). Install via `rustup`, then
   the `cargo` command below just works.
 
-Nothing else. There is no dependency on Windows-only APIs or on
-platform-specific tooling.
+Nothing else on Windows and macOS. There is no dependency on Windows-only APIs
+or on platform-specific tooling.
+
+On Linux, the GUI needs system libraries at build time — D-Bus for the
+keyring, OpenSSL for HTTPS, EGL/GLX for the renderer:
+
+```bash
+sudo apt-get install -y libdbus-1-dev libssl-dev pkg-config \
+  libegl1-mesa-dev libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev
+```
+
+Wayland support loads `libwayland` at runtime, so those headers are not needed.
 
 ---
 
@@ -73,6 +84,73 @@ or `x86_64-apple-darwin` as needed. The Windows executable embeds
 `saishin-png-icon-set/saishin.ico` at build time (see `build.rs`); to
 regenerate it after artwork changes, run
 `python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow).
+
+---
+
+## Version and releases
+
+The version lives in exactly one place: `version` in `Cargo.toml`. Everything
+else is derived from it at build time by `build.rs`.
+
+```bash
+./target/release/saishin --version
+saishin 1.0.0 (e88e2c3, x86_64-pc-windows-msvc, release)
+```
+
+That line names the version from `Cargo.toml`, the commit the binary was built
+from (`-dirty` for a tree with uncommitted changes, `-ci` for a CI build), the
+target triple and the profile. Nothing has to be kept in sync by hand.
+
+### Every push
+
+`.github/workflows/ci.yml` builds release binaries for Windows, Linux and
+macOS, and uploads them as artifacts named `saishin-<version>-<os>`. They are
+on the run page under **Artifacts**, which is the quickest way to get a build
+of a branch: push, open the run, download. Dependency builds are cached per
+`Cargo.lock`, so a push that changes no dependency reuses them.
+
+### Making a release
+
+1. Bump the version, commit it and tag it, in one command:
+
+   ```powershell
+   pwsh scripts/release.ps1 1.1.0
+   ```
+
+   The script refuses a dirty tree and a malformed version, updates
+   `Cargo.toml` and `Cargo.lock`, commits `Release v1.1.0` and tags it
+   `v1.1.0`. A prerelease label is allowed too (`1.1.0-rc1`).
+
+2. Publish:
+
+   ```bash
+   git push main --follow-tags
+   ```
+
+`.github/workflows/release.yml` runs on any `v*` tag. It first checks that the
+tag matches the version in `Cargo.toml`, and fails with a message saying so
+when it does not, so a binary can never claim a version it is not. Then it
+builds all three platforms and publishes a GitHub Release with one bundle per
+platform:
+
+```
+saishin-1.1.0-x86_64-pc-windows-msvc.zip
+saishin-1.1.0-x86_64-unknown-linux-gnu.tar.gz
+saishin-1.1.0-aarch64-apple-darwin.tar.gz
+```
+
+Each bundle contains the binary, `config.ini.example` and this README. The
+release notes are generated from the changes since the last release, and the
+new release is marked as the latest.
+
+A published tag can be taken back:
+
+```bash
+git tag -d v1.1.0 && git push main :refs/tags/v1.1.0
+```
+
+then delete the release on the Releases page and run the script again with
+the version you meant.
 
 ---
 
@@ -379,6 +457,7 @@ saishin [config.ini] [options]
 | `--logout` | Remove the stored token, then exit |
 | `--gui` | Show a selection window for new artifacts before downloading |
 | `-q`, `--quiet` | Suppress progress and informational output |
+| `-V`, `--version` | Print the version, commit, target and profile, then exit |
 | `-h`, `--help` | Show usage |
 
 The configuration path may also be given positionally, as in
@@ -450,11 +529,16 @@ later run would mistake for current.
 
 ```
 saishin/
-├── Cargo.toml            crate definition and dependencies
+├── Cargo.toml            crate definition, dependencies and the version
 ├── Cargo.lock            pinned dependency versions
-├── build.rs              embeds the .ico into the Windows executable
+├── build.rs              stamps the build identity, embeds the Windows .ico
 ├── config.ini.example      annotated example configuration
 ├── README.md
+├── .github/workflows/
+│   ├── ci.yml            builds all three platforms on every push
+│   └── release.yml       publishes a release from a v* tag
+├── scripts/
+│   └── release.ps1       bump the version, commit it, tag it
 ├── src/
 │   ├── main.rs           argument parsing, orchestration, exit codes
 │   ├── config.rs         INI model and validation
@@ -486,7 +570,14 @@ saishin/
 | [`chrono`](https://crates.io/crates/chrono) | MIT/Apache-2.0 | Release date parsing and timestamps |
 | [`rpassword`](https://crates.io/crates/rpassword) | MIT/Apache-2.0 | Hidden token prompt |
 | [`url`](https://crates.io/crates/url) | MIT/Apache-2.0 | File names from plain URLs |
-| [`winres`](https://crates.io/crates/winres) (Windows only) | MIT | Embeds the icon into the executable |
+| [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) | MIT/Apache-2.0 | The `--gui` window, rendered with OpenGL (glow) |
+| [`egui_extras`](https://crates.io/crates/egui_extras) | MIT | The artifact table of the GUI |
+| [`image`](https://crates.io/crates/image) | MIT/Apache-2.0 | PNG decoding for the header logo |
+| [`embed-resource`](https://crates.io/crates/embed-resource) (Windows only) | MIT/Apache-2.0 | Embeds the icon into the executable |
 
-The exact versions are pinned in `Cargo.lock`. The initial build needs network
+The exact versions are pinned in `Cargo.lock`. The GUI and archive
+dependencies are pulled with a reduced feature set — the glow renderer
+instead of wgpu, the png decoder instead of every image format, deflate
+zip entries only — which keeps the wgpu, naga, bzip2, lzma and zstd C
+builds out of the tree. The initial build needs network
 access for crates.io; subsequent builds use the local cargo cache.

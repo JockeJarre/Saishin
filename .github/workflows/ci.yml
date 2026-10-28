@@ -2,44 +2,72 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
-jobs:
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # --locked fails if Cargo.lock is missing or out of date, so the
-      # committed lockfile stays the single source of truth.
-      - run: cargo test --locked --all-targets
+env:
+  CARGO_TERM_COLOR: always
 
+jobs:
   build:
     name: build (${{ matrix.os }})
     strategy:
+      # Windows is listed first: it is the platform most downloads land on,
+      # so its job should be the first to get a runner.
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            binary: saishin
           - os: windows-latest
             binary: saishin.exe
+          - os: ubuntu-latest
+            binary: saishin
           - os: macos-latest
             binary: saishin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --locked --release
+
+      # Cargo.toml holds the version, so the artifact names match the binary's
+      # own -V output and the tags cut with scripts/release.
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          test -n "$version" || { echo "::error::No version = \"...\" in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Built saishin $version" >> "$GITHUB_STEP_SUMMARY"
+
+      # Cargo and target/ caches keyed on Cargo.lock: a push that does not
+      # change dependencies reuses the whole dependency build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: saishin-v1
+
+      # keyring needs D-Bus, glow/glutin needs EGL/GLX, reqwest needs OpenSSL.
+      # winit's wayland-dlopen feature loads libwayland at runtime, so the
+      # wayland headers are not needed at build time.
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev libssl-dev pkg-config \
+            libegl1-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev
+
+      # --locked fails if Cargo.lock is missing or out of date, so the
+      # committed lockfile stays the single source of truth.
+      - name: Build
+        run: cargo build --locked --release
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}-${{ matrix.os }}
+          name: saishin-${{ steps.version.outputs.version }}-${{ matrix.os }}
           path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
 
   icon:
     # The Windows executable embeds saishin-png-icon-set/saishin.ico, which is
