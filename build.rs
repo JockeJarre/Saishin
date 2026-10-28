@@ -8,11 +8,18 @@
 use std::env;
 use std::process::Command;
 
+/// The square artwork the GUI header draws, and how far it is shrunk on the
+/// way in: the 1024 px PNG becomes a 256 px texture, which is what a 120 pt
+/// logo takes on a 2x display.
+const LOGO_PNG: &str = "saishin-png-icon-set/saishin-master-1024.png";
+const LOGO_SHRINK: usize = 4;
+
 fn main() {
     println!("cargo::rerun-if-changed=saishin-png-icon-set/saishin.ico");
     println!("cargo::rerun-if-changed=build.rs");
 
     stamp_build_identity();
+    embed_logo();
 
     #[cfg(windows)]
     embed_icon();
@@ -101,4 +108,99 @@ fn embed_icon() {
         Ok(_) => {}
         Err(ex) => println!("cargo:warning=could not embed saishin.ico: {ex}"),
     }
+}
+
+/// Decodes the header logo and writes it into OUT_DIR as raw RGBA8, which
+/// src/gui.rs embeds with include_bytes!(). Raw pixels rather than the PNG
+/// bytes, so that the texture is uploaded from the embedded bytes as they
+/// are: showing the logo needs no image decoder in the binary. The PNG is
+/// 285 KB, the shrunk raw texture 256 KB and ready to hand to the GPU.
+///
+/// Unlike the icon, a missing logo stops the build: a binary without a header
+/// logo is broken, not merely unbranded.
+fn embed_logo() {
+    println!("cargo::rerun-if-changed={LOGO_PNG}");
+
+    let bytes = match std::fs::read(LOGO_PNG) {
+        Ok(bytes) => bytes,
+        Err(ex) => panic!("{LOGO_PNG} is missing, and the GUI header needs it: {ex}"),
+    };
+    let (width, height, rgba) =
+        decode_rgba8(&bytes).unwrap_or_else(|ex| panic!("{LOGO_PNG} cannot be decoded: {ex}"));
+
+    if width != height {
+        panic!("{LOGO_PNG} is {width}x{height}; the header logo needs a square image");
+    }
+    if width % LOGO_SHRINK != 0 {
+        panic!("{LOGO_PNG} is {width} px wide, which does not divide by {LOGO_SHRINK}");
+    }
+
+    let size = width / LOGO_SHRINK;
+    println!("cargo:rustc-env=SAISHIN_LOGO_SIZE={size}");
+
+    let pixels = box_shrink(&rgba, width, LOGO_SHRINK);
+    let dest = std::path::Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join("saishin-logo.rgba");
+    if let Err(ex) = std::fs::write(&dest, pixels) {
+        panic!("{} cannot be written: {ex}", dest.display());
+    }
+}
+
+/// Decodes a PNG into 8-bit RGBA. The `png` crate is a build dependency, so
+/// this is the only place a PNG decoder exists in the project.
+fn decode_rgba8(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // EXPAND takes care of palettes, grayscale and sub-8-bit samples, ALPHA
+    // guarantees an alpha channel, STRIP_16 keeps the sample depth at 8 bits.
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|ex| ex.to_string())?;
+    let (width, height) = {
+        let info = reader.info();
+        (info.width as usize, info.height as usize)
+    };
+    let mut buffer = vec![0u8; reader.output_buffer_size().ok_or("the size of the PNG is unknown")?];
+    let frame = reader.next_frame(&mut buffer).map_err(|ex| ex.to_string())?;
+
+    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "the logo decodes to colour type {} at {} bit, which the header cannot use",
+            frame.color_type as u8, frame.bit_depth as u8
+        ));
+    }
+
+    Ok((width, height, buffer))
+}
+
+/// Averages `shrink` x `shrink` blocks of RGBA pixels into one pixel each.
+///
+/// A plain box filter on straight (not premultiplied) alpha: cheap, and the
+/// header draws the logo at a fraction of this size, so the slight darkening
+/// of the edges is not visible there.
+fn box_shrink(rgba: &[u8], width: usize, shrink: usize) -> Vec<u8> {
+    let side = width / shrink;
+    let mut out = vec![0u8; side * side * 4];
+
+    for y in 0..side {
+        for x in 0..side {
+            let (mut red, mut green, mut blue, mut alpha, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+
+            for source_y in y * shrink..(y + 1) * shrink {
+                for source_x in x * shrink..(x + 1) * shrink {
+                    let at = (source_y * width + source_x) * 4;
+                    red += u32::from(rgba[at]);
+                    green += u32::from(rgba[at + 1]);
+                    blue += u32::from(rgba[at + 2]);
+                    alpha += u32::from(rgba[at + 3]);
+                    count += 1;
+                }
+            }
+
+            let at = (y * side + x) * 4;
+            out[at] = (red / count) as u8;
+            out[at + 1] = (green / count) as u8;
+            out[at + 2] = (blue / count) as u8;
+            out[at + 3] = (alpha / count) as u8;
+        }
+    }
+
+    out
 }

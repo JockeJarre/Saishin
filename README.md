@@ -48,6 +48,11 @@ sudo apt-get install -y libdbus-1-dev libssl-dev pkg-config \
 
 Wayland support loads `libwayland` at runtime, so those headers are not needed.
 
+The header of the GUI spells 最新 out in a CJK font, and the app ships none:
+Windows and macOS have one in the system, on Linux install `fonts-noto-cjk`
+(Debian, Ubuntu) or `google-noto-cjk-fonts` (Fedora). A machine without such a
+font gets the logo on its own, which is the whole header minus the word.
+
 ---
 
 ## Build and run
@@ -531,7 +536,10 @@ later run would mistake for current.
 saishin/
 ├── Cargo.toml            crate definition, dependencies and the version
 ├── Cargo.lock            pinned dependency versions
-├── build.rs              stamps the build identity, embeds the Windows .ico
+├── build.rs              stamps the build identity, embeds the Windows .ico,
+│                         decodes the header logo into raw pixels
+├── saishin-png-icon-set/ the logo PNG (header art, and the build input for it)
+│                         and saishin.ico
 ├── config.ini.example      annotated example configuration
 ├── README.md
 ├── .github/workflows/
@@ -571,8 +579,7 @@ saishin/
 | [`rpassword`](https://crates.io/crates/rpassword) | MIT/Apache-2.0 | Hidden token prompt |
 | [`url`](https://crates.io/crates/url) | MIT/Apache-2.0 | File names from plain URLs |
 | [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) | MIT/Apache-2.0 | The `--gui` window, rendered with OpenGL (glow) |
-| [`egui_extras`](https://crates.io/crates/egui_extras) | MIT | The artifact table of the GUI |
-| [`image`](https://crates.io/crates/image) | MIT/Apache-2.0 | PNG decoding for the header logo |
+| [`png`](https://crates.io/crates/png) (build only) | MIT/Apache-2.0 | Decodes and shrinks the header logo at build time, so the binary needs no image decoder |
 | [`embed-resource`](https://crates.io/crates/embed-resource) (Windows only) | MIT/Apache-2.0 | Embeds the icon into the executable |
 
 The exact versions are pinned in `Cargo.lock`. The GUI and archive

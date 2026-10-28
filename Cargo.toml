@@ -43,10 +43,10 @@ winit = { version = "0.30", features = [
     "wayland-dlopen",
     "wayland-csd-adwaita",
 ] }
-# Only the two bundled PNGs in the header are shown, so only the png decoder
-# of the `image` crate is needed (all_loaders pulls gif, webp, svg, file, http).
-egui_extras = { version = "0.37", default-features = false, features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+# The header logo is decoded and shrunk by `build.rs` and embedded as raw
+# RGBA8, so no image decoder is linked into the binary.
+[build-dependencies]
+png = "0.18"
 
 # Platform credential stores: Credential Manager on Windows, Keychain on
 # macOS, Secret Service on Linux. Without these the keyring crate silently

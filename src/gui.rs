@@ -11,7 +11,8 @@ use crate::ProgressSink;
 use eframe::App;
 use eframe::egui;
 use eframe::run_native;
-use egui_extras::install_image_loaders;
+use std::fs;
+use std::path::PathBuf;
 use std::thread;
 use tokio::runtime::Builder;
 use std::sync::{Arc, Mutex};
@@ -113,6 +114,11 @@ struct SelectionApp {
     result: Arc<GuiResult>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<GuiProgress>>,
+    /// The header logo, uploaded to the GPU on the first frame.
+    logo: Option<egui::TextureHandle>,
+    /// Whether a font carrying the glyphs of 最新 was found, which is what
+    /// decides if the header can spell the name out.
+    kanji: bool,
     shown: bool,
     centered_at_startup: bool,
     window_centered: bool,
@@ -122,6 +128,77 @@ struct SelectionApp {
 /// version, the build number and the commit, so it needs room to be readable.
 const WINDOW_WIDTH: f32 = 940.0;
 const WINDOW_HEIGHT: f32 = 640.0;
+
+/// The header logo as raw RGBA8 pixels, decoded and shrunk from the PNG by
+/// `build.rs`. Pixels and not PNG bytes on purpose: the embedded bytes are
+/// uploaded to the texture as they are, so showing the logo does not need an
+/// image decoder at run time.
+const LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/saishin-logo.rgba"));
+/// Pixels on a side of the embedded logo: a quarter of the 1024 px PNG, which
+/// is what a 120 pt logo takes on a 2x display. `build.rs` reports the size it
+/// wrote, and the test at the bottom of this file keeps the two in step.
+const LOGO_SIZE: usize = 256;
+const _: () = assert!(LOGO_RGBA.len() == LOGO_SIZE * LOGO_SIZE * 4);
+
+/// The header spells 最新 out as text, and egui's built-in font carries no CJK
+/// glyphs, so a font from the machine joins the font stack as a fallback.
+/// Every platform this app runs on ships one that has the two glyphs.
+///
+/// Returns whether a font was installed: the header only draws the word when
+/// it can be drawn properly, and shows boxes on a machine with no CJK font.
+fn install_cjk_font(ctx: &egui::Context) -> bool {
+    let Some(path) = cjk_font_file() else { return false };
+    let Ok(bytes) = fs::read(&path) else { return false };
+
+    ctx.add_font(egui::FontInsert {
+        name: "saishin-cjk".to_owned(),
+        data: egui::FontData::from_owned(bytes),
+        families: vec![
+            egui::InsertFontFamily { family: egui::FontFamily::Proportional, priority: egui::FontPriority::Lowest },
+            egui::InsertFontFamily { family: egui::FontFamily::Monospace, priority: egui::FontPriority::Lowest },
+        ],
+    });
+    true
+}
+
+/// The first font file on this machine that carries CJK glyphs.
+fn cjk_font_file() -> Option<PathBuf> {
+    cjk_font_candidates().into_iter().find(|path| path.is_file())
+}
+
+/// The font files to try, per platform. The `.ttc` collections are read at
+/// face 0, which is the plain face of each of these.
+fn cjk_font_candidates() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        vec![
+            // Microsoft YaHei, shipped with every Windows since Windows 7.
+            PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
+            // SimHei, and the Japanese faces, both carry the two glyphs too.
+            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\YuGothR.ttc"),
+        ]
+    } else if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc"),
+        ]
+    } else {
+        vec![
+            // The usual places of `fonts-noto-cjk` and its equivalents: Debian
+            // and Ubuntu, Fedora, Arch.
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        ]
+    }
+}
+
+/// The header logo as an egui image, ready to upload: the bytes `build.rs`
+/// wrote, read as un-premultiplied RGBA.
+fn logo_image() -> egui::ColorImage {
+    egui::ColorImage::from_rgba_unmultiplied([LOGO_SIZE, LOGO_SIZE], LOGO_RGBA)
+}
 
 fn error_message(ex: AppError) -> String {
     match ex {
@@ -178,6 +255,7 @@ impl SelectionApp {
         result: Arc<GuiResult>,
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<GuiProgress>>,
+        kanji: bool,
         window_centered: bool,
         centered_at_startup: bool,
     ) -> SelectionApp {
@@ -249,6 +327,8 @@ impl SelectionApp {
             result,
             cancel,
             progress,
+            logo: None,
+            kanji,
             shown: false,
             centered_at_startup,
             window_centered,
@@ -355,7 +435,11 @@ impl App for SelectionApp {
     /// egui 0.37 split `update` in two: `logic` runs on the context (viewport
     /// commands belong here), `ui` gets the root `Ui` the panels are drawn into.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        install_image_loaders(ctx);
+        // One upload, from bytes that are already pixels. The texture lives on
+        // the GPU for the rest of the session.
+        if self.logo.is_none() {
+            self.logo = Some(ctx.load_texture("saishin logo", logo_image(), egui::TextureOptions::LINEAR));
+        }
 
         if self.window_centered && !self.shown {
             if self.centered_at_startup {
@@ -384,21 +468,19 @@ impl App for SelectionApp {
 
         egui::Panel::top("header_logo").exact_size(128.0).show_separator_line(false).show(ui, |ui| {
             ui.centered_and_justified(|ui| {
-                ui.add(
-                    egui::Image::new(egui::include_image!("../saishin-png-icon-set/saishin-master-1024.png"))
-                        .max_width(120.0),
-                );
+                if let Some(logo) = &self.logo {
+                    ui.add(egui::Image::from_texture(logo).max_width(120.0));
+                }
             });
         });
 
-        egui::Panel::top("header_kanji").exact_size(60.0).show_separator_line(false).show(ui, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.add(
-                    egui::Image::new(egui::include_image!("../saishin-png-icon-set/saishin-kanji-strip-inverted.png"))
-                        .max_width(100.0),
-                );
+        if self.kanji {
+            egui::Panel::top("header_kanji").exact_size(60.0).show_separator_line(false).show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("最新").size(40.0).strong());
+                });
             });
-        });
+        }
 
         match phase {
             Phase::Selecting => {
@@ -644,12 +726,13 @@ pub fn run_gui(
     let mut native_options = eframe::NativeOptions::default();
     native_options.centered = false;
     native_options.persist_window = false;
-    let app_icon = match eframe::icon_data::from_png_bytes(
-        include_bytes!("../saishin-png-icon-set/saishin-master-1024.png")
-    ) {
-        Ok(icon) => Arc::new(icon),
-        Err(_) => Arc::new(egui::IconData::default()),
-    };
+    // The window icon is the logo, taken as the pixels the build script wrote:
+    // no PNG decode at start-up.
+    let app_icon = Arc::new(egui::IconData {
+        rgba: LOGO_RGBA.to_vec(),
+        width: LOGO_SIZE as u32,
+        height: LOGO_SIZE as u32,
+    });
     let startup_center = if window_centered {
         centered_position(WINDOW_WIDTH, WINDOW_HEIGHT)
     } else {
@@ -669,7 +752,13 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup)))),
+        Box::new(move |cc: &eframe::CreationContext| {
+            // The header word is set in a font this app does not ship, so the
+            // machine's own CJK font joins the font stack here, before egui
+            // lays out the first frame.
+            let kanji = install_cjk_font(&cc.egui_ctx);
+            Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, kanji, window_centered, centered_at_startup)))
+        }),
     );
 
     if let Err(ex) = outcome {
@@ -681,4 +770,34 @@ pub fn run_gui(
 
     let updated = result.updated.lock().unwrap_or_else(|guard| guard.into_inner());
     Ok(updated.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build.rs` picks the embedded logo's size from the PNG, and this file
+    /// draws a logo of a size it assumes. The two have to agree.
+    #[test]
+    fn the_embedded_logo_is_the_size_the_build_script_wrote() {
+        let built: usize = env!("SAISHIN_LOGO_SIZE").parse().expect("build.rs reports the logo size");
+        assert_eq!(built, LOGO_SIZE);
+        assert_eq!(LOGO_RGBA.len(), LOGO_SIZE * LOGO_SIZE * 4);
+    }
+
+    /// The logo is drawn over the header, so it needs an alpha channel with
+    /// both empty and filled pixels in it.
+    #[test]
+    fn the_embedded_logo_keeps_its_transparency() {
+        let mut alpha = LOGO_RGBA.iter().skip(3).step_by(4);
+        assert!(alpha.clone().any(|&a| a == 0), "the logo has no transparent pixels");
+        assert!(alpha.any(|&a| a == 255), "the logo has no opaque pixels");
+    }
+
+    /// The header word is set in a font the app does not ship, so every
+    /// platform needs its list of the fonts that ship with it.
+    #[test]
+    fn a_cjk_font_is_listed_for_every_platform() {
+        assert!(!cjk_font_candidates().is_empty());
+    }
 }
