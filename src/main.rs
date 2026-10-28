@@ -14,6 +14,7 @@ use config::{AppConfig, SourceConfig, SourceKind};
 use downloader::{format_bytes, Downloader};
 use error::AppError;
 use futures_util::future::join_all;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -27,12 +28,28 @@ pub(crate) struct PendingFile {
     url: String,
     link_url: String,
     file_name: String,
+    /// Key that groups the versions of one artifact across releases (or
+    /// workflow runs). Derived from the asset name with the version, build
+    /// number and commit tokens removed; set by `apply_names`, so GUI rows
+    /// and version lists always agree.
+    group_key: String,
+    /// Version shown in the GUI dropdown: release tag, or run number.
+    version_label: String,
     size: Option<u64>,
     release_tag: String,
     changelog: String,
     published_at: Option<DateTime<Utc>>,
     json_accept: bool,
     destination: String,
+}
+
+/// One artifact's versions across the last N releases (or workflow runs),
+/// newest first, as offered by the GUI version dropdown.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactVersions {
+    source_name: String,
+    group_key: String,
+    versions: Vec<PendingFile>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -203,12 +220,18 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
             .into_iter()
             .filter(|file| !file.file_name.is_empty())
             .collect();
-        let flags = join_all(
-            candidates
-                .iter()
-                .map(|file| is_new_artifact(&http, file, token.as_deref(), options.force)),
-        )
-        .await;
+        let (flags, version_lists) = tokio::join!(
+            join_all(
+                candidates
+                    .iter()
+                    .map(|file| is_new_artifact(&http, file, token.as_deref(), options.force)),
+            ),
+            join_all(
+                selected
+                    .iter()
+                    .map(|source| collect_versions(source, &config, &http, token.as_deref())),
+            )
+        );
         let new_entries: Vec<PendingFile> = candidates
             .into_iter()
             .zip(flags)
@@ -216,7 +239,14 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
             .map(|(file, _)| file)
             .collect();
 
-        updated.extend(gui::run_gui(new_entries, selected.clone(), config.clone(), token.clone(), options.clone())?);
+        let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
+        for result in version_lists {
+            for group in result? {
+                versions.insert((group.source_name, group.group_key), group.versions);
+            }
+        }
+
+        updated.extend(gui::run_gui(new_entries, versions, selected.clone(), config.clone(), token.clone(), options.clone())?);
     } else {
         for source in &selected {
             let names = run_source(source, &config, &http, token.as_deref(), options).await?;
@@ -429,31 +459,259 @@ async fn collect_pending(
     let mut files = Vec::new();
     for file in raw {
         let mut out = file.clone();
-        let mut name = sanitize_file_name(&out.file_name);
-        if source.version_suffix && !out.release_tag.trim().is_empty() {
-            let version = sanitize_file_name(out.release_tag.trim());
-            if !version.is_empty() {
-                let path = Path::new(&name);
-                let stem = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let extension = path
-                    .extension()
-                    .map(|e| format!(".{}", e.to_string_lossy()))
-                    .unwrap_or_default();
-                name = format!("{stem}-{version}{extension}");
-            }
-        }
-        out.file_name = name.clone();
-        out.destination = Path::new(&source.out_dir)
-            .join(&name)
-            .to_string_lossy()
-            .to_string();
+        apply_names(source, &mut out);
         files.push(out);
     }
 
     Ok((files, summary))
+}
+
+/// Applies the local file name (with the optional version suffix) and the
+/// destination path. Shared by the CLI/row resolution and by the GUI version
+/// lists so both name the same artifact identically.
+fn apply_names(source: &SourceConfig, file: &mut PendingFile) {
+    let mut name = sanitize_file_name(&file.file_name);
+    file.group_key = version_group_key(&name);
+    if source.version_suffix && !file.release_tag.trim().is_empty() {
+        let version = sanitize_file_name(file.release_tag.trim());
+        if !version.is_empty() {
+            let path = Path::new(&name);
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let extension = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            name = format!("{stem}-{version}{extension}");
+        }
+    }
+    file.file_name = name.clone();
+    file.destination = Path::new(&source.out_dir)
+        .join(&name)
+        .to_string_lossy()
+        .to_string();
+}
+
+/// Groups the versions of one artifact across releases (or workflow runs).
+/// Asset names normally embed the version, the build number and the commit,
+/// so a plain name comparison only matches within one release. Those tokens
+/// are dropped, and the tokens that tell builds apart - architecture, variant,
+/// extension, short numbers - are kept:
+///
+/// ```text
+/// dmdext-v2.5.0-x64.zip                      -> dmdext-x64.zip
+/// VPinMAME-sc-3.7.0-1038-aed5459-win-x86.zip -> vpinmame-sc-win-x86.zip
+/// VPinballX_BGFX-10.8.1-6480-8ac5b79c5-windows-x64-Release.zip
+///                                            -> vpinballx-bgfx-windows-x64-release.zip
+/// FlexDMD.zip                                -> flexdmd.zip
+/// ```
+fn version_group_key(name: &str) -> String {
+    // The extension is split off first: in `VPinballX.starter-1.8.zip` the
+    // version is glued to it, and dropping the version must not drop the
+    // extension, or a .zip and a .msi of one release would share a dropdown.
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && extension.len() <= 5
+                && extension.chars().all(|c| c.is_ascii_alphabetic()) =>
+        {
+            (stem, Some(extension.to_ascii_lowercase()))
+        }
+        _ => (name, None),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for token in stem.split(['-', '_', ' ']) {
+        if token.is_empty() || is_version_token(token) {
+            continue;
+        }
+        parts.push(token.to_ascii_lowercase());
+    }
+    if parts.is_empty() {
+        // Nothing but version tokens; keep the name so it stays one group.
+        return name.to_ascii_lowercase();
+    }
+    match extension {
+        Some(extension) => format!("{}.{}", parts.join("-"), extension),
+        None => parts.join("-"),
+    }
+}
+
+/// True for the tokens that change from one release of the same artifact to
+/// the next: dotted versions (`3.7.0`, `v2.5.0`), long digit runs (`1038`,
+/// `6480`) and commit shas (`aed5459`, `8ac5b79c5`). Short numbers (`2` in
+/// `two_balls_2.zip`) and architecture tokens (`x64`, `arm64`) are not
+/// versions, so artifacts that differ by them stay in separate groups.
+fn is_version_token(token: &str) -> bool {
+    let body = token.strip_prefix('v').unwrap_or(token);
+    if !body.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if body.contains('.') {
+        return body.chars().all(|c| c.is_ascii_digit() || c == '.');
+    }
+    let all_digits = body.chars().all(|c| c.is_ascii_digit());
+    let all_hex = body.chars().all(|c| c.is_ascii_hexdigit());
+    (all_digits && body.len() >= 3) || (all_hex && body.len() >= 7)
+}
+
+/// Collects the versions of every artifact of a source, newest first, for the
+/// GUI version dropdown. Only used by `--gui`; the CLI path never calls this.
+async fn collect_versions(
+    source: &SourceConfig,
+    config: &AppConfig,
+    http: &Downloader,
+    token: Option<&str>,
+) -> Result<Vec<ArtifactVersions>, AppError> {
+    let web_base = github_web_base(config);
+    match source.kind {
+        SourceKind::Url => Ok(Vec::new()),
+        SourceKind::GitHub => {
+            let releases =
+                github::get_recent_releases(http, config, source, token, source.releases).await?;
+            Ok(group_release_versions(source, &web_base, token.is_some(), &releases))
+        }
+        SourceKind::Actions => {
+            let workflow = source.workflow.clone();
+            let runs = github::get_runs(
+                http,
+                config,
+                source,
+                token,
+                100,
+                source.releases,
+                |run| github::run_matches(run, &workflow),
+            )
+            .await?;
+            let fetched = join_all(runs.iter().map(|run| github::get_artifacts(http, run, token, 100))).await;
+            let mut per_run = Vec::new();
+            for (run, artifacts) in runs.iter().zip(fetched) {
+                per_run.push((run, artifacts?));
+            }
+            Ok(group_run_versions(source, &web_base, &per_run))
+        }
+    }
+}
+
+fn group_release_versions(
+    source: &SourceConfig,
+    web_base: &str,
+    with_token: bool,
+    releases: &[github::GhRelease],
+) -> Vec<ArtifactVersions> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<PendingFile>> = HashMap::new();
+    for release in releases.iter().filter(|release| !release.draft) {
+        for asset in &release.assets {
+            if !source.filters.is_empty() && !glob::matches_any(&asset.name, &source.filters) {
+                continue;
+            }
+            let url = if with_token {
+                asset.api_url.clone()
+            } else {
+                asset.browser_download_url.clone()
+            };
+            if url.is_empty() {
+                continue;
+            }
+            let mut file = PendingFile {
+                source_name: source.name.clone(),
+                url,
+                link_url: format!(
+                    "{web_base}/{}/{}/releases/tag/{}",
+                    source.owner, source.repo, release.tag
+                ),
+                file_name: asset.name.clone(),
+                group_key: String::new(),
+                version_label: release.tag.clone(),
+                size: Some(asset.size as u64),
+                release_tag: release.tag.clone(),
+                changelog: release.body.clone(),
+                published_at: release.published_at,
+                json_accept: false,
+                destination: String::new(),
+            };
+            apply_names(source, &mut file);
+            push_version(&mut order, &mut groups, file);
+        }
+    }
+    build_groups(&source.name, order, groups)
+}
+
+fn group_run_versions(
+    source: &SourceConfig,
+    web_base: &str,
+    runs: &[(&github::GhRun, Vec<github::GhArtifact>)],
+) -> Vec<ArtifactVersions> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<PendingFile>> = HashMap::new();
+    for (run, artifacts) in runs {
+        for artifact in artifacts {
+            if artifact.expired || artifact.archive_download_url.is_empty() {
+                continue;
+            }
+            if !source.filters.is_empty() && !glob::matches_any(&artifact.name, &source.filters) {
+                continue;
+            }
+            let name = if artifact.name.to_lowercase().ends_with(".zip") {
+                artifact.name.clone()
+            } else {
+                format!("{}.zip", artifact.name)
+            };
+            let mut file = PendingFile {
+                source_name: source.name.clone(),
+                url: artifact.archive_download_url.clone(),
+                link_url: format!(
+                    "{web_base}/{}/{}/actions/runs/{}",
+                    source.owner, source.repo, run.id
+                ),
+                file_name: name.clone(),
+                group_key: String::new(),
+                version_label: format!("run #{}", run.run_number),
+                size: Some(artifact.size as u64),
+                release_tag: run.run_number.to_string(),
+                changelog: String::new(),
+                published_at: run.created_at,
+                json_accept: true,
+                destination: String::new(),
+            };
+            apply_names(source, &mut file);
+            push_version(&mut order, &mut groups, file);
+        }
+    }
+    build_groups(&source.name, order, groups)
+}
+
+fn push_version(
+    order: &mut Vec<String>,
+    groups: &mut HashMap<String, Vec<PendingFile>>,
+    file: PendingFile,
+) {
+    let key = file.group_key.clone();
+    match groups.get_mut(&key) {
+        Some(versions) => versions.push(file),
+        None => {
+            order.push(key.clone());
+            groups.insert(key, vec![file]);
+        }
+    }
+}
+
+fn build_groups(
+    source_name: &str,
+    order: Vec<String>,
+    groups: HashMap<String, Vec<PendingFile>>,
+) -> Vec<ArtifactVersions> {
+    order
+        .into_iter()
+        .map(|group_key| ArtifactVersions {
+            source_name: source_name.to_string(),
+            group_key: group_key.clone(),
+            versions: groups.get(&group_key).cloned().unwrap_or_default(),
+        })
+        .collect()
 }
 
 async fn download_pending(
@@ -655,7 +913,9 @@ async fn resolve_actions(
                     "{web_base}/{}/{}/actions/runs/{}",
                     source.owner, source.repo, run.id
                 ),
-                file_name: name,
+                file_name: name.clone(),
+                group_key: String::new(),
+                version_label: format!("run #{}", run.run_number),
                 size: Some(artifact.size as u64),
                 release_tag: run.run_number.to_string(),
                 changelog: String::new(),
@@ -714,6 +974,8 @@ async fn resolve_github(
                     source.owner, source.repo, release.tag
                 ),
                 file_name: asset.name.clone(),
+                group_key: String::new(),
+                version_label: release.tag.clone(),
                 size: Some(asset.size as u64),
                 release_tag: release.tag.clone(),
                 changelog: release.body.clone(),
@@ -743,7 +1005,9 @@ fn resolve_urls(source: &SourceConfig) -> (Vec<PendingFile>, String) {
             source_name: source.name.clone(),
             url: url.clone(),
             link_url: url.clone(),
-            file_name: name,
+            file_name: name.clone(),
+            group_key: String::new(),
+            version_label: String::new(),
             size: None,
             release_tag: String::new(),
             changelog: String::new(),
@@ -859,6 +1123,401 @@ fn prune_old_files(out_dir: &str, keep: i64, filters: &[String]) {
 mod tests {
     use super::*;
 
+    fn source(kind: SourceKind, version_suffix: bool) -> SourceConfig {
+        SourceConfig {
+            name: "demo".to_string(),
+            kind,
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            tag: "latest".to_string(),
+            private: false,
+            workflow: String::new(),
+            max_runs: 10,
+            releases: 10,
+            keep: 0,
+            changelog: false,
+            version_suffix,
+            urls: Vec::new(),
+            filters: vec!["*.zip".to_string()],
+            out_dir: "out".to_string(),
+            extract: None,
+        }
+    }
+
+    fn asset(name: &str, size: i64) -> github::GhAsset {
+        github::GhAsset {
+            name: name.to_string(),
+            size,
+            browser_download_url: format!("https://download.invalid/{name}"),
+            api_url: format!("https://api.invalid/{name}"),
+        }
+    }
+
+    fn run(id: i64, number: i64) -> github::GhRun {
+        github::GhRun {
+            id,
+            name: "vpinmame".to_string(),
+            status: "completed".to_string(),
+            conclusion: "success".to_string(),
+            run_number: number,
+            created_at: None,
+            artifacts_url: String::new(),
+        }
+    }
+
+    fn artifact_named(name: &str, size: i64) -> github::GhArtifact {
+        github::GhArtifact {
+            id: 1,
+            name: name.to_string(),
+            size,
+            archive_download_url: format!("https://download.invalid/{name}.zip"),
+            expired: false,
+        }
+    }
+
+    #[test]
+    fn version_dropdown_rows_offers_older_releases_of_the_same_asset() {
+        let source = source(SourceKind::GitHub, false);
+        let releases = vec![
+            github::GhRelease {
+                tag: "v2".to_string(),
+                prerelease: false,
+                draft: false,
+                body: "new".to_string(),
+                published_at: None,
+                assets: vec![asset("game.zip", 20), asset("other.zip", 5)],
+            },
+            github::GhRelease {
+                tag: "v1".to_string(),
+                prerelease: false,
+                draft: false,
+                body: "old".to_string(),
+                published_at: None,
+                assets: vec![asset("game.zip", 10)],
+            },
+        ];
+
+        let groups = group_release_versions(&source, "https://github.com", false, &releases);
+        assert_eq!(groups.len(), 2);
+
+        let game = groups.iter().find(|g| g.group_key == "game.zip").expect("game.zip");
+        assert_eq!(game.versions.len(), 2);
+        // Newest first, and each version carries its own tag, size and link.
+        assert_eq!(game.versions[0].version_label, "v2");
+        assert_eq!(game.versions[1].version_label, "v1");
+        assert_eq!(game.versions[1].size, Some(10));
+        assert_eq!(game.versions[1].url, "https://download.invalid/game.zip");
+        assert_eq!(
+            game.versions[1].link_url,
+            "https://github.com/owner/repo/releases/tag/v1"
+        );
+        assert_eq!(
+            game.versions[1].destination,
+            Path::new("out").join("game.zip").to_string_lossy()
+        );
+        assert_eq!(groups.iter().find(|g| g.group_key == "other.zip").unwrap().versions.len(), 1);
+    }
+
+    #[test]
+    fn version_dropdown_prefers_the_api_url_when_a_token_is_present() {
+        let source = source(SourceKind::GitHub, false);
+        let releases = vec![github::GhRelease {
+            tag: "v1".to_string(),
+            prerelease: false,
+            draft: false,
+            body: String::new(),
+            published_at: None,
+            assets: vec![asset("game.zip", 10)],
+        }];
+        let groups = group_release_versions(&source, "https://github.com", true, &releases);
+        assert_eq!(groups[0].versions[0].url, "https://api.invalid/game.zip");
+    }
+
+    #[test]
+    fn version_dropdown_skips_drafts_unmatched_assets_and_empty_urls() {
+        let source = source(SourceKind::GitHub, false);
+        let releases = vec![
+            github::GhRelease {
+                tag: "draft".to_string(),
+                prerelease: false,
+                draft: true,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("game.zip", 1)],
+            },
+            github::GhRelease {
+                tag: "v1".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![
+                    asset("notes.txt", 1),
+                    github::GhAsset {
+                        name: "no-url.zip".to_string(),
+                        size: 1,
+                        browser_download_url: String::new(),
+                        api_url: String::new(),
+                    },
+                ],
+            },
+        ];
+        let groups = group_release_versions(&source, "https://github.com", false, &releases);
+        assert!(groups.is_empty());
+        // With a token the API url is used, so the same asset is offered.
+        let with_token = group_release_versions(&source, "https://github.com", true, &releases);
+        assert!(with_token.is_empty());
+    }
+
+    #[test]
+    fn version_dropdown_gives_each_version_its_own_suffixed_file() {
+        let source = source(SourceKind::GitHub, true);
+        let releases = vec![
+            github::GhRelease {
+                tag: "v2".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("game.zip", 20)],
+            },
+            github::GhRelease {
+                tag: "v1".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("game.zip", 10)],
+            },
+        ];
+        let groups = group_release_versions(&source, "https://github.com", false, &releases);
+        let game = &groups[0].versions;
+        // One key, so the dropdown groups them, but distinct files on disk.
+        assert_eq!(game[0].group_key, game[1].group_key);
+        assert_eq!(game[0].file_name, "game-v2.zip");
+        assert_eq!(game[1].file_name, "game-v1.zip");
+        assert_ne!(game[0].destination, game[1].destination);
+    }
+
+    #[test]
+    fn run_versions_label_runs_and_skip_expired_artifacts() {
+        let source = source(SourceKind::Actions, false);
+        let run = |id: i64, number: i64| github::GhRun {
+            id,
+            name: "vpinmame".to_string(),
+            status: "completed".to_string(),
+            conclusion: "success".to_string(),
+            run_number: number,
+            created_at: None,
+            artifacts_url: String::new(),
+        };
+        let artifact = |name: &str, expired: bool| github::GhArtifact {
+            id: 1,
+            name: name.to_string(),
+            size: 7,
+            archive_download_url: format!("https://download.invalid/{name}.zip"),
+            expired,
+        };
+        let newest = run(100, 12);
+        let older = run(90, 11);
+        let runs = vec![
+            (&newest, vec![artifact("game.zip", false), artifact("gone.zip", true)]),
+            (&older, vec![artifact("game.zip", false)]),
+        ];
+
+        let groups = group_run_versions(&source, "https://github.com", &runs);
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.group_key, "game.zip");
+        assert_eq!(group.versions.len(), 2);
+        assert_eq!(group.versions[0].version_label, "run #12");
+        assert_eq!(group.versions[1].version_label, "run #11");
+        assert_eq!(
+            group.versions[1].link_url,
+            "https://github.com/owner/repo/actions/runs/90"
+        );
+        assert!(group.versions[0].json_accept);
+    }
+
+    #[test]
+    fn apply_names_sanitizes_the_key_and_builds_the_destination() {
+        let source = source(SourceKind::GitHub, false);
+        let mut file = PendingFile {
+            source_name: "demo".to_string(),
+            url: "https://download.invalid/x".to_string(),
+            link_url: String::new(),
+            file_name: "sub/game:win.zip".to_string(),
+            group_key: String::new(),
+            version_label: "v1".to_string(),
+            size: None,
+            release_tag: "v1".to_string(),
+            changelog: String::new(),
+            published_at: None,
+            json_accept: false,
+            destination: String::new(),
+        };
+        apply_names(&source, &mut file);
+        // Only the last path segment survives, and path-hostile characters
+        // become underscores. Key and file name stay in step.
+        assert_eq!(file.file_name, "game_win.zip");
+        // The group key is name-only: separators normalize, case folds.
+        assert_eq!(file.group_key, "game-win.zip");
+        assert_eq!(
+            file.destination,
+            Path::new("out").join("game_win.zip").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn version_group_key_drops_version_build_and_commit_tokens() {
+        // Real asset and artifact names: the version rides in the name, so an
+        // exact comparison would only ever match within one release.
+        assert_eq!(version_group_key("dmdext-v2.5.0-x64.zip"), "dmdext-x64.zip");
+        assert_eq!(
+            version_group_key("VPinMAME-sc-3.7.0-1038-aed5459-win-x86.zip"),
+            "vpinmame-sc-win-x86.zip"
+        );
+        assert_eq!(
+            version_group_key("VPinballX_BGFX-10.8.1-6480-8ac5b79c5-windows-x64-Release.zip"),
+            "vpinballx-bgfx-windows-x64-release.zip"
+        );
+        assert_eq!(version_group_key("FlexDMD.zip"), "flexdmd.zip");
+        // Version glued to the extension, and the same artifact one release older.
+        assert_eq!(version_group_key("VPinballX.starter-1.8.zip"), "vpinballx.starter.zip");
+        assert_eq!(
+            version_group_key("libpinmame-3.7.0-1038-aed5459-macos.tar.gz"),
+            "libpinmame-macos.tar.gz"
+        );
+    }
+
+    #[test]
+    fn version_group_key_keeps_the_tokens_that_tell_artifacts_apart() {
+        // Architectures and variants stay, so they never share a dropdown.
+        assert_ne!(
+            version_group_key("dmdext-v2.5.0-x64.zip"),
+            version_group_key("dmdext-v2.5.0-x86.zip")
+        );
+        assert_ne!(
+            version_group_key("dmdext-v2.5.0-x64.msi"),
+            version_group_key("dmdext-v2.5.0-x64.zip")
+        );
+        assert_ne!(
+            version_group_key("VPinballX-10.8.1-6480-a-windows-x64-Release.zip"),
+            version_group_key("VPinballX_BGFX-10.8.1-6480-a-windows-x64-Release.zip")
+        );
+        // A short number is a name, not a build number.
+        assert_ne!(version_group_key("two_balls_2.zip"), version_group_key("two_balls_3.zip"));
+        assert_eq!(version_group_key("arm64-x64-x86_64.zip"), "arm64-x64-x86-64.zip");
+        // A name made only of version tokens stays one group of its own.
+        assert_eq!(version_group_key("1.2.3.zip"), "1.2.3.zip");
+        assert_eq!(version_group_key(""), "");
+    }
+
+    #[test]
+    fn version_dropdown_groups_version_named_assets_of_older_releases() {
+        // The reported bug: only a source whose asset name is stable (FlexDMD)
+        // produced a dropdown. Names carrying the version must group too.
+        let source = source(SourceKind::GitHub, false);
+        let releases = vec![
+            github::GhRelease {
+                tag: "v2.5.0".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("dmdext-v2.5.0-x64.zip", 100), asset("dmdext-v2.5.0-x86.zip", 90)],
+            },
+            github::GhRelease {
+                tag: "v2.4.0".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("dmdext-v2.4.0-x64.zip", 80), asset("dmdext-v2.4.0-x86.zip", 70)],
+            },
+            github::GhRelease {
+                tag: "v2.3.1".to_string(),
+                prerelease: false,
+                draft: false,
+                body: String::new(),
+                published_at: None,
+                assets: vec![asset("dmdext-v2.3.1-x64.zip", 60)],
+            },
+        ];
+
+        let groups = group_release_versions(&source, "https://github.com", false, &releases);
+        assert_eq!(groups.len(), 2, "x64 and x86 stay separate groups");
+
+        let x64 = groups.iter().find(|g| g.group_key == "dmdext-x64.zip").expect("x64 group");
+        assert_eq!(x64.versions.len(), 3);
+        assert_eq!(x64.versions[0].file_name, "dmdext-v2.5.0-x64.zip");
+        assert_eq!(x64.versions[2].file_name, "dmdext-v2.3.1-x64.zip");
+        assert_eq!(x64.versions[2].release_tag, "v2.3.1");
+
+        let x86 = groups.iter().find(|g| g.group_key == "dmdext-x86.zip").expect("x86 group");
+        assert_eq!(x86.versions.len(), 2);
+    }
+
+    #[test]
+    fn run_versions_group_across_runs_whose_names_carry_the_version() {
+        let source = source(SourceKind::Actions, false);
+        let newest = run(1_000, 6_241);
+        let older = run(999, 6_240);
+        let runs = vec![
+            (
+                &newest,
+                vec![artifact_named(
+                    "VPinballX-10.8.1-6480-8ac5b79c5-windows-x64-Release.zip",
+                    20,
+                )],
+            ),
+            (
+                &older,
+                vec![artifact_named(
+                    "VPinballX-10.8.1-6477-099c8a386-windows-x64-Release.zip",
+                    19,
+                )],
+            ),
+        ];
+
+        let groups = group_run_versions(&source, "https://github.com", &runs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_key, "vpinballx-windows-x64-release.zip");
+        assert_eq!(groups[0].versions.len(), 2);
+        assert_eq!(groups[0].versions[0].version_label, "run #6241");
+        assert_eq!(groups[0].versions[1].version_label, "run #6240");
+    }
+
+    #[test]
+    fn version_cell_label_shows_names_only_when_the_group_needs_them() {
+        let source = source(SourceKind::GitHub, false);
+        let mut versioned = PendingFile {
+            source_name: "demo".to_string(),
+            url: "https://download.invalid/a".to_string(),
+            link_url: String::new(),
+            file_name: "dmdext-v2.5.0-x64.zip".to_string(),
+            group_key: String::new(),
+            version_label: "v2.5.0".to_string(),
+            size: None,
+            release_tag: "v2.5.0".to_string(),
+            changelog: String::new(),
+            published_at: None,
+            json_accept: false,
+            destination: String::new(),
+        };
+        apply_names(&source, &mut versioned);
+        assert_eq!(
+            gui::version_cell_label(&versioned, true),
+            "v2.5.0  -  dmdext-v2.5.0-x64.zip"
+        );
+        assert_eq!(gui::version_cell_label(&versioned, false), "v2.5.0");
+
+        let mut plain = versioned.clone();
+        plain.file_name = "FlexDMD.zip".to_string();
+        plain.version_label = String::new();
+        assert_eq!(gui::version_cell_label(&plain, true), "FlexDMD.zip");
+    }
+
     #[test]
     fn github_web_base_default_is_github_com() {
         let config = AppConfig {
@@ -868,6 +1527,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            releases: 10,
             sound: String::new(),
             sound_player: String::new(),
             sources: Vec::new(),
@@ -884,6 +1544,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            releases: 10,
             sound: String::new(),
             sound_player: String::new(),
             sources: Vec::new(),

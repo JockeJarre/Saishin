@@ -171,6 +171,31 @@ pub async fn get_releases(
     Ok(releases)
 }
 
+/// The `limit` newest releases, independent of the source's `tag`. The GUI
+/// version dropdown needs a bounded window of recent releases, so this
+/// stops as soon as the limit is reached instead of walking every page.
+pub async fn get_recent_releases(
+    http: &Downloader,
+    config: &AppConfig,
+    source: &SourceConfig,
+    token: Option<&str>,
+    limit: i64,
+) -> Result<Vec<GhRelease>, AppError> {
+    let limit = limit.max(1);
+    let per_page = limit.min(100);
+    let mut releases = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let batch = get_release_page(http, config, source, token, per_page, page).await?;
+        let full = batch.len() as i64 >= per_page;
+        releases.extend(batch);
+        if !full || releases.len() as i64 >= limit {
+            break;
+        }
+    }
+    releases.truncate(limit as usize);
+    Ok(releases)
+}
+
 async fn get_release_page(
     http: &Downloader,
     config: &AppConfig,

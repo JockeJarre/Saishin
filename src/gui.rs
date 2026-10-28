@@ -21,7 +21,6 @@ use std::collections::HashMap;
 
 struct GuiJob {
     sources: Vec<SourceConfig>,
-    entries: Vec<PendingFile>,
     config: AppConfig,
     token: Option<String>,
     options: Options,
@@ -58,10 +57,58 @@ struct GuiProgress {
 struct ArtifactEntry {
     file: PendingFile,
     selected: bool,
+    /// Older releases (or workflow runs) of the same artifact, newest first.
+    versions: Vec<PendingFile>,
+    version_index: usize,
+    /// Rows offering exactly the same versions (the files of one release, or
+    /// of one workflow run) share one dropdown. `None` when the row has no
+    /// versions to offer.
+    family: Option<usize>,
+}
+
+/// Rows sharing one version dropdown: one release or one workflow run usually
+/// carries several files (architectures, installers), and picking a version
+/// there has to switch all of them, not just the row the dropdown sits on.
+struct VersionFamily {
+    rows: Vec<usize>,
+    /// The versions every row of the family offers, newest first.
+    labels: Vec<String>,
+    picked: usize,
+}
+
+/// True when `row` is the row of `family` that draws the version dropdown.
+fn is_family_owner(families: &[VersionFamily], family: usize, row: usize) -> bool {
+    families
+        .get(family)
+        .map(|family| family.rows.first() == Some(&row))
+        .unwrap_or(false)
+}
+
+/// Applies the version picked in a family dropdown to every row of it, so the
+/// file names and sizes beside the rows follow the pick.
+fn apply_picks(entries: &mut [ArtifactEntry], families: &mut [VersionFamily], picks: Vec<(usize, usize)>) {
+    for (family_index, label_index) in picks {
+        let Some(family) = families.get_mut(family_index) else { continue };
+        let Some(label) = family.labels.get(label_index).cloned() else { continue };
+        family.picked = label_index;
+        for &row in &family.rows {
+            if let Some(entry) = entries.get_mut(row) {
+                let position = entry
+                    .versions
+                    .iter()
+                    .position(|version| version_cell_label(version, false) == label);
+                if let Some(position) = position {
+                    entry.version_index = position;
+                    entry.file = entry.versions[position].clone();
+                }
+            }
+        }
+    }
 }
 
 struct SelectionApp {
     entries: Vec<ArtifactEntry>,
+    families: Vec<VersionFamily>,
     job: Arc<GuiJob>,
     result: Arc<GuiResult>,
     cancel: Arc<AtomicBool>,
@@ -70,6 +117,11 @@ struct SelectionApp {
     centered_at_startup: bool,
     window_centered: bool,
 }
+
+/// The artifact list is five columns wide and the file names carry the
+/// version, the build number and the commit, so it needs room to be readable.
+const WINDOW_WIDTH: f32 = 940.0;
+const WINDOW_HEIGHT: f32 = 640.0;
 
 fn error_message(ex: AppError) -> String {
     match ex {
@@ -100,13 +152,99 @@ impl ProgressSink for GuiSink {
     }
 }
 
+/// Text for one entry of the version dropdown. Versions of the same artifact
+/// often carry different file names (`dmdext-v2.5.0-x64.zip` per release), so
+/// the name is added next to the version whenever the group's names differ -
+/// otherwise the list would be a column of tags telling you nothing about what
+/// you are about to download.
+pub(crate) fn version_cell_label(version: &PendingFile, show_names: bool) -> String {
+    let label = version.version_label.trim();
+    if label.is_empty() {
+        return version.file_name.clone();
+    }
+    if show_names {
+        format!("{label}  -  {}", version.file_name)
+    } else {
+        label.to_string()
+    }
+}
+
 impl SelectionApp {
-    fn new(entries: Vec<PendingFile>, job: Arc<GuiJob>, result: Arc<GuiResult>, cancel: Arc<AtomicBool>, progress: Arc<Mutex<GuiProgress>>, window_centered: bool, centered_at_startup: bool) -> SelectionApp {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        entries: Vec<PendingFile>,
+        version_map: HashMap<(String, String), Vec<PendingFile>>,
+        job: Arc<GuiJob>,
+        result: Arc<GuiResult>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<GuiProgress>>,
+        window_centered: bool,
+        centered_at_startup: bool,
+    ) -> SelectionApp {
+        let mut entries: Vec<ArtifactEntry> = entries
+            .into_iter()
+            .map(|file| {
+                let mut versions = version_map
+                    .get(&(file.source_name.clone(), file.group_key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let version_index = match versions.iter().position(|version| version.url == file.url) {
+                    Some(index) => index,
+                    None => {
+                        // The row sits outside the version window (a source
+                        // with tag = all, for example); keep it selectable.
+                        versions.insert(0, file.clone());
+                        0
+                    }
+                };
+                ArtifactEntry {
+                    file,
+                    selected: true,
+                    versions,
+                    version_index,
+                    family: None,
+                }
+            })
+            .collect();
+
+        // One release, or one workflow run, usually carries several files.
+        // Rows that offer exactly the same versions are given a family, and
+        // the family gets a single dropdown that switches all of its rows.
+        let mut families: Vec<VersionFamily> = Vec::new();
+        let mut by_labels: HashMap<(String, Vec<String>), usize> = HashMap::new();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            if entry.versions.is_empty() {
+                continue;
+            }
+            let labels: Vec<String> = entry
+                .versions
+                .iter()
+                .map(|version| version_cell_label(version, false))
+                .collect();
+            let key = (entry.file.source_name.clone(), labels.clone());
+            match by_labels.get(&key) {
+                Some(family) => {
+                    let family = *family;
+                    if let Some(family) = families.get_mut(family) {
+                        family.rows.push(index);
+                    }
+                    entry.family = Some(family);
+                }
+                None => {
+                    by_labels.insert(key, families.len());
+                    families.push(VersionFamily {
+                        rows: vec![index],
+                        labels,
+                        picked: entry.version_index,
+                    });
+                    entry.family = Some(families.len() - 1);
+                }
+            }
+        }
+
         SelectionApp {
-            entries: entries
-                .into_iter()
-                .map(|file| ArtifactEntry { file, selected: true })
-                .collect(),
+            entries,
+            families,
             job,
             result,
             cancel,
@@ -118,10 +256,16 @@ impl SelectionApp {
     }
 
     fn start_download(&mut self, chosen: Vec<usize>) {
+        let chosen_files: Vec<PendingFile> = chosen
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.file.clone())
+            .collect();
+
         let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
         progress.phase = Phase::Downloading;
         progress.done = 0;
-        progress.total = chosen.len();
+        progress.total = chosen_files.len();
         progress.message = "".to_string();
         progress.rows = self.entries
             .iter()
@@ -133,10 +277,12 @@ impl SelectionApp {
         let progress_arc = Arc::clone(&self.progress);
         let result = Arc::clone(&self.result);
 
-        let index: HashMap<(String, String), usize> = job.entries
+        // Built from the rows as they now stand, so a version swapped in the
+        // dropdown reports progress on the right row.
+        let index: HashMap<(String, String), usize> = self.entries
             .iter()
             .enumerate()
-            .map(|(i, file)| ((file.source_name.clone(), file.file_name.clone()), i))
+            .map(|(i, entry)| ((entry.file.source_name.clone(), entry.file.file_name.clone()), i))
             .collect();
         let sink = GuiSink { progress: Arc::clone(&self.progress), index };
 
@@ -164,11 +310,10 @@ impl SelectionApp {
                     async {
                         let cancel_ref: &Arc<AtomicBool> = &cancel;
                         for source in job.sources.iter() {
-                            let files: Vec<PendingFile> = job.entries
+                            let files: Vec<PendingFile> = chosen_files
                                 .iter()
-                                .enumerate()
-                                .filter(|(index, file)| chosen.contains(index) && file.source_name == source.name)
-                                .map(|(_, file)| file.clone())
+                                .filter(|file| file.source_name == source.name)
+                                .cloned()
                                 .collect();
                             if files.is_empty() {
                                 continue;
@@ -291,15 +436,27 @@ impl App for SelectionApp {
                     }
 
                     ui.label(format!("{} new artifact(s)", self.entries.len()));
+                    ui.label("Pick an older version in the version column to download that instead.");
 
-                    egui::ScrollArea::vertical()
+                    // Picking a version changes rows, so the picks are
+                    // collected while drawing and applied once the list is
+                    // rendered.
+                    let mut picks: Vec<(usize, usize)> = Vec::new();
+
+                    egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
                             egui::Grid::new("artifact_list")
                                 .spacing(egui::vec2(8.0, 4.0))
                                 .show(ui, |ui| {
-                                    for (_index, entry) in self.entries.iter_mut().enumerate() {
+                                    ui.label("");
+                                    ui.strong("source");
+                                    ui.strong("size");
+                                    ui.strong("version");
+                                    ui.strong("file");
+                                    ui.end_row();
+                                    for (index, entry) in self.entries.iter_mut().enumerate() {
                                         ui.checkbox(&mut entry.selected, "");
                                         ui.label(entry.file.source_name.clone());
                                         let size = match entry.file.size {
@@ -307,11 +464,57 @@ impl App for SelectionApp {
                                             None => "size unknown".to_string(),
                                         };
                                         ui.label(size);
+                                        match entry.family {
+                                            None => { ui.label(entry.file.version_label.clone()); }
+                                            Some(family) if !is_family_owner(&self.families, family, index) => {
+                                                // Same versions as the row that
+                                                // owns the dropdown, and its
+                                                // pick switches this row too.
+                                                ui.label(entry.file.version_label.clone());
+                                            }
+                                            Some(family) => {
+                                                // One dropdown for every row of
+                                                // the family.
+                                                let labels = self.families[family].labels.clone();
+                                                let picked = self.families[family].picked;
+                                                // Full file names are listed
+                                                // next to the version whenever
+                                                // this row's names differ, so
+                                                // picking an entry is never a
+                                                // guess.
+                                                let show_names = entry.versions.len() > 1
+                                                    && entry.versions.iter().any(|version| {
+                                                        version.file_name != entry.versions[0].file_name
+                                                    });
+                                                let versions = entry.versions.clone();
+                                                let mut current = picked;
+                                                egui::ComboBox::from_id_source((index, &entry.file.source_name, &entry.file.group_key))
+                                                    .selected_text(version_cell_label(&entry.file, false))
+                                                    .show_ui(ui, |ui| {
+                                                        for (i, label) in labels.iter().enumerate() {
+                                                            let text = match versions.get(i) {
+                                                                Some(version) => version_cell_label(version, show_names),
+                                                                None => label.clone(),
+                                                            };
+                                                            if ui.selectable_value(&mut current, i, text).changed() {
+                                                                picks.push((family, i));
+                                                            }
+                                                        }
+                                                    });
+                                            }
+                                        }
                                         ui.hyperlink_to(&entry.file.file_name, &entry.file.link_url);
                                         ui.end_row();
                                     }
                                 });
                         });
+
+                    if !picks.is_empty() {
+                        apply_picks(&mut self.entries, &mut self.families, picks);
+                        // Redraw right away, so the columns beside the picked
+                        // row show the version that was chosen.
+                        ui.ctx().request_repaint();
+                    }
                 });
             }
             Phase::Downloading => {
@@ -422,13 +625,14 @@ fn centered_position(_width: f32, _height: f32) -> Option<[f32; 2]> {
 
 pub fn run_gui(
     entries: Vec<PendingFile>,
+    version_map: HashMap<(String, String), Vec<PendingFile>>,
     sources: Vec<SourceConfig>,
     config: AppConfig,
     token: Option<String>,
     options: Options,
 ) -> Result<Vec<String>, AppError> {
     let window_centered = config.window_centered;
-    let job = Arc::new(GuiJob { sources, entries: entries.clone(), config, token, options });
+    let job = Arc::new(GuiJob { sources, config, token, options });
     let result = Arc::new(GuiResult { updated: Mutex::new(Vec::new()) });
     let cancel = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Selecting, done: 0, total: 0, message: "".to_string(), rows: Vec::new() }));
@@ -443,14 +647,14 @@ pub fn run_gui(
         Err(_) => Arc::new(egui::IconData::default()),
     };
     let startup_center = if window_centered {
-        centered_position(520.0, 420.0)
+        centered_position(WINDOW_WIDTH, WINDOW_HEIGHT)
     } else {
         None
     };
     let centered_at_startup = startup_center.is_some();
     let mut builder = egui::ViewportBuilder::default()
-        .with_inner_size([520.0, 420.0])
-        .with_min_inner_size([520.0, 420.0])
+        .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
+        .with_min_inner_size([620.0, 380.0])
         .with_icon(app_icon);
     builder = match startup_center {
         Some([x, y]) => builder.with_position([x, y]).with_visible(false),
@@ -461,7 +665,7 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Box::new(SelectionApp::new(entries, job, gui_result, cancel, progress, window_centered, centered_at_startup))),
+        Box::new(move |_| Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup))),
     );
 
     if let Err(ex) = outcome {

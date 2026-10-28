@@ -249,6 +249,7 @@ the directory containing the INI file.
 | `github_api_url` | `https://api.github.com` | API root; override for GitHub Enterprise |
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
 | `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
+| `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
 | `sound` | empty | Play this sound file after a run that downloaded something |
 | `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
 
@@ -261,6 +262,7 @@ the directory containing the INI file.
 | `filters` | *(all)* | Comma-separated globs matched against the file name; a glob prefixed with `!` excludes matches |
 | `changelog` | `false` | Write the release description to `<artifact>.txt` next to each downloaded file (github sources) |
 | `version_suffix` | `false` | Rename downloads to `<stem>-<tag><ext>` so same-name artifacts keep one file per version (release tag, or run number for actions) |
+| `releases` | `10` | Number of recent releases, or workflow runs, offered in the `--gui` version dropdown. Overrides `[general] releases` for this source |
 
 ### `type = github`
 
@@ -396,6 +398,32 @@ you do not want, then press **Download selected**. **Cancel** aborts the run;
 artifacts are downloaded; the rest of the run (changelogs, archive handling,
 notifications) proceeds as usual. The window needs a display server, so use
 the plain CLI mode for headless scheduled runs.
+
+### Picking an older version
+
+The **version** column holds a dropdown over the last `releases` releases of an
+artifact — release tags for `type = github`, recent workflow runs for
+`type = actions`. Rows still show only artifacts that are new; the dropdown is
+how you deliberately download an older version of one of them.
+
+Versions are matched across releases by name with the version, the build number
+and the commit removed, so a project that names its assets
+`dmdext-v2.5.0-x64.zip` groups with its own `dmdext-v2.4.0-x64.zip`. The tokens
+that tell artifacts apart — architecture, variant, extension — are kept, so the
+x64 and the x86 build never end up in one dropdown.
+
+One release, or one workflow run, usually carries several files. Rows offering
+exactly the same versions share a single dropdown, drawn on the first of them;
+the other rows show the version as a label. Picking a version switches every
+row of the group, so their size, destination file, download URL and hyperlink
+all follow the selection. Dropdown entries name the file next to the version
+whenever the names differ, so a pick is never a guess. Plain `url` sources have
+no versions and show the file name as a label.
+
+The window lists versions only for the artifacts it already knows about, so
+the extra GitHub calls are made on this path alone: the newest `releases`
+releases, or `releases` workflow runs with their artifacts, fetched in
+parallel while the list is being built. CLI runs never make them.
 
 ---
 

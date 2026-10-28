@@ -30,6 +30,7 @@ pub struct SourceConfig {
     pub private: bool,
     pub workflow: String,
     pub max_runs: i64,
+    pub releases: i64,
     pub keep: i64,
     pub changelog: bool,
     pub version_suffix: bool,
@@ -49,6 +50,7 @@ pub struct AppConfig {
     pub keyring_service: String,
     pub notify: bool,
     pub window_centered: bool,
+    pub releases: i64,
     pub sound: String,
     pub sound_player: String,
     pub sources: Vec<SourceConfig>,
@@ -87,12 +89,19 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
         notify: get_bool(&sections, GENERAL_SECTION, "notify", false)?,
         window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
+        releases: get_int(&sections, GENERAL_SECTION, "releases", 10)?,
         sound: resolve_sound(&sections, GENERAL_SECTION, &base_dir),
         sound_player: get_string(&sections, GENERAL_SECTION, "sound_player", "")
             .trim()
             .to_string(),
         sources: Vec::new(),
     };
+
+    if config.releases < 1 {
+        return Err(AppError::Config(
+            "Section [general]: 'releases' must be at least 1.".to_string(),
+        ));
+    }
 
     // Preserve file order for sources.
     let mut ordered: Vec<String> = Vec::new();
@@ -107,7 +116,7 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
     }
 
     for name in ordered {
-        if let Some(source) = read_source(&sections, &name, &config.default_out_dir, &base_dir)? {
+        if let Some(source) = read_source(&sections, &name, &config.default_out_dir, &base_dir, config.releases)? {
             config.sources.push(source);
         }
     }
@@ -126,6 +135,7 @@ fn read_source(
     section: &str,
     default_out: &str,
     base_dir: &str,
+    default_releases: i64,
 ) -> Result<Option<SourceConfig>, AppError> {
     let raw_type = get_string(sections, section, "type", "");
     let source_type = raw_type.to_lowercase();
@@ -156,6 +166,7 @@ fn read_source(
                 private: get_bool(sections, section, "private", false)?,
                 workflow: String::new(),
                 max_runs: 10,
+                releases: get_int(sections, section, "releases", default_releases)?,
                 keep: 0,
                 changelog: false,
                 version_suffix: false,
@@ -174,6 +185,7 @@ fn read_source(
             private: false,
             workflow: String::new(),
             max_runs: 10,
+            releases: get_int(sections, section, "releases", default_releases)?,
             keep: 0,
             changelog: false,
             version_suffix: false,
@@ -199,6 +211,7 @@ fn read_source(
                 private: false,
                 workflow: get_string(sections, section, "workflow", ""),
                 max_runs: get_int(sections, section, "runs", 10)?,
+                releases: get_int(sections, section, "releases", default_releases)?,
                 keep: 0,
                 changelog: false,
                 version_suffix: false,
@@ -230,6 +243,11 @@ fn read_source(
     if source.max_runs < 1 {
         return Err(AppError::Config(format!(
             "Section [{section}]: 'runs' must be at least 1."
+        )));
+    }
+    if source.releases < 1 {
+        return Err(AppError::Config(format!(
+            "Section [{section}]: 'releases' must be at least 1."
         )));
     }
 
@@ -485,6 +503,44 @@ mod tests {
         assert!(err.to_string().contains("No sources defined"));
 
         for path in [missing_type, bad_bool, negative_keep, unknown, no_sources] {
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn releases_defaults_to_ten_and_is_overridable_per_source() {
+        let path = write_ini(
+            "releases.ini",
+            "[general]\nreleases = 25\n\n[copy_default]\ntype = github\nowner = o\nrepo = r\n\n[override_it]\ntype = actions\nowner = o\nrepo = r\nreleases = 3\n",
+        );
+        let config = load(&path).expect("load");
+        assert_eq!(config.releases, 25);
+        assert_eq!(config.sources[0].releases, 25);
+        assert_eq!(config.sources[1].releases, 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn releases_must_be_positive() {
+        let general = write_ini("releases-zero.ini", "[general]\nreleases = 0\n[demo]\ntype = url\nurls = https://example.invalid/a\n");
+        let err = load(&general).expect_err("must fail");
+        assert!(err.to_string().contains("'releases' must be at least 1"));
+
+        let section = write_ini(
+            "releases-section.ini",
+            "[demo]\ntype = github\nowner = o\nrepo = r\nreleases = 0\n",
+        );
+        let err = load(&section).expect_err("must fail");
+        assert!(err.to_string().contains("[demo]: 'releases' must be at least 1"));
+
+        let not_a_number = write_ini(
+            "releases-text.ini",
+            "[demo]\ntype = github\nowner = o\nrepo = r\nreleases = many\n",
+        );
+        let err = load(&not_a_number).expect_err("must fail");
+        assert!(err.to_string().contains("'releases' must be a whole number"));
+
+        for path in [general, section, not_a_number] {
             std::fs::remove_file(&path).ok();
         }
     }
