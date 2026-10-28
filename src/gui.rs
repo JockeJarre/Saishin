@@ -122,7 +122,9 @@ struct SelectionApp {
 /// The artifact list is five columns wide and the file names carry the
 /// version, the build number and the commit, so it needs room to be readable.
 const WINDOW_WIDTH: f32 = 940.0;
-const WINDOW_HEIGHT: f32 = 640.0;
+/// The height fits the list: the header is one row, so the window does not
+/// need the 640 px a header of two stacked rows took.
+const WINDOW_HEIGHT: f32 = 520.0;
 
 /// The header logo as raw RGBA8 pixels, decoded and shrunk from the PNG by
 /// `build.rs`. Pixels and not PNG bytes on purpose: the embedded bytes are
@@ -130,17 +132,24 @@ const WINDOW_HEIGHT: f32 = 640.0;
 /// image decoder at run time.
 const LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/saishin-logo.rgba"));
 /// Pixels on a side of the embedded logo: a quarter of the 1024 px PNG, which
-/// is what a 120 pt logo takes on a 2x display. `build.rs` reports the size it
-/// wrote, and the test at the bottom of this file keeps the two in step.
+/// is what the header's 52 pt logo takes on a 2x display. `build.rs` reports
+/// the size it wrote, and the test at the bottom of this file keeps the two in
+/// step.
 const LOGO_SIZE: usize = 256;
 const _: () = assert!(LOGO_RGBA.len() == LOGO_SIZE * LOGO_SIZE * 4);
 
-/// The word the header sets over the logo, the app's name: 最新, "newest".
+/// The header is one row: the logo at the far left, the app's name 最新,
+/// "newest", right beside it.
 const HEADER_WORD: &str = "最新";
-/// Its size in points, and the height of the row it sits in.
-const HEADER_WORD_SIZE: f32 = 40.0;
-const HEADER_WORD_ROW: f32 = 60.0;
-const _: () = assert!(HEADER_WORD_ROW > HEADER_WORD_SIZE);
+const HEADER_ROW: f32 = 64.0;
+/// The logo's height. The row centers logo and word vertically, so this is the
+/// tallest thing in it.
+const HEADER_LOGO: f32 = 52.0;
+/// The word's size in points.
+const HEADER_WORD_SIZE: f32 = 34.0;
+/// The header's inset at the left and the right, in pixels.
+const HEADER_SIDE_MARGIN: i8 = 12;
+const _: () = assert!(HEADER_ROW > HEADER_LOGO && HEADER_LOGO > HEADER_WORD_SIZE);
 
 /// The header logo as an egui image, ready to upload: the bytes `build.rs`
 /// wrote, read as un-premultiplied RGBA.
@@ -412,14 +421,6 @@ impl App for SelectionApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
 
-        egui::Panel::top("header_logo").exact_size(128.0).show_separator_line(false).show(ui, |ui| {
-            ui.centered_and_justified(|ui| {
-                if let Some(logo) = &self.logo {
-                    ui.add(egui::Image::from_texture(logo).max_width(120.0));
-                }
-            });
-        });
-
         // The two kanji are outside egui's bundled font, so the glyphs have to
         // come from this machine. Asking for them is what makes eframe's system
         // font provider look them up; a machine without a font carrying them
@@ -428,13 +429,27 @@ impl App for SelectionApp {
             fonts.has_glyphs(&egui::FontId::proportional(HEADER_WORD_SIZE), HEADER_WORD)
         });
 
-        if kanji {
-            egui::Panel::top("header_kanji").exact_size(HEADER_WORD_ROW).show_separator_line(false).show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new(HEADER_WORD).size(HEADER_WORD_SIZE).strong());
+        egui::Panel::top("header")
+            .exact_size(HEADER_ROW)
+            // The frame keeps the panel's own background; only the inset is set.
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(HEADER_SIDE_MARGIN, 0)),
+            )
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                // Full height, centered: the logo and the word sit on one line
+                // at the left, and the row keeps its height with no word in it.
+                ui.horizontal_centered(|ui| {
+                    if let Some(logo) = &self.logo {
+                        ui.add(egui::Image::from_texture(logo).max_height(HEADER_LOGO));
+                    }
+                    if kanji {
+                        ui.label(egui::RichText::new(HEADER_WORD).size(HEADER_WORD_SIZE).strong());
+                    }
                 });
             });
-        }
 
         match phase {
             Phase::Selecting => {
