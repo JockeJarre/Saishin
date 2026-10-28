@@ -435,6 +435,7 @@ pub fn run_gui(
 
     let mut native_options = eframe::NativeOptions::default();
     native_options.centered = false;
+    native_options.persist_window = false;
     let app_icon = match eframe::icon_data::from_png_bytes(
         include_bytes!("../saishin-png-icon-set/saishin-master-1024.png")
     ) {
