@@ -11,8 +11,6 @@ use crate::ProgressSink;
 use eframe::App;
 use eframe::egui;
 use eframe::run_native;
-use std::fs;
-use std::path::PathBuf;
 use std::thread;
 use tokio::runtime::Builder;
 use std::sync::{Arc, Mutex};
@@ -116,9 +114,6 @@ struct SelectionApp {
     progress: Arc<Mutex<GuiProgress>>,
     /// The header logo, uploaded to the GPU on the first frame.
     logo: Option<egui::TextureHandle>,
-    /// Whether a font carrying the glyphs of 最新 was found, which is what
-    /// decides if the header can spell the name out.
-    kanji: bool,
     shown: bool,
     centered_at_startup: bool,
     window_centered: bool,
@@ -140,59 +135,12 @@ const LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/saishin-logo.
 const LOGO_SIZE: usize = 256;
 const _: () = assert!(LOGO_RGBA.len() == LOGO_SIZE * LOGO_SIZE * 4);
 
-/// The header spells 最新 out as text, and egui's built-in font carries no CJK
-/// glyphs, so a font from the machine joins the font stack as a fallback.
-/// Every platform this app runs on ships one that has the two glyphs.
-///
-/// Returns whether a font was installed: the header only draws the word when
-/// it can be drawn properly, and shows boxes on a machine with no CJK font.
-fn install_cjk_font(ctx: &egui::Context) -> bool {
-    let Some(path) = cjk_font_file() else { return false };
-    let Ok(bytes) = fs::read(&path) else { return false };
-
-    ctx.add_font(egui::FontInsert {
-        name: "saishin-cjk".to_owned(),
-        data: egui::FontData::from_owned(bytes),
-        families: vec![
-            egui::InsertFontFamily { family: egui::FontFamily::Proportional, priority: egui::FontPriority::Lowest },
-            egui::InsertFontFamily { family: egui::FontFamily::Monospace, priority: egui::FontPriority::Lowest },
-        ],
-    });
-    true
-}
-
-/// The first font file on this machine that carries CJK glyphs.
-fn cjk_font_file() -> Option<PathBuf> {
-    cjk_font_candidates().into_iter().find(|path| path.is_file())
-}
-
-/// The font files to try, per platform. The `.ttc` collections are read at
-/// face 0, which is the plain face of each of these.
-fn cjk_font_candidates() -> Vec<PathBuf> {
-    if cfg!(windows) {
-        vec![
-            // Microsoft YaHei, shipped with every Windows since Windows 7.
-            PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
-            // SimHei, and the Japanese faces, both carry the two glyphs too.
-            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-            PathBuf::from(r"C:\Windows\Fonts\YuGothR.ttc"),
-        ]
-    } else if cfg!(target_os = "macos") {
-        vec![
-            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-            PathBuf::from("/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc"),
-        ]
-    } else {
-        vec![
-            // The usual places of `fonts-noto-cjk` and its equivalents: Debian
-            // and Ubuntu, Fedora, Arch.
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-        ]
-    }
-}
+/// The word the header sets over the logo, the app's name: 最新, "newest".
+const HEADER_WORD: &str = "最新";
+/// Its size in points, and the height of the row it sits in.
+const HEADER_WORD_SIZE: f32 = 40.0;
+const HEADER_WORD_ROW: f32 = 60.0;
+const _: () = assert!(HEADER_WORD_ROW > HEADER_WORD_SIZE);
 
 /// The header logo as an egui image, ready to upload: the bytes `build.rs`
 /// wrote, read as un-premultiplied RGBA.
@@ -255,7 +203,6 @@ impl SelectionApp {
         result: Arc<GuiResult>,
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<GuiProgress>>,
-        kanji: bool,
         window_centered: bool,
         centered_at_startup: bool,
     ) -> SelectionApp {
@@ -328,7 +275,6 @@ impl SelectionApp {
             cancel,
             progress,
             logo: None,
-            kanji,
             shown: false,
             centered_at_startup,
             window_centered,
@@ -474,10 +420,18 @@ impl App for SelectionApp {
             });
         });
 
-        if self.kanji {
-            egui::Panel::top("header_kanji").exact_size(60.0).show_separator_line(false).show(ui, |ui| {
+        // The two kanji are outside egui's bundled font, so the glyphs have to
+        // come from this machine. Asking for them is what makes eframe's system
+        // font provider look them up; a machine without a font carrying them
+        // gets the logo on its own, and no row of tofu.
+        let kanji = ui.ctx().fonts_mut(|fonts| {
+            fonts.has_glyphs(&egui::FontId::proportional(HEADER_WORD_SIZE), HEADER_WORD)
+        });
+
+        if kanji {
+            egui::Panel::top("header_kanji").exact_size(HEADER_WORD_ROW).show_separator_line(false).show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("最新").size(40.0).strong());
+                    ui.label(egui::RichText::new(HEADER_WORD).size(HEADER_WORD_SIZE).strong());
                 });
             });
         }
@@ -752,13 +706,7 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |cc: &eframe::CreationContext| {
-            // The header word is set in a font this app does not ship, so the
-            // machine's own CJK font joins the font stack here, before egui
-            // lays out the first frame.
-            let kanji = install_cjk_font(&cc.egui_ctx);
-            Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, kanji, window_centered, centered_at_startup)))
-        }),
+        Box::new(move |_| Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup)))),
     );
 
     if let Err(ex) = outcome {
@@ -794,10 +742,10 @@ mod tests {
         assert!(alpha.any(|&a| a == 255), "the logo has no opaque pixels");
     }
 
-    /// The header word is set in a font the app does not ship, so every
-    /// platform needs its list of the fonts that ship with it.
+    /// The header row, the text size and the width of the window are all set
+    /// for a two-glyph word.
     #[test]
-    fn a_cjk_font_is_listed_for_every_platform() {
-        assert!(!cjk_font_candidates().is_empty());
+    fn the_header_word_is_the_apps_name() {
+        assert_eq!(HEADER_WORD.chars().count(), 2);
     }
 }

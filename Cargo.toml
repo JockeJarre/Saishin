@@ -25,8 +25,8 @@ url = "2"
 futures-util = "0.3"
 # eframe's default renderer is wgpu, which drags in naga, ash, gpu-allocator
 # and friends. This app draws a grid, so the glow (OpenGL) renderer is enough.
-# system_fonts stays on: the header kanji need a font that ships CJK glyphs,
-# and eframe's built-in font has none.
+# system_fonts stays on: the header kanji are outside egui's bundled font, and
+# this is the feature that lets eframe ask the system for a font carrying them.
 eframe = { version = "0.37", default-features = false, features = [
     "default_fonts",
     "system_fonts",
@@ -43,9 +43,10 @@ winit = { version = "0.30", features = [
     "wayland-dlopen",
     "wayland-csd-adwaita",
 ] }
-# The header logo is decoded and shrunk by `build.rs` and embedded as raw
-# RGBA8, so no image decoder is linked into the binary.
+
 [build-dependencies]
+# Decodes and shrinks the header logo, which src/gui.rs embeds as raw RGBA8, so
+# no image decoder is linked into the binary.
 png = "0.18"
 
 # Platform credential stores: Credential Manager on Windows, Keychain on

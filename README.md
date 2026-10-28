@@ -48,10 +48,11 @@ sudo apt-get install -y libdbus-1-dev libssl-dev pkg-config \
 
 Wayland support loads `libwayland` at runtime, so those headers are not needed.
 
-The header of the GUI spells 最新 out in a CJK font, and the app ships none:
-Windows and macOS have one in the system, on Linux install `fonts-noto-cjk`
-(Debian, Ubuntu) or `google-noto-cjk-fonts` (Fedora). A machine without such a
-font gets the logo on its own, which is the whole header minus the word.
+The header of the GUI spells 最新 out as text, and the app ships no CJK font:
+eframe's system font fallback takes one from the machine. Windows and macOS have
+one, on Linux install `fonts-noto-cjk` (Debian, Ubuntu) or
+`google-noto-cjk-fonts` (Fedora). A machine without such a font gets the logo on
+its own: the row is left out rather than set in boxes.
 
 ---
 
