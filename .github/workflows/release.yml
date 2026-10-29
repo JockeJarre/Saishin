@@ -105,9 +105,12 @@ jobs:
         run: |
           version="${{ needs.version.outputs.version }}"
           bundle="saishin-$version-$TARGET"
+          # cargo build --target puts what it built in a directory named after
+          # the target, which is where the tag and the bundle name point too.
+          srcdir="target/$TARGET/release"
           mkdir -p "$bundle"
-          cp "target/release/$PROGRAM" "$bundle/"
-          if [ -n "$LAUNCHER" ]; then cp "target/release/$LAUNCHER" "$bundle/"; fi
+          cp "$srcdir/$PROGRAM" "$bundle/"
+          if [ -n "$LAUNCHER" ]; then cp "$srcdir/$LAUNCHER" "$bundle/"; fi
           cp saishin.ini.template README.md "$bundle/"
           # The packaged binary carries the build identity build.rs stamped in.
           "./$bundle/$(basename "$PROGRAM")" --version
