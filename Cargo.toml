@@ -5,9 +5,29 @@ edition = "2021"
 description = "Keep files up to date from official GitHub releases, actions or any other URL, using an INI configuration file"
 license = "MIT"
 
+# Two binaries, both declared here. autobins is off so src/main.rs is not also
+# picked up as a second binary named after the package:
+#
+#   saishin-cli   the program, src/main.rs. Console subsystem: a terminal run
+#                 prints, the shell waits for it, the exit code arrives. Scripts
+#                 and scheduled tasks call this one.
+#   saishin       the launcher, src/launcher.rs. GUI subsystem, so an icon
+#                 launch gets no console window at all, and this is the binary
+#                 that carries the icon a shortcut, Explorer and the taskbar
+#                 show. It starts saishin-cli and reports its text in a box.
+#
+# default-run keeps a plain cargo run on the program: the launcher answers in a
+# box, which is not what a terminal session wants.
+autobins = false
+default-run = "saishin-cli"
+
+[[bin]]
+name = "saishin-cli"
+path = "src/main.rs"
+
 [[bin]]
 name = "saishin"
-path = "src/main.rs"
+path = "src/launcher.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

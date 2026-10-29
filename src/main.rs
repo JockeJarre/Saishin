@@ -200,7 +200,11 @@ async fn async_main(options: &Options) -> i32 {
 /// of its own on the console and keeps the text, and a service has no console
 /// and writes to a log: neither wants a box.
 fn box_is_the_report() -> bool {
-    !log::is_console_output() || console_is_ours()
+    // A launcher running in front of this program (saishin.exe, the icon's
+    // target) reads the text we print and draws the box, so drawing one here
+    // too would report the same failure twice.
+    let launcher_reports = std::env::var_os("SAISHIN_LAUNCHER").is_some();
+    !launcher_reports && (!log::is_console_output() || console_is_ours())
 }
 
 #[cfg(windows)]

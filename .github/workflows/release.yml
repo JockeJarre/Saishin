@@ -48,15 +48,18 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            binary: saishin.exe
+            program: saishin-cli.exe
+            launcher: saishin.exe
             target: x86_64-pc-windows-msvc
             archive: zip
           - os: ubuntu-latest
-            binary: saishin
+            program: saishin-cli
+            launcher: ""
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - os: macos-latest
-            binary: saishin
+            program: saishin-cli
+            launcher: ""
             target: aarch64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
@@ -89,22 +92,25 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
-      # A bundle the user can unpack anywhere: the binary, the annotated
-      # sample configuration, and the README.
+      # A bundle the user can unpack anywhere: the binaries, the annotated
+      # sample configuration, and the README. Windows ships the launcher that
+      # an icon points at next to the program a terminal runs.
       - name: Package
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          BINARY: ${{ matrix.binary }}
+          PROGRAM: ${{ matrix.program }}
+          LAUNCHER: ${{ matrix.launcher }}
           ARCHIVE: ${{ matrix.archive }}
         run: |
           version="${{ needs.version.outputs.version }}"
           bundle="saishin-$version-$TARGET"
           mkdir -p "$bundle"
-          cp "target/release/$BINARY" "$bundle/"
+          cp "target/release/$PROGRAM" "$bundle/"
+          if [ -n "$LAUNCHER" ]; then cp "target/release/$LAUNCHER" "$bundle/"; fi
           cp saishin.ini.template README.md "$bundle/"
           # The packaged binary carries the build identity build.rs stamped in.
-          "./$bundle/$(basename "$BINARY")" --version
+          "./$bundle/$(basename "$PROGRAM")" --version
           if [ "$ARCHIVE" = "zip" ]; then
             # bsdtar on the Windows runner writes a zip from the .zip suffix.
             tar -a -c -f "$bundle.zip" "$bundle"
@@ -112,14 +118,15 @@ jobs:
             tar -czf "$bundle.tar.gz" "$bundle"
           fi
 
-      # The bundle is what users download, so the exe in it must carry the icon.
+      # The bundle is what users download, so the exes in it must carry the icon.
       - name: Check the embedded icon
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
           BUNDLE: saishin-${{ needs.version.outputs.version }}-${{ matrix.target }}
-          BINARY: ${{ matrix.binary }}
-        run: ./scripts/check-icon.ps1 "$env:BUNDLE/$env:BINARY"
+        run: |
+          ./scripts/check-icon.ps1 "$env:BUNDLE/saishin.exe"
+          ./scripts/check-icon.ps1 "$env:BUNDLE/saishin-cli.exe"
 
       - uses: actions/upload-artifact@v4
         with:

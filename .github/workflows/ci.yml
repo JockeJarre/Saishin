@@ -19,17 +19,22 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            binary: saishin.exe
+            # program is the binary a terminal runs; launcher is the icon's
+            # target, and only Windows has one.
+            program: saishin-cli.exe
+            launcher: saishin.exe
             # platform and arch go into the artifact name, spelled the way the
             # names of the release bundles are spelled.
             platform: windows
             arch: x64
           - os: ubuntu-latest
-            binary: saishin
+            program: saishin-cli
+            launcher: ""
             platform: linux
             arch: x64
           - os: macos-latest
-            binary: saishin
+            program: saishin-cli
+            launcher: ""
             platform: macos
             arch: arm64
     runs-on: ${{ matrix.os }}
@@ -102,27 +107,39 @@ jobs:
           echo "stem=$stem" >> "$GITHUB_OUTPUT"
           echo "- $stem.zip" >> "$GITHUB_STEP_SUMMARY"
 
-      # One directory holding the two files. Actions zips an artifact by itself,
-      # so staging is all the packaging there is: what arrives in the browser is
-      # a single zip with the binary and the annotated sample configuration at
+      # One directory holding the files. Actions zips an artifact by itself, so
+      # staging is all the packaging there is: what arrives in the browser is a
+      # single zip with the binaries and the annotated sample configuration at
       # its root, named after the artifact, which is named after the build.
+      # Windows ships the launcher next to the program, so that an icon launch
+      # opens no console window (src/launcher.rs); elsewhere the program is all
+      # there is.
       - name: Stage the artifact
         shell: bash
         env:
-          BINARY: ${{ matrix.binary }}
+          PROGRAM: ${{ matrix.program }}
+          LAUNCHER: ${{ matrix.launcher }}
         run: |
           mkdir dist
-          cp "target/release/$BINARY" dist/
+          cp "target/release/$PROGRAM" dist/
+          if [ -n "$LAUNCHER" ]; then cp "target/release/$LAUNCHER" dist/; fi
           cp saishin.ini.template dist/
-          # The staged binary carries the identity build.rs stamped into it.
-          "./dist/$BINARY" -V
+          # The staged program carries the identity build.rs stamped into it.
+          # Only the program is asked: the launcher is a GUI-subsystem binary
+          # with no console to print -V into.
+          "./dist/$PROGRAM" -V
 
       # A missing icon is only cosmetics, so build.rs warns and continues. The
-      # promise is kept here instead: the exe that ships carries the resource.
+      # promise is kept here instead: both exes that ship carry the resource.
+      # The launcher is the one Explorer, a shortcut and the taskbar show; the
+      # program gets the same package-wide resource, so a folder view shows a
+      # branded icon for it too.
       - name: Check the embedded icon
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: ./scripts/check-icon.ps1 dist/saishin.exe
+        run: |
+          ./scripts/check-icon.ps1 dist/saishin.exe
+          ./scripts/check-icon.ps1 dist/saishin-cli.exe
 
       - uses: actions/upload-artifact@v4
         with:

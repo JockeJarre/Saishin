@@ -69,7 +69,7 @@ git clone <this-repo>
 cd saishin
 
 cargo build --release
-./target/release/saishin --config saishin.ini
+./target/release/saishin-cli --config saishin.ini
 ```
 
 During development, `cargo run -- --config saishin.ini` builds (debug) and runs
@@ -92,13 +92,47 @@ cargo build --release --target aarch64-apple-darwin
 ```
 
 Replace the identifiers with `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`
-or `x86_64-apple-darwin` as needed. The Windows executable embeds
+or `x86_64-apple-darwin` as needed. Both Windows executables embed
 `saishin-png-icon-set/saishin.ico` (see `build.rs`). That .ico is generated
 artwork and is not in the repository, so on a fresh checkout generate it first —
 `python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow) — otherwise
 the build warns and produces an executable without an icon. The CI jobs that
 ship a binary do generate it, and `scripts/check-icon.ps1` fails the run when
 the icon did not end up in the executable.
+
+### The two Windows files
+
+A Windows download is two executables, and the difference is only in how the run
+starts:
+
+| File | Started from | What happens |
+| --- | --- | --- |
+| `saishin.exe` | a shortcut, a double-click, the taskbar | No console window at all. It starts `saishin-cli.exe` in the same directory, reads its text, and puts that report in a message box. |
+| `saishin-cli.exe` | a terminal, a script, Task Scheduler | Prints as usual, the shell waits for it, the exit code arrives. |
+
+`saishin.exe` exists for one Windows detail. An icon launch of a console program
+gets a console, and on a machine whose console host is Windows Terminal that is a
+terminal window for a few hundred milliseconds, titled with the exe path, before
+the GUI window opens. No call inside the process can stop the host from drawing
+it; the PE subsystem is what decides whether a console exists in the first
+place. So the launcher is marked as a GUI-subsystem binary, which is also the
+binary carrying the icon, and it is std-only, so it starts in milliseconds.
+
+What a run through the launcher reports:
+
+- A headless run's text is the box: the console that would have carried it does
+  not exist. A failure is an error box, a run that downloaded something is the
+  summary of it.
+- A run that opens the GUI window prints nothing and stays quiet: the window is
+  the report.
+- The exit code is passed through, so watching exit codes changes nothing.
+
+A terminal run of `saishin.exe` answers in a box rather than in the terminal, and
+cmd and PowerShell do not wait for a GUI-subsystem program. In a script, call
+`saishin-cli.exe`: it prints, and the shell waits for it.
+
+On Linux and macOS there is no console window to avoid, so the program is all
+there is, and it is called `saishin-cli` there as well.
 
 ---
 
@@ -108,7 +142,7 @@ The version lives in exactly one place: `version` in `Cargo.toml`. Everything
 else is derived from it at build time by `build.rs`.
 
 ```bash
-./target/release/saishin --version
+./target/release/saishin-cli --version
 saishin 1.0.0 (e88e2c3, x86_64-pc-windows-msvc, release)
 ```
 
@@ -121,8 +155,9 @@ target triple and the profile. Nothing has to be kept in sync by hand.
 `.github/workflows/ci.yml` builds release binaries for Windows, Linux and
 macOS, and uploads one artifact per platform, named
 `saishin-<version>-<sha>-r<run>-<platform>-<arch>`. Downloading an artifact
-gives a zip holding the executable and `saishin.ini.template`, and the
-executable's own `-V` line names the same version and sha. The artifacts are on
+gives a zip holding the executables and `saishin.ini.template` - on Windows the
+launcher and the program, elsewhere the program alone - and the program's own
+`-V` line names the same version and sha. The artifacts are on
 the run page under **Artifacts**, which is the quickest way to get a build of a
 branch: push, open the run, download. Dependency builds are cached per
 `Cargo.lock`, so a push that changes no dependency reuses them.
@@ -157,7 +192,7 @@ saishin-1.1.0-x86_64-unknown-linux-gnu.tar.gz
 saishin-1.1.0-aarch64-apple-darwin.tar.gz
 ```
 
-Each bundle contains the binary, `saishin.ini.template` and this README. The
+Each bundle contains the binaries, `saishin.ini.template` and this README. The
 release notes are generated from the changes since the last release, and the
 new release is marked as the latest.
 
@@ -183,13 +218,13 @@ the version you meant.
 2. Check what would happen without downloading anything:
 
    ```bash
-   ./target/release/saishin --config saishin.ini --dry-run
+   ./target/release/saishin-cli --config saishin.ini --dry-run
    ```
 
 3. Run it:
 
    ```bash
-   ./target/release/saishin --config saishin.ini
+   ./target/release/saishin-cli --config saishin.ini
    ```
 
 Start with `--help` for the full option list.
@@ -206,7 +241,7 @@ The token is a GitHub **personal access token** with the `repo` scope. Create on
 <https://github.com/settings/tokens>.
 
 ```bash
-./target/release/saishin --login
+./target/release/saishin-cli --login
 ```
 
 You are prompted once, the token is verified against the GitHub API, and it is then
@@ -221,7 +256,7 @@ written to the platform's credential store:
 Remove it again with:
 
 ```bash
-./target/release/saishin --logout
+./target/release/saishin-cli --logout
 ```
 
 ### Where the token is looked up
@@ -246,13 +281,13 @@ will then either reuse the stored token or fail with exit code `3` and a message
 telling you to run `--login` once.
 
 ```bash
-saishin --config /etc/saishin/saishin.ini --non-interactive
+saishin-cli --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ### Linux (cron)
 
 ```cron
-17 */6 * * * /usr/local/bin/saishin --config /etc/saishin/saishin.ini --non-interactive >> /var/log/saishin.log 2>&1
+17 */6 * * * /usr/local/bin/saishin-cli --config /etc/saishin/saishin.ini --non-interactive >> /var/log/saishin.log 2>&1
 ```
 
 ### Linux (systemd timer)
@@ -264,7 +299,7 @@ Description=saishin
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/saishin --config /etc/saishin/saishin.ini --non-interactive
+ExecStart=/usr/local/bin/saishin-cli --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ```ini
@@ -301,7 +336,7 @@ that no secure store is available and falls back to environment variables. Use
   <string>com.saishin</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/saishin</string>
+    <string>/usr/local/bin/saishin-cli</string>
     <string>--config</string>
     <string>/etc/saishin/saishin.ini</string>
     <string>--non-interactive</string>
@@ -320,7 +355,7 @@ that no secure store is available and falls back to environment variables. Use
 
 ```powershell
 Register-ScheduledTask -TaskName saishin -Action (
-  New-ScheduledTaskAction -Execute 'C:\tools\saishin.exe' `
+  New-ScheduledTaskAction -Execute 'C:\tools\saishin-cli.exe' `
     -Argument '--config C:\saishin\saishin.ini --non-interactive'
 ) -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(6) `
     -RepetitionInterval (New-TimeSpan -Hours 6)) -RunLevel Limited
@@ -513,14 +548,14 @@ saishin [saishin.ini] [options]
 | `-h`, `--help` | Show usage |
 
 The configuration path may also be given positionally, as in
-`saishin saishin.ini`. The default name is `saishin.ini`, the name of the
+`saishin-cli saishin.ini`. The default name is `saishin.ini`, the name of the
 template in the download. A file still called `config.ini` from the earlier
 examples works when it is passed with `--config`.
 
 ### GUI selection
 
 ```bash
-./target/release/saishin --config saishin.ini --gui
+./target/release/saishin-cli --config saishin.ini --gui
 ```
 
 Instead of downloading every new artifact, `--gui` opens a window listing the
@@ -607,7 +642,7 @@ later run would mistake for current.
 
 ```
 saishin/
-├── Cargo.toml            crate definition, dependencies and the version
+├── Cargo.toml            the two binaries, the dependencies, the version
 ├── Cargo.lock            pinned dependency versions
 ├── build.rs              stamps the build identity, embeds the Windows .ico,
 │                         decodes the header logo into raw pixels
@@ -622,7 +657,8 @@ saishin/
 │   ├── release.ps1       bump the version, commit it, tag it
 │   └── check-icon.ps1    fails the CI build when the exe has no icon resource
 ├── src/
-│   ├── main.rs           argument parsing, orchestration, exit codes
+│   ├── launcher.rs       the icon's target: starts saishin-cli, boxes its report
+│   ├── main.rs           the program: arguments, orchestration, exit codes
 │   ├── config.rs         INI model and validation
 │   ├── glob.rs           glob to regular expression
 │   ├── secrets.rs        token prompt, storage and lookup order
