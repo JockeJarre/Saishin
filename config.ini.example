@@ -2,6 +2,8 @@
 ;
 ; Every section except [general] defines exactly one source.
 ; Relative paths are resolved against the directory containing this file.
+; Values are read as written: a backslash is a path separator, not an escape,
+; so C:\Saishin\tables is that directory.
 ; Comments start with ; or #
 
 [general]

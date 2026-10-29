@@ -64,7 +64,11 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
             "Configuration file not found: {path}"
         )));
     }
-    let ini = ini::Ini::load_from_file(path)
+    // The no-escape reader on purpose: rust-ini's default reads '\' as an
+    // escape character and drops it, which ate the separators of every Windows
+    // path (`out = C:\Saishin\tables` arrived as `C:Saishinstables`). A
+    // backslash in a value means a path, and the file is read as written.
+    let ini = ini::Ini::load_from_file_noescape(path)
         .map_err(|ex| AppError::Config(format!("Could not parse {path}: {ex}")))?;
 
     let mut sections: Sections = HashMap::new();
@@ -458,6 +462,29 @@ mod tests {
         assert!(source.version_suffix);
         assert_eq!(source.keep, 2);
         assert!(source.out_dir.ends_with("dl"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn backslashes_in_values_survive() {
+        // A Windows path is the common case: rust-ini's default parse options
+        // read '\' as an escape character and drop it, so `C:\Saishin\tables`
+        // arrived as `C:Saishinstables`. Values are taken as they are written.
+        let path = write_ini(
+            "backslash.ini",
+            "[general]\nout_dir = C:\\Saishin\\downloads\nsound = C:\\Windows\\media\\ding.wav\n\n[tables]\ntype = github\nowner = o\nrepo = r\nout = C:\\Saishin\\tables\nextract = *\nextract_to = C:\\Saishin\\tables\\vpin-mame\n",
+        );
+        let config = load(&path).expect("load");
+        assert_eq!(config.default_out_dir, "C:\\Saishin\\downloads");
+        assert!(config.sound.ends_with("C:\\Windows\\media\\ding.wav"));
+        let source = &config.sources[0];
+        assert!(source.out_dir.ends_with("C:\\Saishin\\tables"));
+        assert!(source
+            .extract
+            .as_ref()
+            .expect("extract")
+            .destination
+            .ends_with("C:\\Saishin\\tables\\vpin-mame"));
         std::fs::remove_file(&path).ok();
     }
 

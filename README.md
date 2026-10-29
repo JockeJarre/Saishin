@@ -325,6 +325,12 @@ user.
 Every section other than `[general]` is one source. Relative paths resolve against
 the directory containing the INI file.
 
+Values are read exactly as they are written: a backslash is a path separator, not
+an escape character, so `out = C:\Saishin\tables` names that directory. (Earlier
+builds ran the INI reader with escape processing on, which ate the backslash and
+turned `C:\Saishin\tables` into `C:Saishinstables`. One backslash is correct; a
+doubled `\\` now stays doubled, which Windows also accepts.)
+
 ### `[general]`
 
 | Key | Default | Meaning |
