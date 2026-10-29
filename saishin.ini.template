@@ -1,5 +1,8 @@
 ; Saishin configuration
 ;
+; Copy this file next to saishin.exe as saishin.ini, which is the name the
+; program looks for; any other name is fine with --config <path>.
+;
 ; Every section except [general] defines exactly one source.
 ; The two GitHub sections point at this project's own repository, which is what
 ; the repository's CI downloads; change owner and repo for your own sources.
@@ -88,7 +91,7 @@ runs = 10
 ; appended to it.
 filters = *windows-x64*
 out = ./builds/actions
-; The artifact zip holds the executable and config.ini.template at its root.
+; The artifact zip holds the executable and this file at its root.
 extract = *
 extract_to = ./builds/actions/current
 keep_zip = true

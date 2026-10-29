@@ -102,7 +102,7 @@ jobs:
           bundle="saishin-$version-$TARGET"
           mkdir -p "$bundle"
           cp "target/release/$BINARY" "$bundle/"
-          cp config.ini.example README.md "$bundle/"
+          cp saishin.ini.template README.md "$bundle/"
           # The packaged binary carries the build identity build.rs stamped in.
           "./$bundle/$(basename "$BINARY")" --version
           if [ "$ARCHIVE" = "zip" ]; then

@@ -69,10 +69,10 @@ git clone <this-repo>
 cd saishin
 
 cargo build --release
-./target/release/saishin --config config.ini
+./target/release/saishin --config saishin.ini
 ```
 
-During development, `cargo run -- --config config.ini` builds (debug) and runs
+During development, `cargo run -- --config saishin.ini` builds (debug) and runs
 in one step, and `cargo test` runs the test suite.
 
 To target another platform, install its target once and cross-compile:
@@ -121,7 +121,7 @@ target triple and the profile. Nothing has to be kept in sync by hand.
 `.github/workflows/ci.yml` builds release binaries for Windows, Linux and
 macOS, and uploads one artifact per platform, named
 `saishin-<version>-<sha>-r<run>-<platform>-<arch>`. Downloading an artifact
-gives a zip holding the executable and `config.ini.template`, and the
+gives a zip holding the executable and `saishin.ini.template`, and the
 executable's own `-V` line names the same version and sha. The artifacts are on
 the run page under **Artifacts**, which is the quickest way to get a build of a
 branch: push, open the run, download. Dependency builds are cached per
@@ -157,7 +157,7 @@ saishin-1.1.0-x86_64-unknown-linux-gnu.tar.gz
 saishin-1.1.0-aarch64-apple-darwin.tar.gz
 ```
 
-Each bundle contains the binary, `config.ini.example` and this README. The
+Each bundle contains the binary, `saishin.ini.template` and this README. The
 release notes are generated from the changes since the last release, and the
 new release is marked as the latest.
 
@@ -177,19 +177,19 @@ the version you meant.
 1. Copy the example configuration and edit it:
 
    ```bash
-   cp config.ini.example config.ini
+   cp saishin.ini.template saishin.ini
    ```
 
 2. Check what would happen without downloading anything:
 
    ```bash
-   ./target/release/saishin --config config.ini --dry-run
+   ./target/release/saishin --config saishin.ini --dry-run
    ```
 
 3. Run it:
 
    ```bash
-   ./target/release/saishin --config config.ini
+   ./target/release/saishin --config saishin.ini
    ```
 
 Start with `--help` for the full option list.
@@ -246,13 +246,13 @@ will then either reuse the stored token or fail with exit code `3` and a message
 telling you to run `--login` once.
 
 ```bash
-saishin --config /etc/saishin/config.ini --non-interactive
+saishin --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ### Linux (cron)
 
 ```cron
-17 */6 * * * /usr/local/bin/saishin --config /etc/saishin/config.ini --non-interactive >> /var/log/saishin.log 2>&1
+17 */6 * * * /usr/local/bin/saishin --config /etc/saishin/saishin.ini --non-interactive >> /var/log/saishin.log 2>&1
 ```
 
 ### Linux (systemd timer)
@@ -264,7 +264,7 @@ Description=saishin
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/saishin --config /etc/saishin/config.ini --non-interactive
+ExecStart=/usr/local/bin/saishin --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ```ini
@@ -303,7 +303,7 @@ that no secure store is available and falls back to environment variables. Use
   <array>
     <string>/usr/local/bin/saishin</string>
     <string>--config</string>
-    <string>/etc/saishin/config.ini</string>
+    <string>/etc/saishin/saishin.ini</string>
     <string>--non-interactive</string>
   </array>
   <key>StartCalendarInterval</key>
@@ -321,7 +321,7 @@ that no secure store is available and falls back to environment variables. Use
 ```powershell
 Register-ScheduledTask -TaskName saishin -Action (
   New-ScheduledTaskAction -Execute 'C:\tools\saishin.exe' `
-    -Argument '--config C:\saishin\config.ini --non-interactive'
+    -Argument '--config C:\saishin\saishin.ini --non-interactive'
 ) -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(6) `
     -RepetitionInterval (New-TimeSpan -Hours 6)) -RunLevel Limited
 ```
@@ -494,12 +494,12 @@ following normal filesystem expectations.
 ## Command line options
 
 ```
-saishin [config.ini] [options]
+saishin [saishin.ini] [options]
 ```
 
 | Option | Effect |
 | --- | --- |
-| `-c`, `--config <path>` | Configuration file. Defaults to `./config.ini`, then next to the executable |
+| `-c`, `--config <path>` | Configuration file. Defaults to `./saishin.ini`, then next to the executable |
 | `-s`, `--source <name>` | Run only this source. Repeatable |
 | `--dry-run` | Report what would be downloaded and extracted, download nothing |
 | `-f`, `--force` | Re-download and overwrite even when a file is already current |
@@ -513,12 +513,14 @@ saishin [config.ini] [options]
 | `-h`, `--help` | Show usage |
 
 The configuration path may also be given positionally, as in
-`saishin config.ini`.
+`saishin saishin.ini`. The default name is `saishin.ini`, the name of the
+template in the download. A file still called `config.ini` from the earlier
+examples works when it is passed with `--config`.
 
 ### GUI selection
 
 ```bash
-./target/release/saishin --config config.ini --gui
+./target/release/saishin --config saishin.ini --gui
 ```
 
 Instead of downloading every new artifact, `--gui` opens a window listing the
@@ -550,7 +552,9 @@ console is released as the window opens, and the notification and sound commands
 are started without a console of their own. Started from a terminal, `--gui`
 therefore prints nothing while the window is open; `--no-gui` is the run that
 writes text. A configuration that fails before any window can open still prints,
-because then the console is the only report there is.
+because then the console is the only report there is - and when even that
+console closes with the process, which is what launching the exe from a shortcut
+gives, the same words arrive in a box on the desktop.
 
 ### Picking an older version
 
@@ -609,7 +613,7 @@ saishin/
 │                         decodes the header logo into raw pixels
 ├── saishin-png-icon-set/ the logo PNG (header art, and the build input for it)
 │                         and saishin.ico
-├── config.ini.example      annotated example configuration
+├── saishin.ini.template      annotated example configuration
 ├── README.md
 ├── .github/workflows/
 │   ├── ci.yml            builds all three platforms on every push

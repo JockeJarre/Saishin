@@ -318,11 +318,11 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
 
 fn find_config() -> Result<String, AppError> {
     let current = std::env::current_dir()
-        .map(|dir| dir.join("config.ini").to_string_lossy().to_string())
-        .unwrap_or_else(|_| "config.ini".to_string());
+        .map(|dir| dir.join("saishin.ini").to_string_lossy().to_string())
+        .unwrap_or_else(|_| "saishin.ini".to_string());
     let beside_exe = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("config.ini").to_string_lossy().to_string()));
+        .and_then(|exe| exe.parent().map(|dir| dir.join("saishin.ini").to_string_lossy().to_string()));
     let mut candidates = vec![current];
     if let Some(path) = beside_exe {
         candidates.push(path);
@@ -333,7 +333,7 @@ fn find_config() -> Result<String, AppError> {
         }
     }
     Err(AppError::Config(
-        "No config.ini found. Pass one with --config <path>.".to_string(),
+        "No saishin.ini found. Pass one with --config <path>.".to_string(),
     ))
 }
 
@@ -1698,10 +1698,10 @@ fn print_usage() {
 saishin - download official releases from GitHub and other sources
 
 USAGE
-  saishin [config.ini] [options]
+  saishin [saishin.ini] [options]
 
 OPTIONS
-  -c, --config <path>    Configuration file (default: ./config.ini)
+  -c, --config <path>    Configuration file (default: ./saishin.ini)
   -s, --source <name>    Run only this source (repeatable)
       --dry-run          List what would be downloaded, download nothing
   -f, --force            Re-download and overwrite even when up to date

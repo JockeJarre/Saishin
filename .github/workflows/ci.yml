@@ -113,7 +113,7 @@ jobs:
         run: |
           mkdir dist
           cp "target/release/$BINARY" dist/
-          cp config.ini.example dist/config.ini.template
+          cp saishin.ini.template dist/
           # The staged binary carries the identity build.rs stamped into it.
           "./dist/$BINARY" -V
 
