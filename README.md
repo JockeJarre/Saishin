@@ -1,4 +1,10 @@
-# Saishin
+<div align="center">
+
+<img src="saishin_logo.png" alt="Saishin — 最新" width="340" />
+
+# Saishin — 最新
+
+</div>
 
 A small cross-platform Rust command line tool that keeps files up to date from
 official GitHub releases/actions — or from any other URL — using an INI configuration file.
