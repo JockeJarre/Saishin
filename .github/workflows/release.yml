@@ -76,6 +76,16 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev \
             libxkbcommon-dev libxkbcommon-x11-dev
 
+      # The .ico is generated artwork and git-ignored, so it is not in the
+      # checkout. Regenerate it, or the released exe carries no icon: build.rs
+      # embeds best-effort and only warns when the file is missing.
+      - name: Generate the Windows icon
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          python -m pip install --quiet pillow
+          python saishin-png-icon-set/make_saishin_ico.py
+
       - name: Build
         run: cargo build --locked --release
 
@@ -101,6 +111,15 @@ jobs:
           else
             tar -czf "$bundle.tar.gz" "$bundle"
           fi
+
+      # The bundle is what users download, so the exe in it must carry the icon.
+      - name: Check the embedded icon
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          BUNDLE: saishin-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: ./scripts/check-icon.ps1 "$env:BUNDLE/$env:BINARY"
 
       - uses: actions/upload-artifact@v4
         with:

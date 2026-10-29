@@ -77,9 +77,11 @@ fn git_identity() -> String {
 
 /// Writes the .rc into OUT_DIR and lets embed-resource find rc.exe (it
 /// ships a fallback compiler, so a Windows SDK is not required). The icon
-/// is presentation, not function: if the resource compiler is missing, we
-/// warn and build the binary without it. The "icon freshness" CI job is
-/// what actually protects the artwork.
+/// is presentation, not function: a missing .ico, or a missing resource
+/// compiler, only warns and the binary builds without it. The promise is
+/// kept in CI instead: the jobs that ship a binary regenerate the .ico from
+/// the masters, and scripts/check-icon.ps1 fails the run when the shipped
+/// executable carries no icon resource.
 #[cfg(windows)]
 fn embed_icon() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");

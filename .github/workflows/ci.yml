@@ -54,6 +54,17 @@ jobs:
         with:
           prefix-key: saishin-v1
 
+      # saishin.ico is generated artwork and git-ignored, so it is not in the
+      # checkout, and build.rs would embed no icon at all. Regenerate it from
+      # the masters before the build; the check below fails the run when the
+      # icon did not end up in the executable.
+      - name: Generate the Windows icon
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          python -m pip install --quiet pillow
+          python saishin-png-icon-set/make_saishin_ico.py
+
       # keyring needs D-Bus, glow/glutin needs EGL/GLX, reqwest needs OpenSSL.
       # winit's wayland-dlopen feature loads libwayland at runtime, so the
       # wayland headers are not needed at build time.
@@ -91,44 +102,42 @@ jobs:
           echo "stem=$stem" >> "$GITHUB_OUTPUT"
           echo "- $stem.zip" >> "$GITHUB_STEP_SUMMARY"
 
-      # The binary and the annotated sample configuration, zipped under the name
-      # the job just picked. The artifact gets that same name, and GitHub hands
-      # out an artifact as a zip named after the artifact, so the file that
-      # arrives in the browser is named exactly like the artifact.
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        env:
-          STEM: ${{ steps.name.outputs.stem }}
-          BINARY: ${{ matrix.binary }}
-        run: |
-          Move-Item -Path config.ini.example -Destination config.ini.template
-          & "target/release/$env:BINARY" -V
-          Compress-Archive -Path "target/release/$env:BINARY",config.ini.template -DestinationPath "${env:STEM}.zip"
-
-      - name: Package
-        if: matrix.os != 'windows-latest'
+      # One directory holding the two files. Actions zips an artifact by itself,
+      # so staging is all the packaging there is: what arrives in the browser is
+      # a single zip with the binary and the annotated sample configuration at
+      # its root, named after the artifact, which is named after the build.
+      - name: Stage the artifact
         shell: bash
         env:
-          STEM: ${{ steps.name.outputs.stem }}
           BINARY: ${{ matrix.binary }}
         run: |
-          cp config.ini.example config.ini.template
-          "./target/release/$BINARY" -V
-          # -j: the two files go into the root of the zip, not under target/.
-          zip -X -q -j "$STEM.zip" "target/release/$BINARY" config.ini.template
+          mkdir dist
+          cp "target/release/$BINARY" dist/
+          cp config.ini.example dist/config.ini.template
+          # The staged binary carries the identity build.rs stamped into it.
+          "./dist/$BINARY" -V
+
+      # A missing icon is only cosmetics, so build.rs warns and continues. The
+      # promise is kept here instead: the exe that ships carries the resource.
+      - name: Check the embedded icon
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/check-icon.ps1 dist/saishin.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.name.outputs.stem }}
-          path: ${{ steps.name.outputs.stem }}.zip
+          path: dist/*
           if-no-files-found: error
 
   icon:
-    # The Windows executable embeds saishin-png-icon-set/saishin.ico, which is
-    # generated from the masters. Regenerate it here and fail if the
-    # committed .ico differs, so artwork changes can never be forgotten.
-    name: icon freshness
+    # The .ico is generated artwork and git-ignored, so it is never in the
+    # checkout: the Windows build job regenerates it from the masters before
+    # building. This job runs the same generator, where pillow is one pip
+    # install away, and checks that the result is the multi-size icon the
+    # executable needs, so artwork trouble is reported here in seconds instead
+    # of as a shipped binary without an icon.
+    name: icon from the masters
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,4 +146,31 @@ jobs:
           python-version: "3.x"
       - run: pip install pillow
       - run: python3 saishin-png-icon-set/make_saishin_ico.py
-      - run: git diff --exit-code -- saishin-png-icon-set/saishin.ico
+      - name: The icon holds the sizes the exe needs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import struct
+          import sys
+
+          path = "saishin-png-icon-set/saishin.ico"
+          data = open(path, "rb").read()
+          if data[:4] != b"\x00\x00\x01\x00":
+              sys.exit(f"{path} is not an ICO file")
+
+          entries = struct.unpack_from("<H", data, 4)[0]
+          sizes = []
+          for index in range(entries):
+              off = 6 + 16 * index
+              width = data[off] or 256
+              height = data[off + 1] or 256
+              payload = struct.unpack_from("<I", data, off + 8)[0]
+              if data[off + 4:off + 6] != b"\x01\x00" or payload == 0:
+                  sys.exit(f"{path}: entry {index} is not a single-plane PNG image")
+              sizes.append((width, height))
+
+          want = [(16, 16), (32, 32), (48, 48), (256, 256)]
+          print(f"{path}: {entries} entries, {sizes}")
+          if sizes != want:
+              sys.exit(f"{path} holds {sizes}, expected {want}")
+          PY

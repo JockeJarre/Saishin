@@ -93,9 +93,12 @@ cargo build --release --target aarch64-apple-darwin
 
 Replace the identifiers with `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`
 or `x86_64-apple-darwin` as needed. The Windows executable embeds
-`saishin-png-icon-set/saishin.ico` at build time (see `build.rs`); to
-regenerate it after artwork changes, run
-`python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow).
+`saishin-png-icon-set/saishin.ico` (see `build.rs`). That .ico is generated
+artwork and is not in the repository, so on a fresh checkout generate it first —
+`python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow) — otherwise
+the build warns and produces an executable without an icon. The CI jobs that
+ship a binary do generate it, and `scripts/check-icon.ps1` fails the run when
+the icon did not end up in the executable.
 
 ---
 
@@ -116,9 +119,12 @@ target triple and the profile. Nothing has to be kept in sync by hand.
 ### Every push
 
 `.github/workflows/ci.yml` builds release binaries for Windows, Linux and
-macOS, and uploads them as artifacts named `saishin-<version>-<os>`. They are
-on the run page under **Artifacts**, which is the quickest way to get a build
-of a branch: push, open the run, download. Dependency builds are cached per
+macOS, and uploads one artifact per platform, named
+`saishin-<version>-<sha>-r<run>-<platform>-<arch>`. Downloading an artifact
+gives a zip holding the executable and `config.ini.template`, and the
+executable's own `-V` line names the same version and sha. The artifacts are on
+the run page under **Artifacts**, which is the quickest way to get a build of a
+branch: push, open the run, download. Dependency builds are cached per
 `Cargo.lock`, so a push that changes no dependency reuses them.
 
 ### Making a release
@@ -573,7 +579,8 @@ saishin/
 │   ├── ci.yml            builds all three platforms on every push
 │   └── release.yml       publishes a release from a v* tag
 ├── scripts/
-│   └── release.ps1       bump the version, commit it, tag it
+│   ├── release.ps1       bump the version, commit it, tag it
+│   └── check-icon.ps1    fails the CI build when the exe has no icon resource
 ├── src/
 │   ├── main.rs           argument parsing, orchestration, exit codes
 │   ├── config.rs         INI model and validation

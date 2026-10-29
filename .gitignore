@@ -1,5 +1,7 @@
 target/
 downloads/
+# CI stages the artifact here (the two files that go into the zip)
+dist/
 *.user
 .vs/
 .idea/
