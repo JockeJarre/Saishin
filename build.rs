@@ -18,6 +18,15 @@ fn main() {
     println!("cargo::rerun-if-changed=saishin-png-icon-set/saishin.ico");
     println!("cargo::rerun-if-changed=build.rs");
 
+    // The commit is part of the build identity, and a commit is not a file Cargo
+    // watches, so a local -V kept naming the commit of the last build. .git/HEAD
+    // moves with every commit, checkout and branch switch; in a worktree it is a
+    // redirect file next to the real repository, so it is only watched when it
+    // exists, and a missing path would rerun this script on every build.
+    if std::path::Path::new(".git/HEAD").exists() {
+        println!("cargo::rerun-if-changed=.git/HEAD");
+    }
+
     stamp_build_identity();
     embed_logo();
 
