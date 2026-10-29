@@ -385,6 +385,32 @@ Downloaded GitHub files have their modification time set to the release publish
 date (or the workflow run creation date for action artifacts), so `keep`
 retention orders by that date rather than by download time.
 
+### `type = actions`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `owner` | *(required)* | Repository owner or organisation |
+| `repo` | *(required)* | Repository name |
+| `workflow` | *(all)* | Only runs of workflows whose name matches this glob: the `name:` at the top of the file (`CI` for `ci.yml`), and for a dispatched run its display title. Only completed, successful runs count |
+| `runs` | `10` | How many recent runs of that workflow to walk |
+
+Listing artifacts needs a token, so this type always uses the stored one. Each
+run contributes its artifacts; `filters` match the **artifact name**, and the
+downloaded file is that name plus `.zip` when it does not already end in `.zip`
+— GitHub hands out an artifact as a zip named after it. Expired artifacts are
+skipped. The timestamp a file's freshness is judged by is the run's creation
+date.
+
+```ini
+[saishin_builds]
+type = actions
+owner = JockeJarre
+repo = Saishin
+workflow = CI
+filters = *windows-x64*
+out = ./builds/actions
+```
+
 ### `type = url`
 
 | Key | Default | Meaning |

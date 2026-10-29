@@ -1,6 +1,8 @@
 ; Saishin configuration
 ;
 ; Every section except [general] defines exactly one source.
+; The two GitHub sections point at this project's own repository, which is what
+; the repository's CI downloads; change owner and repo for your own sources.
 ; Relative paths are resolved against the directory containing this file.
 ; Values are read as written: a backslash is a path separator, not an escape,
 ; so C:\Saishin\tables is that directory.
@@ -41,15 +43,20 @@ out_dir = ./downloads
 
 
 ; ---------------------------------------------------------------------------
-; Public GitHub releases
+; GitHub releases. The example points at this project's own repository, so
+; saishin updates saishin. The repository is private, hence 'private = true'
+; and a stored token ('saishin --login', once).
+; No version is tagged yet, so this source has nothing to offer today; it
+; starts delivering with the first release made by scripts/release.ps1.
 ; ---------------------------------------------------------------------------
-[territory_tables]
+[saishin_release]
 type = github
-owner = vpinball
-repo = vpin-mame-tables
+owner = JockeJarre
+repo = Saishin
+private = true
 tag = latest
-filters = *.vpt, *.vpin
-out = ./tables
+filters = *.zip
+out = ./builds/release
 changelog = true
 ; version_suffix = true
 ; Older releases offered in the --gui version dropdown (inherits [general]).
@@ -57,28 +64,34 @@ changelog = true
 
 ; Uncomment to unpack what was downloaded.
 ; extract = *
-; extract_to = ./tables/vpin-mame-tables
+; extract_to = ./builds/release/current
 ; strip_prefix = 1
 ; overwrite = true
 ; keep_zip = true
 
 
 ; ---------------------------------------------------------------------------
-; Account-gated builds (private repository or authenticated action artifacts)
-; Requires a stored token: run 'saishin --login' once.
+; GitHub Actions artifacts: the binaries .github/workflows/ci.yml uploads on
+; every push, one per platform. Reading artifacts always needs a token, so
+; 'saishin --login' once. This is the source with something to download now:
+; each run names its artifacts after the build, and the --gui dropdown offers
+; the older runs of the same platform.
 ; ---------------------------------------------------------------------------
-[nightly_builds]
-type = github
-owner = my-organisation
-repo = private-builds
-private = true
-tag = all
-filters = *.zip
-out = ./builds
+[saishin_builds]
+type = actions
+owner = JockeJarre
+repo = Saishin
+workflow = CI
+runs = 10
+; 'workflow' is a glob against the workflow name (the 'name:' line in the
+; file); 'filters' match the artifact name, and the saved file gets .zip
+; appended to it.
+filters = *windows-x64*
+out = ./builds/actions
+; The artifact zip holds the executable and config.ini.template at its root.
 extract = *
-strip_prefix = 1
-overwrite = true
-keep_zip = false
+extract_to = ./builds/actions/current
+keep_zip = true
 
 
 ; ---------------------------------------------------------------------------
