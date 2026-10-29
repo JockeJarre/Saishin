@@ -269,12 +269,22 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     }
 
     let selected = select_sources(&config, options)?;
+
+    // Decided here, before the token is looked up: a run that opens the window
+    // prints no stream of text, and the token's provenance is part of that
+    // stream. Warnings and errors keep the console rule, so a failure before
+    // the window exists is still something a launcher can show.
+    if use_gui(options, &config) {
+        log::window_is_the_report();
+    }
+
     let token = resolve_token(&config, &selected, &http, options).await?;
 
     let mut updated: Vec<String> = Vec::new();
     if use_gui(options, &config) {
-        // The window is the report from here on, so nothing is printed: text in
-        // the console a double-click created is what keeps that window open.
+        // The stream is already off (decided above, before the token). Here the
+        // problems go too: the console is released just below, and text in the
+        // console a double-click created is what keeps that window standing.
         log::set_console_output(false);
         detach_console();
         let per_source = join_all(
