@@ -39,7 +39,7 @@ out_dir = ./downloads
 ; as the last argument.
 ; sound_player = ffplay -nodisp -autoexit
 
-; Optional. How many recent releases (or workflow runs) the --gui version
+; Optional. How many recent workflow runs (or releases) the --gui version
 ; dropdown offers per artifact. A source section may override this with its
 ; own 'releases'. Default: 10.
 ; releases = 10
@@ -62,8 +62,6 @@ filters = *.zip
 out = ./builds/release
 changelog = true
 ; version_suffix = true
-; Older releases offered in the --gui version dropdown (inherits [general]).
-; releases = 20
 
 ; Uncomment to unpack what was downloaded.
 ; extract = *
