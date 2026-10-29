@@ -124,7 +124,7 @@ What a run through the launcher reports:
   not exist. A failure is an error box, a run that downloaded something is the
   summary of it.
 - A run that opens the GUI window prints nothing and stays quiet: the window is
-  the report.
+  the report, and the run's lines are readable in the log strip at its bottom.
 - The exit code is passed through, so watching exit codes changes nothing.
 
 A terminal run of `saishin.exe` answers in a box rather than in the terminal, and
@@ -387,6 +387,7 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
 | `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
 | `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
+| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with a **Close** button, so the log strip stays readable. `true` closes the window as soon as the run ends |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
 | `sound` | empty | Play this sound file after a run that downloaded something |
 | `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
@@ -590,6 +591,17 @@ writes text. A configuration that fails before any window can open still prints,
 because then the console is the only report there is - and when even that
 console closes with the process, which is what launching the exe from a shortcut
 gives, the same words arrive in a box on the desktop.
+
+The window opens as soon as the configuration and the token are settled, before
+the sources are asked: a run of several sources takes seconds, and the window
+shows **Checking sources...** with a spinner while they answer, and **Cancel**
+ends it. The strip at the bottom is the run's text, the same lines a console run
+prints — the token's provenance, which source was asked and what it offered, the
+download lines, the warnings. Closed, the strip is one line: the newest. Open, it
+is a list that follows the newest line, and its text can be selected and copied.
+Because a GUI run's words live in that strip, the window stays open when the run
+ends — **Done**, **Cancelled** or **Failed** — with a **Close** button;
+`close_on_finish = true` gives the older habit of closing at once.
 
 ### Picking an older version
 

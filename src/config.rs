@@ -50,6 +50,9 @@ pub struct AppConfig {
     pub keyring_service: String,
     pub notify: bool,
     pub window_centered: bool,
+    /// What the window does when a run ends. False keeps it open, on the end
+    /// state with a Close button, so the log strip stays readable.
+    pub close_on_finish: bool,
     /// Open the GUI by default (`[general] gui`). `--gui` and `--no-gui` on the
     /// command line win over this.
     pub gui: bool,
@@ -96,6 +99,7 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
         notify: get_bool(&sections, GENERAL_SECTION, "notify", false)?,
         window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
+            close_on_finish: get_bool(&sections, GENERAL_SECTION, "close_on_finish", false)?,
         gui: get_bool(&sections, GENERAL_SECTION, "gui", false)?,
         releases: get_int(&sections, GENERAL_SECTION, "releases", 10)?,
         sound: resolve_sound(&sections, GENERAL_SECTION, &base_dir),

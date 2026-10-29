@@ -287,64 +287,11 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
         // console a double-click created is what keeps that window standing.
         log::set_console_output(false);
         detach_console();
-        let per_source = join_all(
-            selected
-                .iter()
-                .map(|source| collect_pending(source, &config, &http, token.as_deref())),
-        )
-        .await;
-        let mut pending: Vec<PendingFile> = Vec::new();
-        for (source, result) in selected.iter().zip(per_source) {
-            let (files, summary) = result?;
-            log::info(&format!("[{}]", source.name));
-            match source.kind {
-                SourceKind::GitHub => log::detail(&format!(
-                    "github {}/{}, tag '{}'",
-                    source.owner, source.repo, source.tag
-                )),
-                SourceKind::Actions => log::detail(&format!(
-                    "actions {}/{}, workflow '{}'",
-                    source.owner, source.repo, source.workflow
-                )),
-                SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
-            }
-            if !summary.is_empty() {
-                log::detail(&summary);
-            }
-            pending.extend(files);
-        }
-
-        let candidates: Vec<PendingFile> = pending
-            .into_iter()
-            .filter(|file| !file.file_name.is_empty())
-            .collect();
-        let (flags, version_lists) = tokio::join!(
-            join_all(
-                candidates
-                    .iter()
-                    .map(|file| is_new_artifact(&http, file, token.as_deref(), options.force)),
-            ),
-            join_all(
-                selected
-                    .iter()
-                    .map(|source| collect_versions(source, &config, &http, token.as_deref())),
-            )
-        );
-        let new_entries: Vec<PendingFile> = candidates
-            .into_iter()
-            .zip(flags)
-            .filter(|(_, is_new)| *is_new)
-            .map(|(file, _)| file)
-            .collect();
-
-        let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
-        for result in version_lists {
-            for group in result? {
-                versions.insert((group.source_name, group.group_key), group.versions);
-            }
-        }
-
-        updated.extend(gui::run_gui(new_entries, versions, selected.clone(), config.clone(), token.clone(), options.clone())?);
+        // The window opens with the sources not yet asked. The asking happens on
+        // the window's worker thread, and the lines it logs are the progress: the
+        // strip shows a source as soon as it answers, which is the tell that a
+        // run of several seconds is doing something.
+        updated.extend(gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone())?);
     } else {
         for source in &selected {
             let names = run_source(source, &config, &http, token.as_deref(), options).await?;
@@ -360,6 +307,77 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     }
 
     Ok(0)
+}
+
+/// What a front end asks the sources for: the files that are new, and the
+/// versions each group offers. Called from the window's worker thread, after the
+/// window is on screen, so the lines this logs are the progress a user reads in
+/// the window's strip.
+pub(crate) async fn collect_new(
+    selected: &[SourceConfig],
+    config: &AppConfig,
+    http: &Downloader,
+    token: Option<&str>,
+    options: &Options,
+) -> Result<(Vec<PendingFile>, HashMap<(String, String), Vec<PendingFile>>), AppError> {
+    let per_source = join_all(
+        selected
+            .iter()
+            .map(|source| collect_pending(source, config, http, token)),
+    )
+    .await;
+    let mut pending: Vec<PendingFile> = Vec::new();
+    for (source, result) in selected.iter().zip(per_source) {
+        let (files, summary) = result?;
+        log::info(&format!("[{}]", source.name));
+        match source.kind {
+            SourceKind::GitHub => log::detail(&format!(
+                "github {}/{}, tag '{}'",
+                source.owner, source.repo, source.tag
+            )),
+            SourceKind::Actions => log::detail(&format!(
+                "actions {}/{}, workflow '{}'",
+                source.owner, source.repo, source.workflow
+            )),
+            SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+        }
+        if !summary.is_empty() {
+            log::detail(&summary);
+        }
+        pending.extend(files);
+    }
+
+    let candidates: Vec<PendingFile> = pending
+        .into_iter()
+        .filter(|file| !file.file_name.is_empty())
+        .collect();
+    let (flags, version_lists) = tokio::join!(
+        join_all(
+            candidates
+                .iter()
+                .map(|file| is_new_artifact(http, file, token, options.force)),
+        ),
+        join_all(
+            selected
+                .iter()
+                .map(|source| collect_versions(source, config, http, token)),
+        )
+    );
+    let new_entries: Vec<PendingFile> = candidates
+        .into_iter()
+        .zip(flags)
+        .filter(|(_, is_new)| *is_new)
+        .map(|(file, _)| file)
+        .collect();
+
+    let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
+    for result in version_lists {
+        for group in result? {
+            versions.insert((group.source_name, group.group_key), group.versions);
+        }
+    }
+
+    Ok((new_entries, versions))
 }
 
 fn find_config() -> Result<String, AppError> {
@@ -1534,6 +1552,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            close_on_finish: false,
             gui,
             releases: 10,
             sound: String::new(),
@@ -1710,6 +1729,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            close_on_finish: false,
             gui: false,
             releases: 10,
             sound: String::new(),
@@ -1728,6 +1748,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            close_on_finish: false,
             gui: false,
             releases: 10,
             sound: String::new(),

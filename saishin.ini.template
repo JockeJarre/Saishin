@@ -31,6 +31,12 @@ out_dir = ./downloads
 ; Default: false.
 ; gui = true
 
+; Optional. What the selection window does when the run ends. false keeps it
+; open on its end state, with a Close button, so the log strip at the bottom
+; stays readable. true closes the window as soon as the run ends.
+; Default: false.
+; close_on_finish = true
+
 ; Optional. Play this sound file after a run that downloaded something.
 ; Default player: 'afplay' (macOS), 'ffplay' (Windows, Linux).
 ; sound = ./sounds/update.mp3

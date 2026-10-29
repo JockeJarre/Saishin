@@ -3,7 +3,10 @@ use crate::error::AppError;
 use crate::PendingFile;
 use crate::Options;
 use crate::config::AppConfig;
+use crate::collect_new;
 use crate::config::SourceConfig;
+use crate::log::{self, Level};
+use std::time::Duration;
 use crate::downloader::Downloader;
 use crate::prune_old_files;
 use crate::download_pending;
@@ -31,11 +34,26 @@ struct GuiResult {
 
 #[derive(Clone, Copy)]
 enum Phase {
+    /// The window is on screen, the sources are being asked.
+    Loading,
     Selecting,
     Downloading,
     Done,
     Cancelled,
     Failed,
+}
+
+/// The rows a run's sources offer, as the worker thread delivers them. The
+/// window is already on screen while this is `Working`, which is what lets the
+/// log strip narrate a fetch of several seconds: the window is not something a
+/// finished fetch hands over, it is the thing the fetch reports into.
+enum LoadState {
+    Working,
+    Ready {
+        entries: Vec<PendingFile>,
+        versions: HashMap<(String, String), Vec<PendingFile>>,
+    },
+    Failed(String),
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +68,9 @@ struct GuiProgress {
     done: usize,
     total: usize,
     message: String,
+    /// The heading of the end state. Empty means "the phase says it", which is
+    /// how the download worker leaves it; the load path sets its own words.
+    heading: String,
     rows: Vec<RowState>,
 }
 
@@ -112,6 +133,12 @@ struct SelectionApp {
     result: Arc<GuiResult>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<GuiProgress>>,
+    /// What the worker thread has found out about the sources.
+    load: Arc<Mutex<LoadState>>,
+    /// The run's lines as the window shows them: a copy taken when the count of
+    /// lines moved, so the list is not cloned on every frame.
+    log_lines: Vec<log::Line>,
+    log_revision: u64,
     /// The header logo, uploaded to the GPU on the first frame.
     logo: Option<egui::TextureHandle>,
     shown: bool,
@@ -151,6 +178,24 @@ const HEADER_WORD_SIZE: f32 = 34.0;
 const HEADER_SIDE_MARGIN: i8 = 12;
 const _: () = assert!(HEADER_ROW > HEADER_LOGO && HEADER_LOGO > HEADER_WORD_SIZE);
 
+/// The height the log strip takes when it is open. Past that the list scrolls and
+/// keeps following the newest line, so a run of a thousand lines cannot make the
+/// window a thousand rows tall.
+const LOG_LINES_HEIGHT: f32 = 180.0;
+
+/// One line of the log strip: monospace, so paths, sizes and the columns of the
+/// progress lines keep their shape, and a colour for the two levels that need
+/// attention.
+fn log_line_text(line: &log::Line) -> egui::RichText {
+    let text = egui::RichText::new(line.text.as_str()).monospace().small();
+    match line.level {
+        Level::Warn => text.color(egui::Color32::from_rgb(204, 153, 51)),
+        Level::Error => text.color(egui::Color32::from_rgb(210, 80, 80)),
+        Level::Detail | Level::Progress => text.weak(),
+        Level::Info => text,
+    }
+}
+
 /// The header logo as an egui image, ready to upload: the bytes `build.rs`
 /// wrote, read as un-premultiplied RGBA.
 fn logo_image() -> egui::ColorImage {
@@ -164,6 +209,12 @@ fn error_message(ex: AppError) -> String {
         AppError::Auth(message) => message,
         AppError::Interrupted => "interrupted".to_string(),
     }
+}
+
+/// The fetch is over and nothing is coming: the window shows this message, and
+/// the strip keeps the lines that led to it.
+fn fail_load(load: &Arc<Mutex<LoadState>>, message: String) {
+    *load.lock().unwrap_or_else(|guard| guard.into_inner()) = LoadState::Failed(message);
 }
 
 struct GuiSink {
@@ -212,6 +263,7 @@ impl SelectionApp {
         result: Arc<GuiResult>,
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<GuiProgress>>,
+        load: Arc<Mutex<LoadState>>,
         window_centered: bool,
         centered_at_startup: bool,
     ) -> SelectionApp {
@@ -283,11 +335,131 @@ impl SelectionApp {
             result,
             cancel,
             progress,
+            load,
+            log_lines: Vec::new(),
+            log_revision: 0,
             logo: None,
             shown: false,
             centered_at_startup,
             window_centered,
         }
+    }
+
+    /// The run's text in a strip at the bottom of the window. The window is the
+    /// report, so everything a console run prints is readable here: the token's
+    /// provenance, which urls matched, the download lines, the warnings. Closed
+    /// it is one line - the newest; open, a list that follows the newest line and
+    /// whose text can be selected and copied.
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        // The run writes from its own thread and egui draws on input, so a new
+        // line has to ask for the frame that shows it.
+        let revision = log::revision();
+        if revision != self.log_revision {
+            self.log_revision = revision;
+            self.log_lines = log::lines();
+            ui.ctx().request_repaint();
+        }
+
+        // Out of self while the strip is drawn, and read through before it: the
+        // header's click is written while its content is read.
+        let lines = std::mem::take(&mut self.log_lines);
+        let count = lines.len();
+        let newest = lines.last().cloned();
+
+        egui::Panel::bottom("log").show(ui, |ui| {
+            let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .max_height(LOG_LINES_HEIGHT)
+                        .show(ui, |ui| {
+                            for line in lines.iter() {
+                                ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                            }
+                        });
+                });
+            // The body is `None` exactly while the header is collapsed, which is
+            // the state the strip is in.
+            if header.body_returned.is_none() {
+                if let Some(newest) = &newest {
+                    ui.add(egui::Label::new(log_line_text(newest)).selectable(true).truncate());
+                }
+            }
+        });
+
+        self.log_lines = lines;
+    }
+
+    /// The app as the window opens it: no rows yet, the sources not yet asked,
+    /// and the asking already running on its own thread.
+    fn new_loading(
+        job: Arc<GuiJob>,
+        result: Arc<GuiResult>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<GuiProgress>>,
+        load: Arc<Mutex<LoadState>>,
+        window_centered: bool,
+        centered_at_startup: bool,
+    ) -> SelectionApp {
+        let app = SelectionApp::new(
+            Vec::new(),
+            HashMap::new(),
+            job,
+            result,
+            cancel,
+            progress,
+            load,
+            window_centered,
+            centered_at_startup,
+        );
+        app.start_load();
+        app
+    }
+
+    /// Asking the sources, off the UI thread: seconds when there are several of
+    /// them, and every line it logs is readable in the window while it runs.
+    fn start_load(&self) {
+        let job = Arc::clone(&self.job);
+        let load = Arc::clone(&self.load);
+        thread::spawn(
+            move || {
+                let runtime = match Builder::new_multi_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(ex) => {
+                        fail_load(&load, format!("Could not start the check: {ex}"));
+                        return;
+                    }
+                };
+                let http = match Downloader::new() {
+                    Ok(http) => http,
+                    Err(ex) => {
+                        fail_load(&load, error_message(ex));
+                        return;
+                    }
+                };
+                runtime.block_on(
+                    async {
+                        match collect_new(&job.sources, &job.config, &http, job.token.as_deref(), &job.options).await {
+                            Ok((entries, versions)) => {
+                                *load.lock().unwrap_or_else(|guard| guard.into_inner()) = LoadState::Ready { entries, versions };
+                            }
+                            Err(ex) => fail_load(&load, error_message(ex)),
+                        }
+                    },
+                );
+            },
+        );
+    }
+
+    /// The rows for the files the sources offered. `SelectionApp::new` is the
+    /// code that builds rows and version families, so the window hands it the
+    /// empty list at start-up and the full list when the fetch lands, and keeps
+    /// the two fields it worked out.
+    fn adopt_rows(&mut self, entries: Vec<PendingFile>, versions: HashMap<(String, String), Vec<PendingFile>>) {
+        let built = SelectionApp::new(entries, versions, Arc::clone(&self.job), Arc::clone(&self.result), Arc::clone(&self.cancel), Arc::clone(&self.progress), Arc::clone(&self.load), false, false);
+        self.entries = built.entries;
+        self.families = built.families;
     }
 
     fn start_download(&mut self, chosen: Vec<usize>) {
@@ -396,6 +568,36 @@ impl App for SelectionApp {
             self.logo = Some(ctx.load_texture("saishin logo", logo_image(), egui::TextureOptions::LINEAR));
         }
 
+        // While work is running, the window asks for a frame about eight times a
+        // second: that is what makes the strip, the spinner and the arrival of
+        // the rows show without anybody moving the mouse.
+        let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
+        if matches!(phase, Phase::Loading | Phase::Downloading) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
+        if matches!(phase, Phase::Loading) {
+            let taken = std::mem::replace(
+                &mut *self.load.lock().unwrap_or_else(|guard| guard.into_inner()),
+                LoadState::Working,
+            );
+            match taken {
+                LoadState::Ready { entries, versions } => {
+                    self.adopt_rows(entries, versions);
+                    self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase = Phase::Selecting;
+                    ctx.request_repaint();
+                }
+                LoadState::Failed(message) => {
+                    let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
+                    progress.heading = "Could not check the sources".to_string();
+                    progress.message = message;
+                    progress.phase = Phase::Failed;
+                    ctx.request_repaint();
+                }
+                LoadState::Working => {}
+            }
+        }
+
         if self.window_centered && !self.shown {
             if self.centered_at_startup {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -450,6 +652,8 @@ impl App for SelectionApp {
                     }
                 });
             });
+
+        self.log_panel(ui);
 
         match phase {
             Phase::Selecting => {
@@ -619,26 +823,69 @@ impl App for SelectionApp {
                         });
                 });
             }
+            Phase::Loading => {
+                egui::Panel::bottom("actions").show(ui, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.heading("Checking sources...");
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    egui::Spinner::new().size(24.0).paint_at(ui, rect);
+                    ui.label("The strip below lists each source as it answers.");
+                });
+            }
             _ => {
+                // close_on_finish is the old habit; the default keeps the window
+                // on the end state, because the strip is the report.
+                let close_on_finish = self.job.config.close_on_finish;
+                if !close_on_finish {
+                    egui::Panel::bottom("end_actions").show(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+                }
+
                 egui::CentralPanel::default().show(ui, |ui| {
                     let progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
+                    let heading = if progress.heading.is_empty() {
+                        match progress.phase {
+                            Phase::Done => "\u{2714} Done",
+                            Phase::Cancelled => "Cancelled",
+                            Phase::Failed => "Download failed",
+                            _ => "Saishin",
+                        }
+                    } else {
+                        progress.heading.as_str()
+                    };
+                    ui.heading(heading);
                     match progress.phase {
                         Phase::Done => {
-                            ui.heading("\u{2714} Done");
                             ui.label(format!("{} file(s) updated.", progress.done));
                         }
                         Phase::Cancelled => {
-                            ui.heading("Cancelled");
                             ui.label("Download cancelled.");
                         }
                         Phase::Failed => {
-                            ui.heading("Download failed");
                             ui.label(progress.message.clone());
                         }
                         _ => {}
                     }
+                    if !close_on_finish {
+                        ui.label("The strip below lists what this run did.");
+                    }
                 });
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+
+                if close_on_finish {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
     }
@@ -679,8 +926,6 @@ fn centered_position(_width: f32, _height: f32) -> Option<[f32; 2]> {
 }
 
 pub fn run_gui(
-    entries: Vec<PendingFile>,
-    version_map: HashMap<(String, String), Vec<PendingFile>>,
     sources: Vec<SourceConfig>,
     config: AppConfig,
     token: Option<String>,
@@ -690,7 +935,8 @@ pub fn run_gui(
     let job = Arc::new(GuiJob { sources, config, token, options });
     let result = Arc::new(GuiResult { updated: Mutex::new(Vec::new()) });
     let cancel = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Selecting, done: 0, total: 0, message: "".to_string(), rows: Vec::new() }));
+    let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Loading, done: 0, total: 0, message: "".to_string(), heading: "".to_string(), rows: Vec::new() }));
+    let load = Arc::new(Mutex::new(LoadState::Working));
 
     let mut native_options = eframe::NativeOptions::default();
     native_options.centered = false;
@@ -721,7 +967,7 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Ok(Box::new(SelectionApp::new(entries, version_map, job, gui_result, cancel, progress, window_centered, centered_at_startup)))),
+        Box::new(move |_| Ok(Box::new(SelectionApp::new_loading(job, gui_result, cancel, progress, load, window_centered, centered_at_startup)))),
     );
 
     if let Err(ex) = outcome {
