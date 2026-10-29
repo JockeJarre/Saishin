@@ -506,7 +506,7 @@ saishin [config.ini] [options]
 | `--non-interactive` | Never prompt. Fail with exit code `3` if credentials are missing |
 | `--login` | Prompt for a token, verify it, store it, then exit |
 | `--logout` | Remove the stored token, then exit |
-| `--gui` | Show a selection window for new artifacts before downloading |
+| `--gui` | Show a selection window for new artifacts before downloading, with no console output |
 | `--no-gui` | Run headless, ignoring `gui = true` in the configuration |
 | `-q`, `--quiet` | Suppress progress and informational output |
 | `-V`, `--version` | Print the version, commit, target and profile, then exit |
@@ -541,6 +541,16 @@ gui = true
 A switch on the command line wins over the key, so the same configuration still
 runs headless for one-off terminal work with `--no-gui`, and `--gui` opens the
 window for a configuration that is headless by default.
+
+A GUI run keeps the console out of it: the window carries the report, so nothing
+is printed. That is not cosmetic. An exe of this kind is a console-subsystem
+program, so launching it from a shortcut gives it a console, and text in that
+console is what keeps a command window standing beside the selection window. The
+console is released as the window opens, and the notification and sound commands
+are started without a console of their own. Started from a terminal, `--gui`
+therefore prints nothing while the window is open; `--no-gui` is the run that
+writes text. A configuration that fails before any window can open still prints,
+because then the console is the only report there is.
 
 ### Picking an older version
 

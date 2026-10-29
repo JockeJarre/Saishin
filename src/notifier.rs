@@ -1,6 +1,24 @@
 use crate::log;
 use std::process::Command;
 
+/// `CREATE_NO_WINDOW`: run a child without giving it a console. A GUI run has
+/// none, so without this each notification and sound gets a window of its own.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// The child processes above, with the console flag applied where it exists.
+#[cfg(windows)]
+fn no_console(mut command: Command) -> Command {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn no_console(command: Command) -> Command {
+    command
+}
+
 pub fn send(title: &str, body: &str) {
     let result = try_send(title, body);
     if let Err(ex) = result {
@@ -55,7 +73,7 @@ fn try_play_sound(path: &str, player: &str) -> Result<(), String> {
             command.args(rest.split_whitespace());
         }
         command.arg(path);
-        match command.output() {
+        match no_console(command).output() {
             Ok(_) => Ok(()),
             Err(ex) => Err(first_line(&ex.to_string())),
         }
@@ -67,7 +85,9 @@ fn try_play_sound(path: &str, player: &str) -> Result<(), String> {
 }
 
 fn run(file_name: &str, args: &[&str]) -> Result<(), String> {
-    match Command::new(file_name).args(args).output() {
+    let mut command = Command::new(file_name);
+    command.args(args);
+    match no_console(command).output() {
         Ok(_) => Ok(()),
         Err(ex) => Err(first_line(&ex.to_string())),
     }

@@ -197,6 +197,23 @@ fn use_gui(options: &Options, config: &AppConfig) -> bool {
     options.gui.unwrap_or(config.gui)
 }
 
+/// Give back a console that launching the exe from a shortcut created on its
+/// own. A terminal that started this process keeps its text, and a console
+/// attached to a parent is not ours to close.
+#[cfg(windows)]
+fn detach_console() {
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FreeConsole() -> i32;
+    }
+    // Safety: a GUI run prints nothing after this point.
+    unsafe { FreeConsole() };
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}
+
 async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     let config_path = match &options.config_path {
         Some(path) => path.clone(),
@@ -220,6 +237,10 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
 
     let mut updated: Vec<String> = Vec::new();
     if use_gui(options, &config) {
+        // The window is the report from here on, so nothing is printed: text in
+        // the console a double-click created is what keeps that window open.
+        log::set_console_output(false);
+        detach_console();
         let per_source = join_all(
             selected
                 .iter()
