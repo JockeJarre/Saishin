@@ -123,6 +123,12 @@ x = gap
 for cell in cells:
     strip.alpha_composite(cell, (x, gap))
     x += cell.width + gap
-out = os.path.join(os.environ.get("TEMP", ROOT), "saishin-icon-compare.png")
+# Preview of the shipped icon at its small sizes, in the temp directory: it is
+# a look-at-it file, not part of the build. Windows has TEMP, macOS TMPDIR;
+# the fallback keeps the repository tree clean on a shell with neither.
+out = os.path.join(
+    os.environ.get("TEMP") or os.environ.get("TMPDIR") or ROOT,
+    "saishin-icon-compare.png",
+)
 strip.save(out)
 print("wrote", out)
