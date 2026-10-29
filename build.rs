@@ -18,20 +18,56 @@ fn main() {
     println!("cargo::rerun-if-changed=saishin-png-icon-set/saishin.ico");
     println!("cargo::rerun-if-changed=build.rs");
 
-    // The commit is part of the build identity, and a commit is not a file Cargo
-    // watches, so a local -V kept naming the commit of the last build. .git/HEAD
-    // moves with every commit, checkout and branch switch; in a worktree it is a
-    // redirect file next to the real repository, so it is only watched when it
-    // exists, and a missing path would rerun this script on every build.
-    if std::path::Path::new(".git/HEAD").exists() {
-        println!("cargo::rerun-if-changed=.git/HEAD");
-    }
+    watch_git_identity();
 
     stamp_build_identity();
     embed_logo();
 
     #[cfg(windows)]
     embed_icon();
+}
+
+/// Makes this script run again when the commit the tree sits on changes, which
+/// is what keeps a local `-V` telling the truth: a commit is not a file Cargo
+/// watches, and a checkout that only moves HEAD is not a file change either.
+/// The paths are asked of git, because "where HEAD is" differs between a normal
+/// checkout, a worktree and a detached HEAD, and a watched path that does not
+/// exist reruns the script on every build, so each one is checked first.
+fn watch_git_identity() {
+    emit_watch(git_path("HEAD"));
+
+    // HEAD names the branch; the branch's ref file is what a commit moves. A
+    // detached HEAD holds a sha and names nothing, and a branch packed into
+    // packed-refs has no loose file: both cases leave a path that is missing.
+    let head = git_path("HEAD");
+    let loose = head
+        .as_ref()
+        .and_then(|head| std::fs::read_to_string(head).ok())
+        .and_then(|text| {
+            let name = text.trim().strip_prefix("ref: ")?.trim().to_string();
+            git_path(&name)
+        });
+    emit_watch(loose);
+    emit_watch(git_path("packed-refs"));
+}
+
+/// Where git keeps a path, relative to the package root this script runs in.
+fn git_path(path: &str) -> Option<std::path::PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-path", path])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then(|| std::path::PathBuf::from(text))
+}
+
+fn emit_watch(path: Option<std::path::PathBuf>) {
+    if let Some(path) = path.filter(|path| path.exists()) {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
 }
 
 /// Publishes SAISHIN_VERSION/GIT/TARGET/PROFILE for `env!()` in main.rs.
