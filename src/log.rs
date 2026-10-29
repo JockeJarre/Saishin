@@ -76,3 +76,16 @@ pub fn error(message: &str) {
         eprintln!("error: {message}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_front_end_can_take_the_report_off_the_console() {
+        assert!(is_console_output());
+        set_console_output(false);
+        assert!(!is_console_output());
+        set_console_output(true);
+    }
+}

@@ -109,3 +109,37 @@ fn first_line(message: &str) -> String {
         .trim()
         .to_string()
 }
+
+/// Words no console can carry: a box on Windows, a notification elsewhere.
+pub fn alert(title: &str, body: &str) {
+    #[cfg(windows)]
+    message_box(title, body);
+    #[cfg(not(windows))]
+    send(title, body);
+}
+
+/// One modal box drawn by the system: no child process, and this process stays
+/// alive while the box is up, so the text can be read.
+#[cfg(windows)]
+fn message_box(title: &str, body: &str) {
+    // User32 is already linked by the windowing stack.
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *const core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            kind: u32,
+        ) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x0000_0010;
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let caption = wide(title);
+    let text = wide(body);
+    // Safety: both strings are NUL-terminated and outlive the call.
+    unsafe { MessageBoxW(core::ptr::null(), text.as_ptr(), caption.as_ptr(), MB_ICONERROR) };
+}

@@ -183,10 +183,42 @@ async fn async_main(options: &Options) -> i32 {
     match async_main_inner(options).await {
         Ok(code) => code,
         Err(ex) => {
-            log::error(&ex.to_string());
+            let message = ex.to_string();
+            log::error(&message);
+            if box_is_the_report() {
+                notifier::alert("Saishin", &message);
+            }
             ex.exit_code()
         }
     }
+}
+
+/// Whether a box is the only way this run can report a failure. The GUI took the
+/// report into a window and released the console, so nothing was printed; a
+/// console created for this process alone, which is what launching the exe from
+/// a shortcut gives, closes with it and hides the text. A terminal has a process
+/// of its own on the console and keeps the text, and a service has no console
+/// and writes to a log: neither wants a box.
+fn box_is_the_report() -> bool {
+    !log::is_console_output() || console_is_ours()
+}
+
+#[cfg(windows)]
+fn console_is_ours() -> bool {
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, size: u32) -> u32;
+    }
+    let mut processes = [0u32; 8];
+    // Zero when there is no console attached, one for a console of our own.
+    let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+    attached == 1
+}
+
+#[cfg(not(windows))]
+fn console_is_ours() -> bool {
+    false
 }
 
 /// Which front end runs. The command line wins: `--gui` opens the window even
