@@ -77,7 +77,9 @@ struct Options {
     show_help: bool,
     show_version: bool,
     quiet: bool,
-    gui: bool,
+    /// GUI override for `[general] gui`: `Some(true)` from `--gui`, `Some(false)`
+    /// from `--no-gui`, `None` (no flag given) follows the config.
+    gui: Option<bool>,
 }
 
 impl Options {
@@ -94,7 +96,8 @@ impl Options {
                 "--login" => options.login = true,
                 "--logout" => options.logout = true,
                 "-q" | "--quiet" => options.quiet = true,
-                "--gui" => options.gui = true,
+                "--gui" => options.gui = Some(true),
+                "--no-gui" => options.gui = Some(false),
                 "-c" | "--config" => {
                     options.config_path = Some(next_value(args, &mut i)?);
                 }
@@ -186,6 +189,14 @@ async fn async_main(options: &Options) -> i32 {
     }
 }
 
+/// Which front end runs. The command line wins: `--gui` opens the window even
+/// when the config says headless, `--no-gui` is the escape hatch for a config
+/// with `gui = true` (a scheduled task, a script). Without a flag, `[general]
+/// gui` decides.
+fn use_gui(options: &Options, config: &AppConfig) -> bool {
+    options.gui.unwrap_or(config.gui)
+}
+
 async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     let config_path = match &options.config_path {
         Some(path) => path.clone(),
@@ -208,7 +219,7 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     let token = resolve_token(&config, &selected, &http, options).await?;
 
     let mut updated: Vec<String> = Vec::new();
-    if options.gui {
+    if use_gui(options, &config) {
         let per_source = join_all(
             selected
                 .iter()
@@ -1405,10 +1416,63 @@ mod tests {
     fn options_parse_the_version_switch() {
         let options = Options::parse(&["-V".to_string()]).expect("parses");
         assert!(options.show_version);
-        assert!(!options.gui);
+        assert_eq!(options.gui, None);
         assert!(Options::parse(&["--version".to_string()])
             .expect("parses")
             .show_version);
+    }
+
+    #[test]
+    fn the_gui_switch_is_an_option_not_a_default() {
+        assert_eq!(Options::parse(&[]).expect("parses").gui, None);
+        assert_eq!(
+            Options::parse(&["--gui".to_string()]).expect("parses").gui,
+            Some(true)
+        );
+        assert_eq!(
+            Options::parse(&["--no-gui".to_string()]).expect("parses").gui,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_config_gui_setting_is_the_default_front_end() {
+        let headless = config_with_gui_flag(false);
+        let graphical = config_with_gui_flag(true);
+        let no_flag = Options::parse(&[]).expect("parses");
+        assert!(!use_gui(&no_flag, &headless));
+        assert!(use_gui(&no_flag, &graphical));
+    }
+
+    #[test]
+    fn command_line_gui_flags_win_over_the_config() {
+        let headless = config_with_gui_flag(false);
+        let graphical = config_with_gui_flag(true);
+        assert!(use_gui(
+            &Options::parse(&["--gui".to_string()]).expect("parses"),
+            &headless
+        ));
+        assert!(!use_gui(
+            &Options::parse(&["--no-gui".to_string()]).expect("parses"),
+            &graphical
+        ));
+    }
+
+    /// A config differing only in `[general] gui`.
+    fn config_with_gui_flag(gui: bool) -> AppConfig {
+        AppConfig {
+            base_directory: String::new(),
+            default_out_dir: String::new(),
+            github_api_url: "https://api.github.com".to_string(),
+            keyring_service: "saishin".to_string(),
+            notify: false,
+            window_centered: true,
+            gui,
+            releases: 10,
+            sound: String::new(),
+            sound_player: String::new(),
+            sources: Vec::new(),
+        }
     }
 
     #[test]
@@ -1579,6 +1643,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            gui: false,
             releases: 10,
             sound: String::new(),
             sound_player: String::new(),
@@ -1596,6 +1661,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             notify: false,
             window_centered: true,
+            gui: false,
             releases: 10,
             sound: String::new(),
             sound_player: String::new(),
@@ -1623,6 +1689,7 @@ OPTIONS
       --logout           Remove the stored GitHub token, then exit
   -q, --quiet            Suppress progress and informational output
       --gui              Show a selection window for new artifacts before downloading
+      --no-gui           Run headless, ignoring [general] gui
   -V, --version          Show the version, commit and target, then exit
   -h, --help             Show this help
 

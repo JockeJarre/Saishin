@@ -339,6 +339,7 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `github_api_url` | `https://api.github.com` | API root; override for GitHub Enterprise |
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
 | `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
+| `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
 | `sound` | empty | Play this sound file after a run that downloaded something |
 | `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
@@ -468,6 +469,7 @@ saishin [config.ini] [options]
 | `--login` | Prompt for a token, verify it, store it, then exit |
 | `--logout` | Remove the stored token, then exit |
 | `--gui` | Show a selection window for new artifacts before downloading |
+| `--no-gui` | Run headless, ignoring `gui = true` in the configuration |
 | `-q`, `--quiet` | Suppress progress and informational output |
 | `-V`, `--version` | Print the version, commit, target and profile, then exit |
 | `-h`, `--help` | Show usage |
@@ -489,6 +491,18 @@ you do not want, then press **Download selected**. **Cancel** aborts the run;
 artifacts are downloaded; the rest of the run (changelogs, archive handling,
 notifications) proceeds as usual. The window needs a display server, so use
 the plain CLI mode for headless scheduled runs.
+
+The same front end can be chosen in the configuration, which is what a desktop
+shortcut wants:
+
+```ini
+[general]
+gui = true
+```
+
+A switch on the command line wins over the key, so the same configuration still
+runs headless for one-off terminal work with `--no-gui`, and `--gui` opens the
+window for a configuration that is headless by default.
 
 ### Picking an older version
 

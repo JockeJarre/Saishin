@@ -50,6 +50,9 @@ pub struct AppConfig {
     pub keyring_service: String,
     pub notify: bool,
     pub window_centered: bool,
+    /// Open the GUI by default (`[general] gui`). `--gui` and `--no-gui` on the
+    /// command line win over this.
+    pub gui: bool,
     pub releases: i64,
     pub sound: String,
     pub sound_player: String,
@@ -93,6 +96,7 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
         notify: get_bool(&sections, GENERAL_SECTION, "notify", false)?,
         window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
+        gui: get_bool(&sections, GENERAL_SECTION, "gui", false)?,
         releases: get_int(&sections, GENERAL_SECTION, "releases", 10)?,
         sound: resolve_sound(&sections, GENERAL_SECTION, &base_dir),
         sound_player: get_string(&sections, GENERAL_SECTION, "sound_player", "")
@@ -463,6 +467,37 @@ mod tests {
         assert_eq!(source.keep, 2);
         assert!(source.out_dir.ends_with("dl"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_general_gui_key_picks_the_graphical_front_end() {
+        const ONE_SOURCE: &str = "[files]\ntype = url\nurls = https://example.com/a.zip\n";
+
+        let on = load(&write_ini(
+            "gui.ini",
+            &format!("[general]\ngui = true\n\n{ONE_SOURCE}"),
+        ))
+        .expect("loads");
+        assert!(on.gui);
+
+        let off = load(&write_ini(
+            "gui_off.ini",
+            &format!("[general]\ngui = off\n\n{ONE_SOURCE}"),
+        ))
+        .expect("loads");
+        assert!(!off.gui);
+
+        let unwritten = load(&write_ini("gui_default.ini", ONE_SOURCE)).expect("loads");
+        assert!(!unwritten.gui, "the CLI stays the default");
+
+        let bad = write_ini(
+            "gui_bad.ini",
+            &format!("[general]\ngui = sometimes\n\n{ONE_SOURCE}"),
+        );
+        let err = load(&bad).expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("'gui' must be true or false, not 'sometimes'"));
     }
 
     #[test]

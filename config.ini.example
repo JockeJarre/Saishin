@@ -20,6 +20,12 @@ out_dir = ./downloads
 ; listing the files that were downloaded. Default: false.
 ; notify = true
 
+; Optional. Which front end runs. true opens the selection window (for a
+; desktop button); false keeps the run headless for a script or a scheduled
+; task. A --gui / --no-gui switch on the command line wins over this key.
+; Default: false.
+; gui = true
+
 ; Optional. Play this sound file after a run that downloaded something.
 ; Default player: 'afplay' (macOS), 'ffplay' (Windows, Linux).
 ; sound = ./sounds/update.mp3
