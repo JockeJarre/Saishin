@@ -22,11 +22,14 @@
 //   - The program is started with `CREATE_NO_WINDOW` and piped handles, so no
 //     console window exists for either process.
 //   - Its text is captured, and the box is the report: the console that would
-//     have carried it does not exist. `SAISHIN_LAUNCHER` tells the program that
-//     someone upstream is reading its text, so it keeps its own box in its
-//     pocket and a failure is not reported twice.
-//   - A run that opens the GUI window prints nothing, and a run with nothing to
-//     say exits 0: both stay quiet, the window is the report.
+//     have carried it does not exist. `SAISHIN_LAUNCHER` tells the program two
+//     things: that it keeps its own box in its pocket, so a failure is not
+//     reported twice, and that a dialog is no place to read a run's transcript,
+//     so the program prints its warnings and errors and keeps the chatter to
+//     itself.
+//   - A run with nothing wrong says nothing and exits 0, so it gets no box, and
+//     a run that opens the GUI window prints nothing at all: its window, and the
+//     log strip in it, is the report.
 //   - The exit code is passed through, so a launcher in front of the program
 //     changes nothing for whoever watches the code.
 //

@@ -10,10 +10,11 @@ static LAST_WIDTH: AtomicUsize = AtomicUsize::new(0);
 /// console is what keeps a command window standing next to the window.
 static CONSOLE: AtomicBool = AtomicBool::new(true);
 
-/// Off in a run that opens the window: a stream of progress and information has
-/// no reader there, the window is the report. Warnings and errors keep the
-/// console rule below, because a failure before the window exists is text
-/// somebody needs to be shown.
+/// Off in a run that opens the window: the window is the report, and everything
+/// the run says - the progress, the information, the warnings, the errors - is
+/// in its strip. A launcher boxes the text its pipes caught, so a window run
+/// leaves the pipes empty. A run that dies before its window has no strip, and
+/// `print_before_the_launcher` is how its words reach that box.
 static STREAM: AtomicBool = AtomicBool::new(true);
 
 pub fn set_quiet(quiet: bool) {
@@ -22,6 +23,21 @@ pub fn set_quiet(quiet: bool) {
 
 pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
+}
+
+/// True when a launcher is reading this run's text and makes its box out of what
+/// it catches (`saishin.exe`, the icon's target, sets `SAISHIN_LAUNCHER`). A box
+/// is for problems, not for reading a run's transcript, so under a launcher the
+/// chatter is not printed and the warnings and errors are. A terminal, a script
+/// and a scheduled task keep the whole run: no launcher is in front of them.
+static LAUNCHER: AtomicBool = AtomicBool::new(false);
+
+pub fn set_launcher_report(on: bool) {
+    LAUNCHER.store(on, Ordering::Relaxed);
+}
+
+fn launcher_reads() -> bool {
+    LAUNCHER.load(Ordering::Relaxed)
 }
 
 pub fn set_console_output(on: bool) {
@@ -45,7 +61,27 @@ fn is_stream() -> bool {
 }
 
 fn on_console() -> bool {
-    !is_quiet() && is_console_output() && is_stream()
+    !is_quiet() && is_console_output() && is_stream() && !launcher_reads()
+}
+
+/// The mouth of a warning and an error: open while no window has taken the
+/// report. A window shows them in its strip, coloured, and the same words in a
+/// launcher's pipes are a box repeating them after the window closed. Problems
+/// are never chatter, so quiet does not close this.
+fn problems_are_printed() -> bool {
+    is_console_output() && is_stream()
+}
+
+/// The words of a run that planned a window and never got one to show them.
+/// Called on a window run's failure paths, where the window is not on screen:
+/// the asking happens behind the window, and `run_gui` only fails when the
+/// window itself could not open, so a failure here is one the strip will not
+/// show and the box is the report.
+pub fn print_before_the_launcher(message: &str) {
+    if !is_console_output() || is_stream() {
+        return;
+    }
+    eprintln!("error: {message}");
 }
 
 /// Which mouth a line came out of, so a window can colour the problems and the
@@ -169,14 +205,14 @@ pub fn progress_done() {
 
 pub fn warn(message: &str) {
     record(Level::Warn, message);
-    if is_console_output() {
+    if problems_are_printed() {
         eprintln!("warning: {message}");
     }
 }
 
 pub fn error(message: &str) {
     record(Level::Error, message);
-    if is_console_output() {
+    if problems_are_printed() {
         eprintln!("error: {message}");
     }
 }
@@ -194,13 +230,30 @@ mod tests {
     }
 
     #[test]
-    fn a_window_takes_the_stream_and_leaves_the_problems() {
+    fn a_window_takes_the_problems_out_of_the_pipes() {
+        // A launcher makes its box out of the text its pipes caught. A window run
+        // has the strip to show the problems in, so the switch that opens the
+        // window closes the warnings and the errors as well as the chatter.
         window_is_the_report();
-        // info, detail and progress are off ...
         assert!(!is_stream());
-        // ... and warn and error are not affected by that switch.
-        assert!(is_console_output());
+        assert!(!problems_are_printed());
+        assert!(!on_console());
+        // A headless run keeps printing its problems, quiet included: on a
+        // console, a warning is the only report there is.
         STREAM.store(true, Ordering::Relaxed);
+        assert_eq!(problems_are_printed(), is_console_output());
+    }
+
+    #[test]
+    fn a_launcher_run_prints_its_problems_and_not_its_chatter() {
+        // The box a launcher builds is read in a dialog: the run's lines do not
+        // fit there, its problems do, and a run with nothing wrong says nothing.
+        set_launcher_report(true);
+        assert!(!on_console());
+        assert_eq!(problems_are_printed(), is_console_output());
+        set_launcher_report(false);
+        // With no launcher in front, a console run gets the whole transcript.
+        assert_eq!(on_console(), is_console_output() && !is_quiet());
     }
 
     #[test]

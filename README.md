@@ -120,11 +120,14 @@ binary carrying the icon, and it is std-only, so it starts in milliseconds.
 
 What a run through the launcher reports:
 
-- A headless run's text is the box: the console that would have carried it does
-  not exist. A failure is an error box, a run that downloaded something is the
-  summary of it.
-- A run that opens the GUI window prints nothing and stays quiet: the window is
-  the report, and the run's lines are readable in the log strip at its bottom.
+- The box is for problems. A headless run's warnings and errors become the box;
+  a run with nothing wrong says nothing, exits 0, and gets no box. A progress
+  line and a source's log are not something to read in a dialog, so under a
+  launcher they stay unprinted — a terminal run's transcript, and a script's or
+  scheduled task's log, keep every line.
+- A run that opens the GUI window prints nothing at all, warnings and errors
+  included: the window is the report, and its lines are readable in the log
+  strip at its bottom.
 - The exit code is passed through, so watching exit codes changes nothing.
 
 A terminal run of `saishin.exe` answers in a box rather than in the terminal, and
@@ -598,7 +601,9 @@ the sources are asked: a run of several sources takes seconds, and the window
 shows **Checking sources...** with a spinner while they answer, and **Cancel**
 ends it. The strip at the bottom is the run's text, the same lines a console run
 prints — the token's provenance, which source was asked and what it offered, the
-download lines, the warnings. Closed, the strip is one line: the newest. Open, it
+download lines with their progress, the warnings, the errors. A window run keeps
+all of those in the strip and prints none of them, which is why a window run is
+never followed by a box. Closed, the strip is one line: the newest. Open, it
 is a list that follows the newest line, and its text can be selected and copied.
 The download list marks what each row is waiting for: a spinning circle is a
 transfer, a turning amber square is an archive being unpacked, a check is a file

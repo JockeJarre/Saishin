@@ -156,6 +156,9 @@ fn run() -> i32 {
     }
 
     log::set_quiet(options.quiet);
+    // The icon's launcher reads this run's text and boxes what it catches, so
+    // the run's lines are not for it: they stay unprinted, the problems do not.
+    log::set_launcher_report(std::env::var_os("SAISHIN_LAUNCHER").is_some());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -185,6 +188,9 @@ async fn async_main(options: &Options) -> i32 {
         Err(ex) => {
             let message = ex.to_string();
             log::error(&message);
+            // The window was going to show this and is not on screen to: give
+            // the words to the box, which is the launcher's making.
+            log::print_before_the_launcher(&message);
             if box_is_the_report() {
                 notifier::alert("Saishin", &message);
             }
@@ -272,8 +278,9 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
 
     // Decided here, before the token is looked up: a run that opens the window
     // prints no stream of text, and the token's provenance is part of that
-    // stream. Warnings and errors keep the console rule, so a failure before
-    // the window exists is still something a launcher can show.
+    // stream. The switch closes the warnings and the errors too - the strip
+    // shows them, and a launcher boxes whatever its pipes catch, which is how a
+    // run of extract warnings ended up in a box after its window closed.
     if use_gui(options, &config) {
         log::window_is_the_report();
     }
