@@ -605,9 +605,12 @@ download lines with their progress, the warnings, the errors. A window run keeps
 all of those in the strip and prints none of them, which is why a window run is
 never followed by a box. Closed, the strip is one line: the newest. Open, it
 is a list that follows the newest line, and its text can be selected and copied.
-The download list marks what each row is waiting for: a spinning circle is a
-transfer, a turning amber square is an archive being unpacked, a check is a file
-that is finished.
+The download list says what each row is doing by how its mark is drawn, and by
+nothing else: a spinning circle is a transfer, a turning amber square an archive
+being unpacked, a green check a finished file, a grey ring a row a cancel stopped
+mid-transfer. The list is the run's work, so it stays on screen when the run ends,
+under the answer - a mark that turns over a run that has ended would say the run
+is still going.
 
 Because a GUI run's words live in that strip, the window stays open when the run
 ends — **Done**, **Cancelled** or **Failed** — with a **Close** button;

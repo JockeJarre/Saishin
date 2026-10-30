@@ -67,17 +67,19 @@ enum RowState {
     Done,
 }
 
-/// The word a row's state shows beside its mark. The marks say a row is busy;
-/// the words say which of the two waits, in so many letters that a glance is
-/// enough to tell a 200 MB download from unzipping the same 200 MB.
-fn state_word(state: RowState) -> &'static str {
-    match state {
-        RowState::Pending => "",
-        RowState::Downloading => "downloading",
-        RowState::Extracting => "unzipping",
-        RowState::Done => "done",
-    }
-}
+/// The colors a row's mark wears. The mark is the whole of a row's telling: a
+/// spinning circle is a transfer, this amber square an archive being unpacked,
+/// this green check a file that is finished, this grey ring a row a cancel
+/// stopped while it was busy. The name beside the mark is the row's only text,
+/// so no word has to repeat what the drawing says.
+const UNZIP_MARK: egui::Color32 = egui::Color32::from_rgb(224, 165, 60);
+const DONE_MARK: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
+const STOPPED_MARK: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+/// A mark's cell: square, and the size of the spinner that fills it.
+const MARK_SIZE: f32 = 16.0;
+/// The end screen shows the list and asks its question and answers, so the list
+/// takes the rows it has and at most this much height.
+const END_LIST_MAX_HEIGHT: f32 = 220.0;
 
 /// The mark for a file being unzipped: a square turning where the download's
 /// circle spins, in an amber no download wears. The motion is the same, so the
@@ -88,7 +90,7 @@ fn paint_unzipping(ui: &egui::Ui, rect: egui::Rect) {
     let turns = (ui.input(|i| i.time) * 0.35).rem_euclid(1.0) as f32;
     let center = rect.center();
     let radius = rect.width().min(rect.height()) * 0.34;
-    let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(224, 165, 60));
+    let stroke = egui::Stroke::new(2.0_f32, UNZIP_MARK);
     let corners: Vec<egui::Pos2> = (0..5)
         .map(|i| {
             let angle = turns * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2 * (i as f32);
@@ -96,6 +98,29 @@ fn paint_unzipping(ui: &egui::Ui, rect: egui::Rect) {
         })
         .collect();
     ui.painter().add(egui::Shape::line(corners, stroke));
+}
+
+/// The mark of a row, in its cell, for as long as the row is on screen. The run
+/// that owns the row says which marks move: while it runs, a transfer and an
+/// archive spin; when it is over, a row that was busy takes a still grey ring,
+/// because a mark turning over a run that has ended says the run is still going.
+fn row_mark(ui: &egui::Ui, rect: egui::Rect, state: RowState, running: bool) {
+    match state {
+        RowState::Pending => {}
+        RowState::Done => {
+            let stroke = egui::Stroke::new(2.0_f32, DONE_MARK);
+            ui.painter().line_segment([egui::pos2(rect.left() + 3.0, rect.center().y), egui::pos2(rect.center().x, rect.bottom() - 4.0)], stroke);
+            ui.painter().line_segment([egui::pos2(rect.center().x, rect.bottom() - 4.0), egui::pos2(rect.right() - 3.0, rect.top() + 3.0)], stroke);
+        }
+        RowState::Downloading if running => egui::Spinner::new().size(MARK_SIZE).paint_at(ui, rect),
+        RowState::Extracting if running => paint_unzipping(ui, rect),
+        RowState::Downloading | RowState::Extracting => {
+            // The shape of the transfer, in a grey that is neither busy nor
+            // finished, and standing still: this row was mid-flight.
+            let stroke = egui::Stroke::new(2.0_f32, STOPPED_MARK);
+            ui.painter().circle_stroke(rect.center(), rect.width() * 0.34, stroke);
+        }
+    }
 }
 
 /// The size of a half downloaded file, as the question lists it. "gone" is an
@@ -672,6 +697,46 @@ impl SelectionApp {
         );
         log::info(&progress.answer);
     }
+
+    /// The files as rows: the mark of what each is doing, its source, its size,
+    /// and a link to where it came from. The same list serves the running screen
+    /// and the end screen, so a run's rows stay on screen as its result: the
+    /// checks are the list of what came down. `running` is the window's say on
+    /// whether the run is still up, which decides what the busy rows draw.
+    fn file_rows(&self, ui: &mut egui::Ui, rows: &[RowState], running: bool) {
+        let list = egui::ScrollArea::vertical()
+            .auto_shrink([false, !running])
+            .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible);
+        let list = if running {
+            list
+        } else {
+            list.max_height(END_LIST_MAX_HEIGHT)
+        };
+        list.show(ui, |ui| {
+            egui::Grid::new("download_list")
+                .spacing(egui::vec2(8.0, 4.0))
+                .show(ui, |ui| {
+                    for (index, entry) in self.entries.iter().enumerate() {
+                        let state = if index < rows.len() {
+                            rows[index]
+                        } else {
+                            RowState::Pending
+                        };
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(MARK_SIZE, MARK_SIZE), egui::Sense::hover());
+                        row_mark(ui, rect, state, running);
+                        ui.label(entry.file.source_name.clone());
+                        let size = match entry.file.size {
+                            Some(bytes) => format_bytes(bytes),
+                            None => "size unknown".to_string(),
+                        };
+                        ui.label(size);
+                        ui.hyperlink_to(&entry.file.file_name, &entry.file.link_url);
+                        ui.end_row();
+                    }
+                });
+        });
+    }
 }
 
 impl App for SelectionApp {
@@ -902,43 +967,16 @@ impl App for SelectionApp {
                 });
 
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
-                    let rows = progress.rows.clone();
+                    let (rows, done, total) = {
+                        let progress = self
+                            .progress
+                            .lock()
+                            .unwrap_or_else(|guard| guard.into_inner());
+                        (progress.rows.clone(), progress.done, progress.total)
+                    };
                     ui.heading("Downloading...");
-                    ui.label(format!("{} of {} files", progress.done, progress.total));
-
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                        .show(ui, |ui| {
-                            egui::Grid::new("download_list")
-                                .spacing(egui::vec2(8.0, 4.0))
-                                .show(ui, |ui| {
-                                    for (index, entry) in self.entries.iter().enumerate() {
-                                        let state = if index < rows.len() { rows[index] } else { RowState::Pending };
-                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                                        match state {
-                                            RowState::Downloading => egui::Spinner::new().size(16.0).paint_at(ui, rect),
-                                            RowState::Extracting => paint_unzipping(ui, rect),
-                                            RowState::Done => {
-                                                let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(60, 180, 90));
-                                                ui.painter().line_segment([egui::pos2(rect.left() + 3.0, rect.center().y), egui::pos2(rect.center().x, rect.bottom() - 4.0)], stroke);
-                                                ui.painter().line_segment([egui::pos2(rect.center().x, rect.bottom() - 4.0), egui::pos2(rect.right() - 3.0, rect.top() + 3.0)], stroke);
-                                            }
-                                            RowState::Pending => {}
-                                        }
-                                        ui.label(state_word(state));
-                                        ui.label(entry.file.source_name.clone());
-                                        let size = match entry.file.size {
-                                            Some(bytes) => format_bytes(bytes),
-                                            None => "size unknown".to_string(),
-                                        };
-                                        ui.label(size);
-                                        ui.hyperlink_to(&entry.file.file_name, &entry.file.link_url);
-                                        ui.end_row();
-                                    }
-                                });
-                        });
+                    ui.label(format!("{done} of {total} files"));
+                    self.file_rows(ui, &rows, true);
                 });
             }
             Phase::Loading => {
@@ -993,29 +1031,52 @@ impl App for SelectionApp {
                 }
 
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
-                    let heading = if progress.heading.is_empty() {
-                        match progress.phase {
-                            Phase::Done => "\u{2714} Done",
-                            Phase::Cancelled => "Cancelled",
-                            Phase::Failed => "Download failed",
-                            _ => "Saishin",
-                        }
-                    } else {
-                        progress.heading.as_str()
+                    // Read once and cloned: the list is drawn by `file_rows`,
+                    // which needs the window, and a guard held across that would
+                    // keep the window borrowed.
+                    let (heading, phase, message, answer, rows, done) = {
+                        let progress = self
+                            .progress
+                            .lock()
+                            .unwrap_or_else(|guard| guard.into_inner());
+                        let heading = if progress.heading.is_empty() {
+                            match progress.phase {
+                                Phase::Done => "\u{2714} Done".to_string(),
+                                Phase::Cancelled => "Cancelled".to_string(),
+                                Phase::Failed => "Download failed".to_string(),
+                                _ => "Saishin".to_string(),
+                            }
+                        } else {
+                            progress.heading.clone()
+                        };
+                        (
+                            heading,
+                            progress.phase,
+                            progress.message.clone(),
+                            progress.answer.clone(),
+                            progress.rows.clone(),
+                            progress.done,
+                        )
                     };
                     ui.heading(heading);
-                    match progress.phase {
+                    match phase {
                         Phase::Done => {
-                            ui.label(format!("{} file(s) updated.", progress.done));
+                            ui.label(format!("{done} file(s) updated."));
                         }
                         Phase::Cancelled => {
                             ui.label("Download cancelled.");
                         }
                         Phase::Failed => {
-                            ui.label(progress.message.clone());
+                            ui.label(message);
                         }
                         _ => {}
+                    }
+                    // The list the run worked through is the run's result, so it
+                    // stays: the checks say what came down, and a row a cancel
+                    // stopped is drawn standing still. A run that ended before
+                    // any file started has no rows to show.
+                    if !rows.is_empty() {
+                        self.file_rows(ui, &rows, false);
                     }
                     if !partials.is_empty() {
                         ui.label(format!(
@@ -1026,8 +1087,8 @@ impl App for SelectionApp {
                             ui.label(format!("  {}  {}", path, partial_size(path)));
                         }
                         ui.label("Keeping them lets the next run continue where this one stopped. Deleting them leaves nothing behind.");
-                    } else if !progress.answer.is_empty() {
-                        ui.label(progress.answer.clone());
+                    } else if !answer.is_empty() {
+                        ui.label(answer);
                     }
                     if !close_on_finish {
                         ui.label("The strip below lists what this run did.");
@@ -1137,16 +1198,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_row_says_which_of_the_two_waits_it_is() {
-        // The window's tell that a long busy row is unpacking and not transferring
-        // has to be a word and a mark, not one word for both.
-        assert_eq!(state_word(RowState::Downloading), "downloading");
-        assert_eq!(state_word(RowState::Extracting), "unzipping");
-        assert_ne!(
-            state_word(RowState::Extracting),
-            state_word(RowState::Downloading)
-        );
-        assert_eq!(state_word(RowState::Pending), "");
+    fn a_rows_mark_is_the_whole_of_its_telling() {
+        // The row carries no word for its state, so the marks have to read apart
+        // on their own: an amber square for an archive, a green check for a file
+        // that is finished, and neither is the other's color.
+        assert_ne!(UNZIP_MARK, DONE_MARK);
+        let (r, g, b, _) = UNZIP_MARK.to_tuple();
+        assert!(r > 200 && g > 120 && b < 100, "the unzip mark has to read amber, not {r},{g},{b}");
+        let (r, g, b, _) = DONE_MARK.to_tuple();
+        assert!(g > r && g > b, "the done mark has to read green, not {r},{g},{b}");
+        // The mark of a row a cancel left mid-flight is grey on purpose: no hue
+        // to read as busy, and no motion to read as a run that is still up.
+        let (r, g, b, _) = STOPPED_MARK.to_tuple();
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert_ne!(STOPPED_MARK, DONE_MARK);
+        assert_ne!(STOPPED_MARK, UNZIP_MARK);
     }
 
     /// `build.rs` picks the embedded logo's size from the PNG, and this file
