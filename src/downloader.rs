@@ -18,6 +18,30 @@ const PARALLEL_MIN_BYTES: u64 = 8_000_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// The half downloaded files a cancelled run leaves on disk, in the order they
+/// were left. A cancel keeps the pieces, because resuming is the whole point of
+/// writing to a `.part` file, so somebody has to say what to do with them: the
+/// window asks. A run that finishes leaves nothing - the piece is renamed into
+/// place and the chunks are removed - so the list stays empty.
+static PARTIALS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Notes one piece left behind. An empty piece is not listed: it resumes
+/// nothing, and a window asking about a 0-byte file is noise.
+fn record_partial(path: &str) {
+    if safe_file_length(path).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut partials = PARTIALS.lock().unwrap_or_else(|guard| guard.into_inner());
+    if !partials.iter().any(|seen| seen == path) {
+        partials.push(path.to_string());
+    }
+}
+
+/// The pieces so far, with the list emptied: the window asks once per run.
+pub fn take_partials() -> Vec<String> {
+    std::mem::take(&mut *PARTIALS.lock().unwrap_or_else(|guard| guard.into_inner()))
+}
+
 pub struct Downloader {
     client: reqwest::Client,
 }
@@ -207,6 +231,8 @@ impl Downloader {
         }
 
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            // Every chunk has closed its own line and listed its own piece.
+            log::progress_done();
             return Ok(false);
         }
 
@@ -242,7 +268,7 @@ impl Downloader {
         }
 
         render_progress(&name, total, Some(total));
-        println!();
+        log::progress_done();
         Ok(true)
     }
 
@@ -349,6 +375,10 @@ impl Downloader {
         let name = file_name_of(destination);
         while let Some(chunk) = source.next().await {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                // The line is closed, and the piece stays: the next run starts
+                // from what is here, and the window asks whether that is wanted.
+                log::progress_done();
+                record_partial(temporary);
                 return Ok(false);
             }
             let chunk = chunk.map_err(|ex| AppError::Download {
@@ -364,7 +394,7 @@ impl Downloader {
         }
 
         render_progress(&name, written, total);
-        println!();
+        log::progress_done();
 
         std::fs::rename(temporary, destination).map_err(|ex| AppError::Download {
             status: 0,
@@ -447,6 +477,8 @@ async fn download_range(
         })?;
     while let Some(chunk) = stream.next().await {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            log::progress_done();
+            record_partial(file);
             return Ok(());
         }
         let chunk = chunk.map_err(|ex| AppError::Download {
@@ -474,12 +506,12 @@ fn render_progress(name: &str, written: u64, total: Option<u64>) {
                 return;
             }
             format!(
-                "    {name}  {percent:3}%  {} / {}",
+                "{name}  {percent:3}%  {} / {}",
                 format_bytes(written),
                 format_bytes(value)
             )
         }
-        _ => format!("    {name}  {}", format_bytes(written)),
+        _ => format!("{name}  {}", format_bytes(written)),
     };
     let complete = matches!(total, Some(value) if value > 0 && written >= value);
 
@@ -492,8 +524,11 @@ fn render_progress(name: &str, written: u64, total: Option<u64>) {
         }
     }
     *last = Some(Instant::now());
-    print!("\r{line:<78}");
-    let _ = std::io::stdout().flush();
+    // The line is handed to the log, not written at the console by hand: the log
+    // is what knows where a line belongs (a carriage return on a console, the
+    // newest line of a window's strip) and a run that reports in a window has no
+    // console - printing here is text in a pipe nobody reads.
+    log::progress(&line);
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -565,4 +600,30 @@ fn first_line(message: &str) -> String {
         .unwrap_or(message)
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_half_downloaded_piece_is_listed_once_and_handed_over_once() {
+        let dir = std::env::temp_dir().join(format!("saishin-partials-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let piece = dir.join("big.zip.part");
+        let empty = dir.join("nothing.zip.part");
+        std::fs::write(&piece, "half of it").unwrap();
+        std::fs::write(&empty, []).unwrap();
+        let listed = piece.to_string_lossy().to_string();
+
+        // Twice for the same piece: four chunk tasks cancel at their own moments,
+        // and a window listing the same file four times is not a question.
+        record_partial(&listed);
+        record_partial(&listed);
+        record_partial(empty.to_string_lossy().as_ref());
+
+        assert_eq!(take_partials(), vec![listed]);
+        assert!(take_partials().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -7,10 +7,12 @@ use crate::collect_new;
 use crate::config::SourceConfig;
 use crate::log::{self, Level};
 use std::time::Duration;
+use crate::downloader::take_partials;
 use crate::downloader::Downloader;
 use crate::prune_old_files;
 use crate::download_pending;
 use crate::ProgressSink;
+use crate::WorkState;
 use eframe::App;
 use eframe::egui;
 use eframe::run_native;
@@ -60,7 +62,49 @@ enum LoadState {
 enum RowState {
     Pending,
     Downloading,
+    /// The file is down and being unpacked: a wait of its own, and drawn as one.
+    Extracting,
     Done,
+}
+
+/// The word a row's state shows beside its mark. The marks say a row is busy;
+/// the words say which of the two waits, in so many letters that a glance is
+/// enough to tell a 200 MB download from unzipping the same 200 MB.
+fn state_word(state: RowState) -> &'static str {
+    match state {
+        RowState::Pending => "",
+        RowState::Downloading => "downloading",
+        RowState::Extracting => "unzipping",
+        RowState::Done => "done",
+    }
+}
+
+/// The mark for a file being unzipped: a square turning where the download's
+/// circle spins, in an amber no download wears. The motion is the same, so the
+/// row keeps saying "busy"; the shape and the color say it is the second wait.
+fn paint_unzipping(ui: &egui::Ui, rect: egui::Rect) {
+    // Turns, not seconds: the clock is a seconds counter that grows all day, and
+    // the fraction of a turn is the only part of it that draws.
+    let turns = (ui.input(|i| i.time) * 0.35).rem_euclid(1.0) as f32;
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.34;
+    let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(224, 165, 60));
+    let corners: Vec<egui::Pos2> = (0..5)
+        .map(|i| {
+            let angle = turns * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2 * (i as f32);
+            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(corners, stroke));
+}
+
+/// The size of a half downloaded file, as the question lists it. "gone" is an
+/// answer the list can show: the file is one the run left, and anything may
+/// have happened to it in the meantime.
+fn partial_size(path: &str) -> String {
+    std::fs::metadata(path)
+        .map(|meta| format_bytes(meta.len()))
+        .unwrap_or_else(|_| "gone".to_string())
 }
 
 struct GuiProgress {
@@ -72,6 +116,11 @@ struct GuiProgress {
     /// how the download worker leaves it; the load path sets its own words.
     heading: String,
     rows: Vec<RowState>,
+    /// The half downloaded files a cancelled run left on disk, and what the
+    /// window is asking about. Emptied by the answer.
+    partials: Vec<String>,
+    /// The window's own words about the answer to that question.
+    answer: String,
 }
 
 struct ArtifactEntry {
@@ -183,11 +232,18 @@ const _: () = assert!(HEADER_ROW > HEADER_LOGO && HEADER_LOGO > HEADER_WORD_SIZE
 /// window a thousand rows tall.
 const LOG_LINES_HEIGHT: f32 = 180.0;
 
+/// The strip's text size. The small style is 9 pt and the body 13 pt, and a log
+/// sits between them: paths, sizes and the columns of the progress lines stay
+/// legible at a glance, and a run's lines still fill the strip's height.
+const LOG_TEXT_SIZE: f32 = 11.0;
+
 /// One line of the log strip: monospace, so paths, sizes and the columns of the
 /// progress lines keep their shape, and a colour for the two levels that need
 /// attention.
 fn log_line_text(line: &log::Line) -> egui::RichText {
-    let text = egui::RichText::new(line.text.as_str()).monospace().small();
+    let text = egui::RichText::new(line.text.as_str())
+        .monospace()
+        .size(LOG_TEXT_SIZE);
     match line.level {
         Level::Warn => text.color(egui::Color32::from_rgb(204, 153, 51)),
         Level::Error => text.color(egui::Color32::from_rgb(210, 80, 80)),
@@ -223,13 +279,21 @@ struct GuiSink {
 }
 
 impl ProgressSink for GuiSink {
-    fn report(&self, file: &PendingFile, started: bool) {
+    fn report(&self, file: &PendingFile, state: WorkState) {
         let key = (file.source_name.clone(), file.file_name.clone());
         if let Some(index) = self.index.get(&key).copied() {
             let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
             if index < progress.rows.len() {
-                progress.rows[index] = if started { RowState::Downloading } else { RowState::Done };
-                if !started {
+                let finished = matches!(state, WorkState::Done);
+                let was_done = matches!(progress.rows[index], RowState::Done);
+                progress.rows[index] = match state {
+                    WorkState::Downloading => RowState::Downloading,
+                    WorkState::Extracting => RowState::Extracting,
+                    WorkState::Done => RowState::Done,
+                };
+                // A row arrives at the end once, whatever marks it wore on the
+                // way: the count is files finished, not reports seen.
+                if finished && !was_done {
                     progress.done += 1;
                 }
             }
@@ -366,27 +430,41 @@ impl SelectionApp {
         let count = lines.len();
         let newest = lines.last().cloned();
 
-        egui::Panel::bottom("log").show(ui, |ui| {
-            let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
-                .default_open(false)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .max_height(LOG_LINES_HEIGHT)
-                        .show(ui, |ui| {
-                            for line in lines.iter() {
-                                ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
-                            }
-                        });
-                });
-            // The body is `None` exactly while the header is collapsed, which is
-            // the state the strip is in.
-            if header.body_returned.is_none() {
-                if let Some(newest) = &newest {
-                    ui.add(egui::Label::new(log_line_text(newest)).selectable(true).truncate());
+        // The lines are the point of this strip. The header's toggle needs the
+        // left inset and nothing needs the right, so the frame hugs the right
+        // edge; the body is drawn unindented, because the 18 pt of indent a
+        // collapsing header asks its body for is width a wrapped path line loses
+        // and gains nothing by; and the scrollbar floats over the text instead of
+        // taking a column of its own.
+        egui::Panel::bottom("log")
+            .frame(egui::Frame::new().fill(ui.style().visuals.panel_fill).inner_margin(
+                egui::Margin { left: 8, right: 2, top: 2, bottom: 2 },
+            ))
+            .show(ui, |ui| {
+                let style = ui.style_mut();
+                style.spacing.scroll.floating = true;
+                style.spacing.scroll.floating_allocated_width = 0.0;
+
+                let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
+                    .default_open(false)
+                    .show_unindented(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .max_height(LOG_LINES_HEIGHT)
+                            .show(ui, |ui| {
+                                for line in lines.iter() {
+                                    ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                                }
+                            });
+                    });
+                // The body is `None` exactly while the header is collapsed, which
+                // is the state the strip is in.
+                if header.body_returned.is_none() {
+                    if let Some(newest) = &newest {
+                        ui.add(egui::Label::new(log_line_text(newest)).selectable(true).truncate());
+                    }
                 }
-            }
-        });
+            });
 
         self.log_lines = lines;
     }
@@ -535,12 +613,16 @@ impl SelectionApp {
                                     let mut seen = progress_arc.lock().unwrap_or_else(|guard| guard.into_inner());
                                     seen.phase = Phase::Failed;
                                     seen.message = error_message(ex);
+                                    // A transfer that broke mid-way leaves pieces
+                                    // too, and the end state asks about those.
+                                    seen.partials = take_partials();
                                     return;
                                 }
                             }
                             if cancel_ref.load(Ordering::Relaxed) {
                                 let mut seen = progress_arc.lock().unwrap_or_else(|guard| guard.into_inner());
                                 seen.phase = Phase::Cancelled;
+                                seen.partials = take_partials();
                                 return;
                             }
                             if !job.options.dry_run && source.keep > 0 {
@@ -555,6 +637,40 @@ impl SelectionApp {
                 );
             },
         );
+    }
+
+    /// Answers the question about the half downloaded files.
+    ///
+    /// Keeping changes nothing on disk: the pieces are exactly what the next run
+    /// resumes from, which is why a cancel leaves them there in the first place.
+    /// Deleting removes the files this run reported, no others, and the strip
+    /// says how many went. An answer is final for this window: the list is
+    /// emptied, and the window's own words take the question's place.
+    fn answer_partials(&mut self, listed: &[String], keep: bool) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(|guard| guard.into_inner());
+        progress.partials.clear();
+        if keep {
+            progress.answer = format!(
+                "Keeping {} half downloaded file(s): the next run continues them.",
+                listed.len()
+            );
+            log::info(&progress.answer);
+            return;
+        }
+        let mut removed = 0usize;
+        for path in listed {
+            if std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        progress.answer = format!(
+            "Removed {removed} of {} half downloaded file(s).",
+            listed.len()
+        );
+        log::info(&progress.answer);
     }
 }
 
@@ -803,6 +919,7 @@ impl App for SelectionApp {
                                         let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                                         match state {
                                             RowState::Downloading => egui::Spinner::new().size(16.0).paint_at(ui, rect),
+                                            RowState::Extracting => paint_unzipping(ui, rect),
                                             RowState::Done => {
                                                 let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(60, 180, 90));
                                                 ui.painter().line_segment([egui::pos2(rect.left() + 3.0, rect.center().y), egui::pos2(rect.center().x, rect.bottom() - 4.0)], stroke);
@@ -810,6 +927,7 @@ impl App for SelectionApp {
                                             }
                                             RowState::Pending => {}
                                         }
+                                        ui.label(state_word(state));
                                         ui.label(entry.file.source_name.clone());
                                         let size = match entry.file.size {
                                             Some(bytes) => format_bytes(bytes),
@@ -842,12 +960,33 @@ impl App for SelectionApp {
             _ => {
                 // close_on_finish is the old habit; the default keeps the window
                 // on the end state, because the strip is the report.
-                let close_on_finish = self.job.config.close_on_finish;
+                let partials = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|guard| guard.into_inner())
+                    .partials
+                    .clone();
+                // A run that stopped with a file half downloaded asks about it
+                // first, and a window that closes itself cannot ask: the question
+                // outranks the config's habit, once, for as long as the pieces
+                // are on disk.
+                let close_on_finish = self.job.config.close_on_finish && partials.is_empty();
                 if !close_on_finish {
                     egui::Panel::bottom("end_actions").show(ui, |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Close").clicked() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if !partials.is_empty() {
+                                // The answers are buttons, not a box: the window
+                                // is where this run's story is, and the list the
+                                // question is about is drawn right above them.
+                                if ui.button("Delete").clicked() {
+                                    self.answer_partials(&partials, false);
+                                }
+                                if ui.button("Keep").clicked() {
+                                    self.answer_partials(&partials, true);
+                                }
                             }
                         });
                     });
@@ -877,6 +1016,18 @@ impl App for SelectionApp {
                             ui.label(progress.message.clone());
                         }
                         _ => {}
+                    }
+                    if !partials.is_empty() {
+                        ui.label(format!(
+                            "{} file(s) are half downloaded, where they were being written:",
+                            partials.len()
+                        ));
+                        for path in partials.iter() {
+                            ui.label(format!("  {}  {}", path, partial_size(path)));
+                        }
+                        ui.label("Keeping them lets the next run continue where this one stopped. Deleting them leaves nothing behind.");
+                    } else if !progress.answer.is_empty() {
+                        ui.label(progress.answer.clone());
                     }
                     if !close_on_finish {
                         ui.label("The strip below lists what this run did.");
@@ -935,7 +1086,7 @@ pub fn run_gui(
     let job = Arc::new(GuiJob { sources, config, token, options });
     let result = Arc::new(GuiResult { updated: Mutex::new(Vec::new()) });
     let cancel = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Loading, done: 0, total: 0, message: "".to_string(), heading: "".to_string(), rows: Vec::new() }));
+    let progress = Arc::new(Mutex::new(GuiProgress { phase: Phase::Loading, done: 0, total: 0, message: "".to_string(), heading: "".to_string(), rows: Vec::new(), partials: Vec::new(), answer: String::new() }));
     let load = Arc::new(Mutex::new(LoadState::Working));
 
     let mut native_options = eframe::NativeOptions::default();
@@ -984,6 +1135,19 @@ pub fn run_gui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_says_which_of_the_two_waits_it_is() {
+        // The window's tell that a long busy row is unpacking and not transferring
+        // has to be a word and a mark, not one word for both.
+        assert_eq!(state_word(RowState::Downloading), "downloading");
+        assert_eq!(state_word(RowState::Extracting), "unzipping");
+        assert_ne!(
+            state_word(RowState::Extracting),
+            state_word(RowState::Downloading)
+        );
+        assert_eq!(state_word(RowState::Pending), "");
+    }
 
     /// `build.rs` picks the embedded logo's size from the PNG, and this file
     /// draws a logo of a size it assumes. The two have to agree.

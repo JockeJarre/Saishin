@@ -387,7 +387,8 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
 | `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
 | `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
-| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with a **Close** button, so the log strip stays readable. `true` closes the window as soon as the run ends |
+| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with a **Close** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
+downloaded file asks about it first, which keeps the window open |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
 | `sound` | empty | Play this sound file after a run that downloaded something |
 | `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
@@ -599,9 +600,17 @@ ends it. The strip at the bottom is the run's text, the same lines a console run
 prints — the token's provenance, which source was asked and what it offered, the
 download lines, the warnings. Closed, the strip is one line: the newest. Open, it
 is a list that follows the newest line, and its text can be selected and copied.
+The download list marks what each row is waiting for: a spinning circle is a
+transfer, a turning amber square is an archive being unpacked, a check is a file
+that is finished.
+
 Because a GUI run's words live in that strip, the window stays open when the run
 ends — **Done**, **Cancelled** or **Failed** — with a **Close** button;
-`close_on_finish = true` gives the older habit of closing at once.
+`close_on_finish = true` gives the older habit of closing at once. A run
+**Cancelled** mid-transfer lists the half downloaded files and asks: **Keep**
+leaves them where they are, so the next run continues them, and **Delete**
+removes them. The question outranks `close_on_finish`, because a window that
+closes itself cannot ask.
 
 ### Picking an older version
 
@@ -646,7 +655,10 @@ outage or an expired credential.
 
 Downloads are written to a `.part` file and moved into place only after the
 transfer completes, so an interrupted run never leaves a truncated file that a
-later run would mistake for current.
+later run would mistake for current. The piece is also where a download resumes
+from: a run that continues a stopped transfer asks the server for the bytes after
+what is already on disk. A cancelled download leaves the piece there on purpose,
+and a window run asks what to do with it.
 
 ---
 

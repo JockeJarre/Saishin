@@ -511,8 +511,17 @@ async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
     }
 }
 
+/// What a row is doing. A download and an unzip look the same from the outside,
+/// a row busy for several seconds, and they are not the same thing to wait for,
+/// so the window draws them apart.
+enum WorkState {
+    Downloading,
+    Extracting,
+    Done,
+}
+
 trait ProgressSink {
-    fn report(&self, _file: &PendingFile, _started: bool) {}
+    fn report(&self, _file: &PendingFile, _state: WorkState) {}
 }
 
 struct NullSink {}
@@ -864,7 +873,7 @@ async fn download_pending(
             continue;
         }
 
-        report.report(file, true);
+        report.report(file, WorkState::Downloading);
         log::info(&format!(
             "Downloading {} of {}: {name}",
             index + 1,
@@ -927,6 +936,9 @@ async fn download_pending(
             if let Some(extract) = &source.extract {
                 if zip_handler::is_archive(&name) {
                     log::detail(&format!("extracting into {}", extract.destination));
+                    // Unzipping a big archive is the longer half of the wait, so
+                    // the row says so while it runs.
+                    report.report(file, WorkState::Extracting);
                     zip_handler::extract(&destination, extract, options.force)?;
                     if !extract.keep_zip {
                         let _ = std::fs::remove_file(&destination);
@@ -936,7 +948,7 @@ async fn download_pending(
             }
         }
 
-        report.report(file, false);
+        report.report(file, WorkState::Done);
     }
 
     Ok(downloaded_names)

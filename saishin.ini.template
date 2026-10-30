@@ -33,7 +33,9 @@ out_dir = ./downloads
 
 ; Optional. What the selection window does when the run ends. false keeps it
 ; open on its end state, with a Close button, so the log strip at the bottom
-; stays readable. true closes the window as soon as the run ends.
+; stays readable. true closes the window as soon as the run ends. A run that
+; stops with a half downloaded file asks about it first, and that question
+; keeps the window open.
 ; Default: false.
 ; close_on_finish = true
 
