@@ -617,8 +617,11 @@ ends — **Done**, **Cancelled** or **Failed** — with a **Close** button;
 `close_on_finish = true` gives the older habit of closing at once. A run
 **Cancelled** mid-transfer lists the half downloaded files and asks: **Keep**
 leaves them where they are, so the next run continues them, and **Delete**
-removes them. The question outranks `close_on_finish`, because a window that
-closes itself cannot ask.
+removes them. **Resume** starts the same rows again from where they stopped - the
+pieces on disk are what a transfer continues from - which is the answer **Keep**
+and the download again in one press; a finished run has nothing to resume, and a
+window that never started a download has no such button to offer. The question
+outranks `close_on_finish`, because a window that closes itself cannot ask.
 
 ### Picking an older version
 

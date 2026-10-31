@@ -45,6 +45,14 @@ enum Phase {
     Failed,
 }
 
+/// True when the end state has a run to continue. A run that stopped with files
+/// picked can start them again from where they left off - the pieces on disk are
+/// what the transfer continues from - while a finished run has nothing left to
+/// do, and a window that never started a download has no files to continue.
+fn can_resume(phase: Phase, chosen: &[usize]) -> bool {
+    !chosen.is_empty() && matches!(phase, Phase::Cancelled | Phase::Failed)
+}
+
 /// The rows a run's sources offer, as the worker thread delivers them. The
 /// window is already on screen while this is `Working`, which is what lets the
 /// log strip narrate a fetch of several seconds: the window is not something a
@@ -209,6 +217,11 @@ struct SelectionApp {
     progress: Arc<Mutex<GuiProgress>>,
     /// What the worker thread has found out about the sources.
     load: Arc<Mutex<LoadState>>,
+    /// The rows the last run was started with, as indexes into `entries`. This
+    /// is what a resume starts again: the same files, picked as they now stand
+    /// in the rows, so a version swapped in the dropdown is resumed as the
+    /// version that is showing.
+    chosen: Vec<usize>,
     /// The run's lines as the window shows them: a copy taken when the count of
     /// lines moved, so the list is not cloned on every frame.
     log_lines: Vec<log::Line>,
@@ -425,6 +438,7 @@ impl SelectionApp {
             cancel,
             progress,
             load,
+            chosen: Vec::new(),
             log_lines: Vec::new(),
             log_revision: 0,
             logo: None,
@@ -566,6 +580,9 @@ impl SelectionApp {
     }
 
     fn start_download(&mut self, chosen: Vec<usize>) {
+        // Remembered, because the end state offers to start these rows again
+        // from where they stopped.
+        self.chosen = chosen.clone();
         let chosen_files: Vec<PendingFile> = chosen
             .iter()
             .filter_map(|index| self.entries.get(*index))
@@ -696,6 +713,36 @@ impl SelectionApp {
             listed.len()
         );
         log::info(&progress.answer);
+    }
+
+    /// Starts the same rows again, from where the run left off. The half
+    /// downloaded files are exactly what a transfer continues from, so resuming
+    /// is the answer **Keep** and the download again in one press: the question
+    /// is answered, the pieces stay where they are, and the rows start moving
+    /// again under the same heading.
+    fn resume(&mut self) {
+        let chosen = self.chosen.clone();
+        let words = {
+            let mut progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(|guard| guard.into_inner());
+            let kept = progress.partials.len();
+            progress.partials.clear();
+            // The phase's own heading again, as on the first run.
+            progress.heading = String::new();
+            progress.answer = if kept == 0 {
+                "Resuming the run from where it stopped.".to_string()
+            } else {
+                format!("Resuming: keeping the {kept} half downloaded file(s) to continue them.")
+            };
+            progress.answer.clone()
+        };
+        log::info(&words);
+        // The flag the **Cancel** button set is the flag the new worker reads, so
+        // it is cleared first: a resume that inherits a cancel would stop at once.
+        self.cancel.store(false, Ordering::Relaxed);
+        self.start_download(chosen);
     }
 
     /// The files as rows: the mark of what each is doing, its source, its size,
@@ -1004,6 +1051,11 @@ impl App for SelectionApp {
                     .unwrap_or_else(|guard| guard.into_inner())
                     .partials
                     .clone();
+                let phase = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|guard| guard.into_inner())
+                    .phase;
                 // A run that stopped with a file half downloaded asks about it
                 // first, and a window that closes itself cannot ask: the question
                 // outranks the config's habit, once, for as long as the pieces
@@ -1025,6 +1077,11 @@ impl App for SelectionApp {
                                 if ui.button("Keep").clicked() {
                                     self.answer_partials(&partials, true);
                                 }
+                            }
+                            if can_resume(phase, &self.chosen) && ui.button("Resume").clicked() {
+                                // One press answers the question and starts the
+                                // same rows again where they stopped.
+                                self.resume();
                             }
                         });
                     });
@@ -1196,6 +1253,23 @@ pub fn run_gui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run that stopped offers to start again where it stopped, and only such a
+    /// run: a finished run has nothing left to do, a run still going has its
+    /// Cancel, and a window that never started a download has no files to
+    /// continue.
+    #[test]
+    fn only_a_stopped_run_with_files_can_resume() {
+        assert!(can_resume(Phase::Cancelled, &[0, 1]));
+        // A transfer that broke leaves pieces too, and they are the same resume.
+        assert!(can_resume(Phase::Failed, &[0]));
+        assert!(!can_resume(Phase::Done, &[0, 1]));
+        assert!(!can_resume(Phase::Downloading, &[0]));
+        assert!(!can_resume(Phase::Selecting, &[0]));
+        // Nothing picked, nothing to continue.
+        assert!(!can_resume(Phase::Cancelled, &[]));
+        assert!(!can_resume(Phase::Loading, &[]));
+    }
 
     #[test]
     fn a_rows_mark_is_the_whole_of_its_telling() {
