@@ -258,14 +258,31 @@ matters for a repository you do not control:
 
 | Token | What it can read |
 | --- | --- |
-| Classic, with the `repo` scope | Every repository your account can see — yours, and everybody else's public ones. This is the one that works everywhere. |
+| Classic | Every repository your account can see — yours, and everybody else's public ones. This is the one that works everywhere. |
 | Fine-grained | Only the repositories it was granted on, with the permissions ticked on it. A repository you do not control cannot be granted to it, so a call to one comes back refused. |
 
 For `type = actions` that works out as: listing the runs and artifacts of a
 *public* repository is public data, and saishin reads it without a token when the
 token is refused — GitHub answers 60 calls an hour that way, and the log says so —
 while **downloading** an artifact always needs a token, and for a repository you do
-not control a classic token with the `repo` scope is what GitHub accepts.
+not control that token has to be a classic one. Its smallest useful scope is
+`public_repo`: it covers listing *and* downloading a public repository's build
+artifacts, measured against `vpinball/vpinball`, where such a token is handed the
+signed download URL. `repo` is only needed on top of it for a private repository.
+
+The form, filled in the way that works for the sources this tool is usually
+pointed at:
+
+| Field | Value |
+| --- | --- |
+| Note | `Saishin downloader` — any name that says what the token is for |
+| Expiration | Your choice; `90 days` is GitHub's default. When it lapses, run `--login` again. |
+| Select scopes | Tick **`public_repo`** (Access public repositories) — listings and build downloads of every public repository. Tick **`repo`** (Full control of private repositories) as well for a source with `private = true`. Leave the other scopes alone; nothing here reads commit status, deployments, invitations or security events. |
+
+<img src="GitHubToken.png" alt="GitHub's New personal access token (classic) form: Note 'Saishin downloader', Expiration 90 days, and public_repo ticked while repo is not" width="680" />
+
+Then press **Generate token**, copy it — it starts with `ghp_` and is shown once —
+and hand it to saishin, which verifies it and stores it:
 
 ```bash
 ./target/release/saishin-cli --login
@@ -460,9 +477,10 @@ retention orders by that date rather than by download time.
 
 Listing the artifacts of a public repository is public data, and saishin reads it
 without a token when the token is refused (see [Authentication](#authentication));
-downloading one always needs a token, and for a repository you do not control a
-classic token with the `repo` scope is what GitHub accepts. Each run contributes
-its artifacts; `filters` match the **artifact name**, and the downloaded file is
+downloading one always needs a token, and for a repository you do not control that
+has to be a classic token — `public_repo` is the smallest scope that works (see
+[Authentication](#authentication)). Each run contributes its artifacts; `filters`
+match the **artifact name**, and the downloaded file is
 that name plus `.zip` when it does not already end in `.zip` — GitHub hands out an
 artifact as a zip named after it. Expired artifacts are skipped. The timestamp a
 file's freshness is judged by is the run's creation date.
@@ -621,6 +639,16 @@ writes text. A configuration that fails before any window can open still prints,
 because then the console is the only report there is - and when even that
 console closes with the process, which is what launching the exe from a shortcut
 gives, the same words arrive in a box on the desktop.
+
+A window run that finds a source needing a token, with none stored and no console
+to type into, asks in a box: which sources are waiting, where to make the token
+and which scopes to tick, and what each answer does. **Yes** opens a command
+prompt running `--login`, waits for that window to be closed — the token is
+pasted there once — and this run then reads it from the credential store. **No**
+runs on without a token, which lists a public repository and stops at its
+downloads, and the strip says so. A window started from a terminal keeps the
+console prompt it has, and a scheduled run with `--non-interactive` is answered
+neither way: it fails with exit code `3`, the way a scheduled run has to.
 
 The window opens as soon as the configuration and the token are settled, before
 the sources are asked: a run of several sources takes seconds, and the window
