@@ -604,7 +604,7 @@ prints — the token's provenance, which source was asked and what it offered, t
 download lines with their progress, the warnings, the errors. A window run keeps
 all of those in the strip and prints none of them, which is why a window run is
 never followed by a box. Closed, the strip is one line: the newest line short
-enough to read whole, since a path cut at the window's edge says nothing - a line
+enough to read whole, since a path cut at the window's edge says nothing — a line
 that is cut gives its whole text on hover. Open, the strip is a list that follows
 the newest line, and its text can be selected and copied.
 The download list says what each row is doing by how its mark is drawn, and by
@@ -625,7 +625,9 @@ the next run continues them, and **Delete** removes them. **Resume** starts the
 same rows again from where they stopped — the pieces on disk are what a transfer
 continues from — which is the answer **Keep** and the download again in one
 press; a finished run has nothing to resume, and a window that never started a
-download has no such button to offer. The question outranks `close_on_finish`,
+download has no such button to offer. **Delete** takes that answer away along
+with the files: the window goes back to the rows, their boxes as the last run
+left them, ready to start the pick over. The question outranks `close_on_finish`,
 because a window that closes itself cannot ask.
 
 ### Picking an older version

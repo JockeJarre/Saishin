@@ -652,6 +652,11 @@ impl SelectionApp {
         self.chosen = chosen.clone();
         // The next run's end gets its own focused **OK**.
         self.end_focused = false;
+        // Cleared here, because every way a run starts comes through this
+        // function: the flag **Cancel** set for the run that is over is the
+        // flag the new worker reads first, and a run that inherits a cancel
+        // stops before it moves.
+        self.cancel.store(false, Ordering::Relaxed);
         let chosen_files: Vec<PendingFile> = chosen
             .iter()
             .filter_map(|index| self.entries.get(*index))
@@ -784,6 +789,25 @@ impl SelectionApp {
         log::info(&progress.answer);
     }
 
+    /// **Delete** is the answer that empties the run. The half downloaded files
+    /// are what a transfer continues from, so with them gone there is nothing
+    /// left to continue and the offer goes with them: `chosen` goes, the cancel
+    /// flag goes with the run that is over, and the window goes back to the rows
+    /// with their boxes as the last run left them - which is where a pick that
+    /// starts over belongs. The strip keeps its lines: they are the finished
+    /// run's own, and the next run adds its own to them.
+    fn delete_partials(&mut self, listed: &[String]) {
+        self.answer_partials(listed, false);
+        self.chosen.clear();
+        self.cancel.store(false, Ordering::Relaxed);
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(|guard| guard.into_inner());
+        progress.heading.clear();
+        progress.phase = Phase::Selecting;
+    }
+
     /// Starts the same rows again, from where the run left off. The half
     /// downloaded files are exactly what a transfer continues from, so resuming
     /// is the answer **Keep** and the download again in one press: the question
@@ -808,9 +832,8 @@ impl SelectionApp {
             progress.answer.clone()
         };
         log::info(&words);
-        // The flag the **Cancel** button set is the flag the new worker reads, so
-        // it is cleared first: a resume that inherits a cancel would stop at once.
-        self.cancel.store(false, Ordering::Relaxed);
+        // The start clears the cancel flag the **Cancel** button set, so the
+        // resumed worker is not the one that was stopped.
         self.start_download(chosen);
     }
 
@@ -1164,7 +1187,9 @@ impl App for SelectionApp {
                                 // is where this run's story is, and the list the
                                 // question is about is drawn right above them.
                                 if ui.button("Delete").clicked() {
-                                    self.answer_partials(&partials, false);
+                                    // Deleting the pieces takes the resume with
+                                    // them and puts the window back at the rows.
+                                    self.delete_partials(&partials);
                                 }
                                 if ui.button("Keep").clicked() {
                                     self.answer_partials(&partials, true);
@@ -1361,6 +1386,23 @@ mod tests {
         // Nothing picked, nothing to continue.
         assert!(!can_resume(Phase::Cancelled, &[]));
         assert!(!can_resume(Phase::Loading, &[]));
+    }
+
+    /// **Delete** removes the files a transfer continues from, so it takes the
+    /// offer along with them: the window is back at the rows, their boxes as
+    /// the last run left them, with nothing left to continue. Both halves of
+    /// the gate close on that - the phase is no longer a stopped run's, and the
+    /// pick those rows started is gone.
+    #[test]
+    fn deleting_the_pieces_ends_the_offer() {
+        // The state **Delete** leaves: the rows, and no pick.
+        assert!(!can_resume(Phase::Selecting, &[]));
+        // The stopped run it came from, with the pick taken away: the same
+        // answer, whatever the phase says.
+        assert!(!can_resume(Phase::Cancelled, &[]));
+        // The case the two clears above exist to break: a stopped run that
+        // still has its rows and its pieces keeps the offer.
+        assert!(can_resume(Phase::Cancelled, &[0, 3]));
     }
 
     /// The strip's one line is the newest that can be read whole, so a run's

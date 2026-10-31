@@ -955,7 +955,14 @@ async fn download_pending(
             }
         }
 
-        report.report(file, WorkState::Done);
+        // A transfer **Cancel** stopped comes back from the download like a file
+        // that came down, so the mark is taken from the flag and not from the
+        // return: the row a cancel stopped keeps its busy mark, which is the ring
+        // of a stopped row once the run is over, and the count keeps counting
+        // only the files that finished.
+        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            report.report(file, WorkState::Done);
+        }
     }
 
     Ok(downloaded_names)
