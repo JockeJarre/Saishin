@@ -48,7 +48,6 @@ pub struct AppConfig {
     pub default_out_dir: String,
     pub github_api_url: String,
     pub keyring_service: String,
-    pub notify: bool,
     pub window_centered: bool,
     /// What the window does when a run ends. False keeps it open, on the end
     /// state with a Close button, so the log strip stays readable.
@@ -57,8 +56,6 @@ pub struct AppConfig {
     /// command line win over this.
     pub gui: bool,
     pub releases: i64,
-    pub sound: String,
-    pub sound_player: String,
     pub sources: Vec<SourceConfig>,
 }
 
@@ -97,15 +94,10 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         default_out_dir: get_string(&sections, GENERAL_SECTION, "out_dir", "downloads"),
         github_api_url,
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
-        notify: get_bool(&sections, GENERAL_SECTION, "notify", false)?,
         window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
             close_on_finish: get_bool(&sections, GENERAL_SECTION, "close_on_finish", false)?,
         gui: get_bool(&sections, GENERAL_SECTION, "gui", false)?,
         releases: get_int(&sections, GENERAL_SECTION, "releases", 10)?,
-        sound: resolve_sound(&sections, GENERAL_SECTION, &base_dir),
-        sound_player: get_string(&sections, GENERAL_SECTION, "sound_player", "")
-            .trim()
-            .to_string(),
         sources: Vec::new(),
     };
 
@@ -322,15 +314,6 @@ fn resolve_output_directory(
     resolve_path(&relative, base_dir)
 }
 
-fn resolve_sound(sections: &Sections, section: &str, base_dir: &str) -> String {
-    let configured = get_string(sections, section, "sound", "").trim().to_string();
-    if configured.is_empty() {
-        String::new()
-    } else {
-        resolve_path(&configured, base_dir)
-    }
-}
-
 pub fn resolve_path(path: &str, base_dir: &str) -> String {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
@@ -458,7 +441,9 @@ mod tests {
         );
         let config = load(&path).expect("load");
         assert_eq!(config.default_out_dir, "./dl");
-        assert!(config.notify);
+        // The INI above names 'notify', which this build has no use for: keys with
+        // no field are ignored, so a file written for an older build loads as it
+        // always did.
         assert_eq!(config.keyring_service, "saishin");
         assert_eq!(config.github_api_url, "https://api.github.com");
         let source = &config.sources[0];
@@ -515,7 +500,9 @@ mod tests {
         );
         let config = load(&path).expect("load");
         assert_eq!(config.default_out_dir, "C:\\Saishin\\downloads");
-        assert!(config.sound.ends_with("C:\\Windows\\media\\ding.wav"));
+        // 'sound' is a key this build has no field for; the line rides along in
+        // the file and is ignored, and the paths' backslashes are what the test is
+        // about: read as written.
         let source = &config.sources[0];
         assert!(source.out_dir.ends_with("C:\\Saishin\\tables"));
         assert!(source
@@ -549,7 +536,7 @@ mod tests {
             "Section [demo] is missing the required 'type' key."
         );
 
-        let bad_bool = write_ini("bool.ini", "[general]\nnotify = maybe\n[demo]\ntype = url\nurls = https://example.invalid/a\n");
+        let bad_bool = write_ini("bool.ini", "[general]\nwindow_centered = maybe\n[demo]\ntype = url\nurls = https://example.invalid/a\n");
         let err = load(&bad_bool).expect_err("must fail");
         assert!(err.to_string().contains("must be true or false"));
 
@@ -564,13 +551,30 @@ mod tests {
         let err = load(&unknown).expect_err("must fail");
         assert!(err.to_string().contains("unknown type 'ftp'"));
 
-        let no_sources = write_ini("empty.ini", "[general]\nnotify = false\n");
+        let no_sources = write_ini("empty.ini", "[general]\nout_dir = ./dl\n");
         let err = load(&no_sources).expect_err("must fail");
         assert!(err.to_string().contains("No sources defined"));
 
         for path in [missing_type, bad_bool, negative_keep, unknown, no_sources] {
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// The keys for the sound and the desktop toast are gone, with the players and
+    /// the notification program they started: a run spawns nothing. An INI that
+    /// still names them is the file of a machine that has been updating for years,
+    /// so the file has to load, keys and all, with nothing said about a player
+    /// this build cannot find.
+    #[test]
+    fn a_file_naming_the_removed_keys_loads() {
+        let path = write_ini(
+            "old-keys.ini",
+            "[general]\nout_dir = ./dl\nnotify = true\nsound = ./sounds/update.mp3\nsound_player = ffplay -nodisp -autoexit\n\n[demo]\ntype = github\nowner = o\nrepo = r\n",
+        );
+        let config = load(&path).expect("an older file loads");
+        assert_eq!(config.default_out_dir, "./dl");
+        assert_eq!(config.sources.len(), 1);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

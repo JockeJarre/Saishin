@@ -21,10 +21,6 @@ out_dir = ./downloads
 ; Optional. Name under which the token is filed in the OS secure store.
 ; keyring_service = saishin
 
-; Optional. Show one desktop notification per run, after all sources,
-; listing the files that were downloaded. Default: false.
-; notify = true
-
 ; Optional. Which front end runs. true opens the selection window (for a
 ; desktop button); false keeps the run headless for a script or a scheduled
 ; task. A --gui / --no-gui switch on the command line wins over this key.
@@ -32,20 +28,12 @@ out_dir = ./downloads
 ; gui = true
 
 ; Optional. What the selection window does when the run ends. false keeps it
-; open on its end state, with a Close button, so the log strip at the bottom
+; open on its end state, with an OK button, so the log strip at the bottom
 ; stays readable. true closes the window as soon as the run ends. A run that
 ; stops with a half downloaded file asks about it first, and that question
 ; keeps the window open.
 ; Default: false.
 ; close_on_finish = true
-
-; Optional. Play this sound file after a run that downloaded something.
-; Default player: 'afplay' (macOS), 'ffplay' (Windows, Linux).
-; sound = ./sounds/update.mp3
-
-; Optional. Command used to play the sound file. The sound file is appended
-; as the last argument.
-; sound_player = ffplay -nodisp -autoexit
 
 ; Optional. How many recent workflow runs (or releases) the --gui version
 ; dropdown offers per artifact. A source section may override this with its

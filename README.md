@@ -457,13 +457,16 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `out_dir` | `downloads` | Default download directory for sources without their own `out` |
 | `github_api_url` | `https://api.github.com` | API root; override for GitHub Enterprise |
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
-| `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
 | `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
 | `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with an **OK** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
 downloaded file asks about it first, which keeps the window open |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
-| `sound` | empty | Play this sound file after a run that downloaded something |
-| `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
+
+A `[general]` section from an older build may still name `notify`, `sound` and
+`sound_player`. Those keys started a desktop toast and a sound player, the two
+places a run used a program of its own, and both are gone: a run spawns nothing,
+which is also why the line `Sound failed: program not found` cannot come back. A
+key with no field is ignored, so an older file loads unchanged.
 
 ### Common keys (every source)
 
@@ -640,8 +643,8 @@ new artifacts — each with a checkbox (checked by default), a hyperlink to its
 GitHub release, workflow run, or source page, and its size. Uncheck the ones
 you do not want, then press **Download selected**. **Cancel** aborts the run;
 **Select all** / **Select none** reset the checkboxes. Only the checked
-artifacts are downloaded; the rest of the run (changelogs, archive handling,
-notifications) proceeds as usual. The window needs a display server, so use
+artifacts are downloaded; the rest of the run (changelogs, archive handling)
+proceeds as usual. The window needs a display server, so use
 the plain CLI mode for headless scheduled runs.
 
 The same front end can be chosen in the configuration, which is what a desktop
@@ -660,8 +663,9 @@ A GUI run keeps the console out of it: the window carries the report, so nothing
 is printed. That is not cosmetic. An exe of this kind is a console-subsystem
 program, so launching it from a shortcut gives it a console, and text in that
 console is what keeps a command window standing beside the selection window. The
-console is released as the window opens, and the notification and sound commands
-are started without a console of their own. Started from a terminal, `--gui`
+console is released as the window opens, and the run starts no program of its
+own: nothing that can pop a window behind the window, and nothing that answers
+"program not found". Started from a terminal, `--gui`
 therefore prints nothing while the window is open; `--no-gui` is the run that
 writes text. A configuration that fails before any window can open still prints,
 because then the console is the only report there is - and when even that
@@ -797,7 +801,7 @@ saishin/
 │   ├── github.rs         release discovery and asset selection
 │   ├── downloader.rs     HTTP transfer, skip detection, progress
 │   ├── zip_handler.rs    archive extraction rules
-│   ├── notifier.rs       desktop notifications and sounds
+│   ├── notifier.rs       the one box, for a run with no console left to read
 │   ├── log.rs            output helpers
 │   └── error.rs          error type and exit codes
 └── tests/

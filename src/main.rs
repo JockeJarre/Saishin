@@ -193,6 +193,10 @@ async fn async_main(options: &Options) -> i32 {
             // The window was going to show this and is not on screen to: give
             // the words to the box, which is the launcher's making.
             log::print_before_the_launcher(&message);
+            // The box is the system's own, so saying this costs no child process;
+            // it is a Windows thing, and the paths that end here on another
+            // platform have a console, a log, or the window to read the words in.
+            #[cfg(windows)]
             if box_is_the_report() {
                 notifier::alert("Saishin", &message);
             }
@@ -207,6 +211,7 @@ async fn async_main(options: &Options) -> i32 {
 /// a shortcut gives, closes with it and hides the text. A terminal has a process
 /// of its own on the console and keeps the text, and a service has no console
 /// and writes to a log: neither wants a box.
+#[cfg(windows)]
 fn box_is_the_report() -> bool {
     // A launcher running in front of this program (saishin.exe, the icon's
     // target) reads the text we print and draws the box, so drawing one here
@@ -226,11 +231,6 @@ fn console_is_ours() -> bool {
     // Zero when there is no console attached, one for a console of our own.
     let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
     attached == 1
-}
-
-#[cfg(not(windows))]
-fn console_is_ours() -> bool {
-    false
 }
 
 /// Whether a prompt asked of this process can be seen and answered: standard
@@ -311,7 +311,6 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
 
     let token = resolve_token(&config, Path::new(&config_path), &selected, &http, options).await?;
 
-    let mut updated: Vec<String> = Vec::new();
     if use_gui(options, &config) {
         // The stream is already off (decided above, before the token). Here the
         // problems go too: the console is released just below, and text in the
@@ -1819,13 +1818,10 @@ mod tests {
             default_out_dir: String::new(),
             github_api_url: "https://api.github.com".to_string(),
             keyring_service: "saishin".to_string(),
-            notify: false,
             window_centered: true,
             close_on_finish: false,
             gui,
             releases: 10,
-            sound: String::new(),
-            sound_player: String::new(),
             sources: Vec::new(),
         }
     }
@@ -1996,13 +1992,10 @@ mod tests {
             default_out_dir: String::new(),
             github_api_url: "https://api.github.com".to_string(),
             keyring_service: "saishin".to_string(),
-            notify: false,
             window_centered: true,
             close_on_finish: false,
             gui: false,
             releases: 10,
-            sound: String::new(),
-            sound_player: String::new(),
             sources: Vec::new(),
         };
         assert_eq!(github_web_base(&config), "https://github.com");
@@ -2015,13 +2008,10 @@ mod tests {
             default_out_dir: String::new(),
             github_api_url: "https://ghe.example.com/api/v3".to_string(),
             keyring_service: "saishin".to_string(),
-            notify: false,
             window_centered: true,
             close_on_finish: false,
             gui: false,
             releases: 10,
-            sound: String::new(),
-            sound_player: String::new(),
             sources: Vec::new(),
         };
         assert_eq!(github_web_base(&config), "https://ghe.example.com");
