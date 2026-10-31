@@ -111,6 +111,8 @@ pub fn prompt_for_token() -> Result<String, AppError> {
     log::info("");
     log::info("A GitHub personal access token is required.");
     log::info("Create one at https://github.com/settings/tokens with 'repo' scope.");
+    log::info("A fine-grained token reaches only the repositories it was granted on.");
+    log::info("For a repository you do not control, a classic token with 'repo' scope is what works.");
     log::info("It is stored in this machine's secure credential store and never written to disk by saishin.");
 
     if !io::stdin().is_terminal() {

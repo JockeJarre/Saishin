@@ -252,8 +252,20 @@ Public GitHub releases need no credentials. Sources that are account-gated — a
 private repository, or builds published only to signed-in accounts — set
 `private = true`, and then a token is required.
 
-The token is a GitHub **personal access token** with the `repo` scope. Create one at
-<https://github.com/settings/tokens>.
+The token is a GitHub **personal access token**. Create one at
+<https://github.com/settings/tokens>. GitHub offers two shapes, and the difference
+matters for a repository you do not control:
+
+| Token | What it can read |
+| --- | --- |
+| Classic, with the `repo` scope | Every repository your account can see — yours, and everybody else's public ones. This is the one that works everywhere. |
+| Fine-grained | Only the repositories it was granted on, with the permissions ticked on it. A repository you do not control cannot be granted to it, so a call to one comes back refused. |
+
+For `type = actions` that works out as: listing the runs and artifacts of a
+*public* repository is public data, and saishin reads it without a token when the
+token is refused — GitHub answers 60 calls an hour that way, and the log says so —
+while **downloading** an artifact always needs a token, and for a repository you do
+not control a classic token with the `repo` scope is what GitHub accepts.
 
 ```bash
 ./target/release/saishin-cli --login
@@ -446,12 +458,14 @@ retention orders by that date rather than by download time.
 | `workflow` | *(all)* | Only runs of workflows whose name matches this glob: the `name:` at the top of the file (`CI` for `ci.yml`), and for a dispatched run its display title. Only completed, successful runs count |
 | `runs` | `10` | How many recent runs of that workflow to walk |
 
-Listing artifacts needs a token, so this type always uses the stored one. Each
-run contributes its artifacts; `filters` match the **artifact name**, and the
-downloaded file is that name plus `.zip` when it does not already end in `.zip`
-— GitHub hands out an artifact as a zip named after it. Expired artifacts are
-skipped. The timestamp a file's freshness is judged by is the run's creation
-date.
+Listing the artifacts of a public repository is public data, and saishin reads it
+without a token when the token is refused (see [Authentication](#authentication));
+downloading one always needs a token, and for a repository you do not control a
+classic token with the `repo` scope is what GitHub accepts. Each run contributes
+its artifacts; `filters` match the **artifact name**, and the downloaded file is
+that name plus `.zip` when it does not already end in `.zip` — GitHub hands out an
+artifact as a zip named after it. Expired artifacts are skipped. The timestamp a
+file's freshness is judged by is the run's creation date.
 
 ```ini
 [saishin_builds]

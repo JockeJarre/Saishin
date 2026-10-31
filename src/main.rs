@@ -897,7 +897,9 @@ async fn download_pending(
                 return Err(AppError::Auth(format!(
                     "[{}] the server returned {status} for {name}. \
                      If the repository is private or the build is account-gated, run 'saishin --login' \
-                     and make sure the token has the 'repo' scope.",
+                     and make sure the token reaches this repository: a fine-grained token covers only \
+                     the repositories it was granted on, so a repository you do not control needs a \
+                     classic token with the 'repo' scope.",
                     source.name
                 )));
             }
