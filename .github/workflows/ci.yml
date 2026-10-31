@@ -132,14 +132,29 @@ jobs:
       # A missing icon is only cosmetics, so build.rs warns and continues. The
       # promise is kept here instead: both exes that ship carry the resource.
       # The launcher is the one Explorer, a shortcut and the taskbar show; the
-      # program gets the same package-wide resource, so a folder view shows a
-      # branded icon for it too.
+      # program gets the same icon, so a folder view shows a branded icon for
+      # it too.
       - name: Check the embedded icon
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           ./scripts/check-icon.ps1 dist/saishin.exe
           ./scripts/check-icon.ps1 dist/saishin-cli.exe
+
+      # The version resource is what a file's Properties window, Explorer's
+      # Version columns and an installer's "which of these two files is newer"
+      # rule read, so it is checked the way the icon is: the version from
+      # Cargo.toml, the sha build.rs takes from the same GITHUB_SHA, and a
+      # description naming which of the two shipped files the window is
+      # describing. GITHUB_RUN_NUMBER is not in the resource: a version resource
+      # compares, and the run number of a re-run is not a property of the code.
+      - name: Check the embedded version
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          ./scripts/check-version.ps1 dist/saishin.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
+          ./scripts/check-version.ps1 dist/saishin-cli.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
 
       - uses: actions/upload-artifact@v4
         with:

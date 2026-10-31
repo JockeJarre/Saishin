@@ -1,9 +1,12 @@
-// Build-time metadata and the Windows executable icon.
+// Build-time metadata and the Windows executable resources.
 //
 // Version handling: Cargo.toml holds the version, this script stamps the
 // build identity (git sha, target, profile) into the binary through the
-// SAISHIN_* environment variables that src/main.rs reads with env!().
-// On CI the sha comes from GITHUB_SHA, locally from git.
+// SAISHIN_* environment variables that src/main.rs reads with env!(), and
+// writes the same two numbers into the Windows version resource, which is what
+// a file's Properties window, Explorer's Version columns and an installer's
+// "keep the newer file" rule read. On CI the sha comes from GITHUB_SHA, locally
+// from git, so the -V line and the Properties window never disagree.
 
 use std::env;
 use std::process::Command;
@@ -24,7 +27,7 @@ fn main() {
     embed_logo();
 
     #[cfg(windows)]
-    embed_icon();
+    embed_resources();
 }
 
 /// Makes this script run again when the commit the tree sits on changes, which
@@ -120,41 +123,137 @@ fn git_identity() -> String {
     }
 }
 
-/// Writes the .rc into OUT_DIR and lets embed-resource find rc.exe (it
-/// ships a fallback compiler, so a Windows SDK is not required). The icon
-/// is presentation, not function: a missing .ico, or a missing resource
-/// compiler, only warns and the binary builds without it. The promise is
-/// kept in CI instead: the jobs that ship a binary regenerate the .ico from
+/// The Windows resources of both binaries: the icon Explorer, a shortcut and
+/// the taskbar draw, and the version block a file's Properties window shows
+/// under "Version". Both come from a generated .rc, and the version block is
+/// built from the same version and build identity as the -V line.
+///
+/// The script is written per binary because a version resource names the file
+/// it belongs to: `compile_for` links a binary's own .rc into that binary,
+/// where `compile` would give both of them the same block (which is what the
+/// icon is happy with and an original filename is not).
+///
+/// The icon is presentation, not function: a missing .ico, or a missing
+/// resource compiler, only warns and the binary builds without it. The promise
+/// is kept in CI instead: the jobs that ship a binary regenerate the .ico from
 /// the masters, and scripts/check-icon.ps1 fails the run when the shipped
-/// executable carries no icon resource.
+/// executable carries no icon resource, scripts/check-version.ps1 when it
+/// carries no version of its own.
 #[cfg(windows)]
-fn embed_icon() {
+fn embed_resources() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let icon = env::current_dir()
         .expect("current dir")
         .join("saishin-png-icon-set")
         .join("saishin.ico");
 
-    if !icon.exists() {
-        println!("cargo:warning=saishin.ico not found, building without the app icon");
-        return;
-    }
-
     // Paths in a .rc file use forward slashes; backslashes are escapes.
-    let icon_path = icon.to_string_lossy().replace('\\', "/");
-    let source = format!("1 ICON \"{icon_path}\"\n");
-    let rc = std::path::Path::new(&out_dir).join("saishin-icon.rc");
-    if let Err(ex) = std::fs::write(&rc, source) {
-        println!("cargo:warning=could not write the icon resource script: {ex}");
-        return;
-    }
+    let icon_line = if icon.exists() {
+        format!("1 ICON \"{}\"\n", icon.to_string_lossy().replace('\\', "/"))
+    } else {
+        println!("cargo:warning=saishin.ico not found, building without the app icon");
+        String::new()
+    };
 
-    match embed_resource::compile(&rc, embed_resource::NONE)
-        .manifest_optional()
-    {
-        Ok(_) => {}
-        Err(ex) => println!("cargo:warning=could not embed saishin.ico: {ex}"),
+    // The description is the line the Properties window calls "File
+    // description", so it says which of the two shipped files this is.
+    for (binary, description) in [("saishin-cli", "Saishin updater"), ("saishin", "Saishin launcher")] {
+        let source = format!("{icon_line}{}", version_block(binary, description));
+        let rc = std::path::Path::new(&out_dir).join(format!("{binary}.rc"));
+        if let Err(ex) = std::fs::write(&rc, source) {
+            println!("cargo:warning=could not write the resource script: {ex}");
+            continue;
+        }
+
+        match embed_resource::compile_for(rc, [binary], embed_resource::NONE)
+            .manifest_optional()
+        {
+            Ok(_) => {}
+            Err(ex) => println!("cargo:warning=could not embed the resources of {binary}: {ex}"),
+        }
     }
+}
+
+/// The version resource of one binary, in the .rc text a Windows resource
+/// compiler turns into VS_VERSION_INFO: the four numbers, and the strings the
+/// Properties window lists beside them. The id is written as the number `1`
+/// because that is what `VS_VERSION_INFO` is in winver.h, and needing no header
+/// include is what keeps rc.exe, the SDK's compiler, and windres, the fallback
+/// embed-resource ships, reading the same file.
+#[cfg(windows)]
+fn version_block(binary: &str, description: &str) -> String {
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let [major, minor, patch, build] = version_numbers(&version);
+    // The identity the -V line prints, so a Properties window names the very
+    // build a terminal does.
+    let identity = rc_escape(&format!("{version} ({})", git_identity()));
+    let description = rc_escape(description);
+    let version = rc_escape(&version);
+    let binary = rc_escape(binary);
+    // VS_FF_DEBUG, the one flag worth setting: a debug build is a local build,
+    // and every build CI ships is a release.
+    let flags = if env::var("PROFILE").as_deref() == Ok("debug") {
+        "0x1"
+    } else {
+        "0x0"
+    };
+
+    format!(
+        "
+1 VERSIONINFO
+ FILEVERSION {major},{minor},{patch},{build}
+ PRODUCTVERSION {major},{minor},{patch},{build}
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS {flags}L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK \"StringFileInfo\"
+    BEGIN
+        BLOCK \"040904b0\"
+        BEGIN
+            VALUE \"FileDescription\", \"{description}\"
+            VALUE \"FileVersion\", \"{version}\"
+            VALUE \"InternalName\", \"{binary}\"
+            VALUE \"LegalCopyright\", \"MIT\"
+            VALUE \"OriginalFilename\", \"{binary}.exe\"
+            VALUE \"ProductName\", \"Saishin\"
+            VALUE \"ProductVersion\", \"{identity}\"
+        END
+    END
+    BLOCK \"VarFileInfo\"
+    BEGIN
+        VALUE \"Translation\", 0x409, 1200
+    END
+END
+"
+    )
+}
+
+/// A string as a .rc file wants it: quoted, so a quote and a backslash are
+/// escaped. The values written here are a version number, an exe name and a
+/// sha, all of them ASCII, and the escaping is what keeps it that way.
+#[cfg(windows)]
+fn rc_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Cargo's version as the four numbers a Windows version resource wants.
+/// A pre-release or metadata suffix ("1.2.0-rc1", "1.2.0+ab12cd3") is cut
+/// away, a part that is missing or is not a number is 0, and a part too large
+/// for the 16 bits the resource has is saturated: whatever Cargo.toml says, the
+/// resource script stays valid, because an invalid one means no version in the
+/// Properties window at all. Windows-only, like the resource it feeds.
+#[cfg(windows)]
+fn version_numbers(version: &str) -> [u16; 4] {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let mut numbers = [0u16; 4];
+    for (slot, part) in numbers.iter_mut().zip(core.split('.')) {
+        let number = part.trim().parse::<u32>().unwrap_or(0);
+        *slot = number.min(u32::from(u16::MAX)) as u16;
+    }
+    numbers
 }
 
 /// Decodes the header logo and writes it into OUT_DIR as raw RGBA8, which

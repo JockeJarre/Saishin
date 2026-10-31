@@ -131,6 +131,20 @@ jobs:
           ./scripts/check-icon.ps1 "$env:BUNDLE/saishin.exe"
           ./scripts/check-icon.ps1 "$env:BUNDLE/saishin-cli.exe"
 
+      # And the version: the bundle's exes are what a user inspects in Explorer,
+      # and on a tag build the sha build.rs stamps is this commit's, so the
+      # Properties window has to say the tag's version and this sha.
+      - name: Check the embedded version
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          BUNDLE: saishin-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          ./scripts/check-version.ps1 "$env:BUNDLE/saishin.exe" -Version "$env:VERSION" -Sha $sha
+          ./scripts/check-version.ps1 "$env:BUNDLE/saishin-cli.exe" -Version "$env:VERSION" -Sha $sha
+
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.target }}

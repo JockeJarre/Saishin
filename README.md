@@ -119,6 +119,14 @@ it; the PE subsystem is what decides whether a console exists in the first
 place. So the launcher is marked as a GUI-subsystem binary, which is also the
 binary carrying the icon, and it is std-only, so it starts in milliseconds.
 
+Both files carry their version in their Windows properties, so a downloaded exe
+names its build without a terminal being opened: Properties, Version shows the
+file version `1.0.0` and the product version `1.0.0 (a1b2c3d-ci)` — the version
+from `Cargo.toml` and the commit the build came from, the same two `-V` prints —
+beside a description naming which of the two files the window describes. The job
+that ships the Windows files fails when an exe carries no icon, or no version of
+its own.
+
 What a run through the launcher reports:
 
 - The box is for problems. A headless run's warnings and errors become the box;
