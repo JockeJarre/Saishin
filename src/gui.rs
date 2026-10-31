@@ -88,6 +88,17 @@ const MARK_SIZE: f32 = 16.0;
 /// The end screen shows the list and asks its question and answers, so the list
 /// takes the rows it has and at most this much height.
 const END_LIST_MAX_HEIGHT: f32 = 220.0;
+/// The end screen's dismiss button. Two letters need little room, and the run's
+/// last press should not be aimed at a small target, so it is a button of a size
+/// a hand finds in one look.
+const OK_WIDTH: f32 = 72.0;
+const OK_HEIGHT: f32 = 26.0;
+/// The list's source cell, in pixels. A cell is a `Grid` column's width, a
+/// truncating label asks for as little as it can get away with, and the columns
+/// of a list that changes as a run moves want a width that does not move with
+/// the text - so the cell is this wide and its text is cut to it.
+const ROW_SOURCE_WIDTH: f32 = 150.0;
+const ROW_CELL_HEIGHT: f32 = 20.0;
 
 /// The mark for a file being unzipped: a square turning where the download's
 /// circle spins, in an amber no download wears. The motion is the same, so the
@@ -222,6 +233,10 @@ struct SelectionApp {
     /// in the rows, so a version swapped in the dropdown is resumed as the
     /// version that is showing.
     chosen: Vec<usize>,
+    /// Whether the finished run's **OK** has been given the keys. Once, so the
+    /// button answers Enter and Space from the moment the run ends, and so the
+    /// focus is not taken back from a button the window's own keys moved to.
+    end_focused: bool,
     /// The run's lines as the window shows them: a copy taken when the count of
     /// lines moved, so the list is not cloned on every frame.
     log_lines: Vec<log::Line>,
@@ -275,6 +290,13 @@ const LOG_LINES_HEIGHT: f32 = 180.0;
 /// legible at a glance, and a run's lines still fill the strip's height.
 const LOG_TEXT_SIZE: f32 = 11.0;
 
+/// How many characters the strip's one line has room for. The window is
+/// `WINDOW_WIDTH` wide and the strip's text is monospace at `LOG_TEXT_SIZE`, so
+/// a line longer than this is cut at the window's edge - and a path or a url cut
+/// in the middle reads as noise, which is the reason the closed strip looks for
+/// a shorter line to show.
+const STRIP_LINE_MAX: usize = 110;
+
 /// One line of the log strip: monospace, so paths, sizes and the columns of the
 /// progress lines keep their shape, and a colour for the two levels that need
 /// attention.
@@ -288,6 +310,41 @@ fn log_line_text(line: &log::Line) -> egui::RichText {
         Level::Detail | Level::Progress => text.weak(),
         Level::Info => text,
     }
+}
+
+/// The strip's one line: the newest line that is short enough to be read whole.
+/// A run writes its progress and its summary in short lines and its paths and
+/// urls in long ones, so this is the newest line while the run moves and as it
+/// ends, and the long lines - a full path being written, a url - are passed over,
+/// because a path cut at the window's edge says nothing. Nothing is lost: every
+/// line is in the open strip, and the closed strip's text gives the whole of its
+/// line on hover.
+fn strip_line(lines: &[log::Line]) -> Option<&log::Line> {
+    let newest = lines.last()?;
+    Some(
+        lines
+            .iter()
+            .rev()
+            .find(|line| line.text.chars().count() <= STRIP_LINE_MAX)
+            .unwrap_or(newest),
+    )
+}
+
+/// A file name that fits a row: the head, an ellipsis, and the tail. A
+/// download's name carries its version and its ending at the end, so a name cut
+/// from the front cannot be checked against the source; the head and the tail
+/// together say which file the row is, and the name's middle is what the row has
+/// no room for. The full name is the link's text, in the strip, and on disk.
+fn short_name(name: &str) -> String {
+    const HEAD: usize = 18;
+    const TAIL: usize = 22;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= HEAD + TAIL + 1 {
+        return name.to_string();
+    }
+    let head: String = chars[..HEAD].iter().collect();
+    let tail: String = chars[chars.len() - TAIL..].iter().collect();
+    format!("{head}\u{2026}{tail}")
 }
 
 /// The header logo as an egui image, ready to upload: the bytes `build.rs`
@@ -439,6 +496,7 @@ impl SelectionApp {
             progress,
             load,
             chosen: Vec::new(),
+            end_focused: false,
             log_lines: Vec::new(),
             log_revision: 0,
             logo: None,
@@ -451,8 +509,9 @@ impl SelectionApp {
     /// The run's text in a strip at the bottom of the window. The window is the
     /// report, so everything a console run prints is readable here: the token's
     /// provenance, which urls matched, the download lines, the warnings. Closed
-    /// it is one line - the newest; open, a list that follows the newest line and
-    /// whose text can be selected and copied.
+    /// it is one line - the newest that can be read whole, with a line cut at the
+    /// window's edge given in full on hover; open, a list that follows the newest
+    /// line and whose text can be selected and copied.
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         // The run writes from its own thread and egui draws on input, so a new
         // line has to ask for the frame that shows it.
@@ -467,7 +526,7 @@ impl SelectionApp {
         // header's click is written while its content is read.
         let lines = std::mem::take(&mut self.log_lines);
         let count = lines.len();
-        let newest = lines.last().cloned();
+        let strip = strip_line(&lines);
 
         // The lines are the point of this strip. The header's toggle needs the
         // left inset and nothing needs the right, so the frame hugs the right
@@ -499,8 +558,16 @@ impl SelectionApp {
                 // The body is `None` exactly while the header is collapsed, which
                 // is the state the strip is in.
                 if header.body_returned.is_none() {
-                    if let Some(newest) = &newest {
-                        ui.add(egui::Label::new(log_line_text(newest)).selectable(true).truncate());
+                    if let Some(line) = strip {
+                        // `truncate` keeps the strip one line tall whatever the
+                        // text, and the tooltip is what makes a line that is cut
+                        // by that readable rather than merely short.
+                        ui.add(
+                            egui::Label::new(log_line_text(line))
+                                .selectable(true)
+                                .truncate()
+                                .show_tooltip_when_elided(true),
+                        );
                     }
                 }
             });
@@ -583,6 +650,8 @@ impl SelectionApp {
         // Remembered, because the end state offers to start these rows again
         // from where they stopped.
         self.chosen = chosen.clone();
+        // The next run's end gets its own focused **OK**.
+        self.end_focused = false;
         let chosen_files: Vec<PendingFile> = chosen
             .iter()
             .filter_map(|index| self.entries.get(*index))
@@ -772,13 +841,23 @@ impl SelectionApp {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(MARK_SIZE, MARK_SIZE), egui::Sense::hover());
                         row_mark(ui, rect, state, running);
-                        ui.label(entry.file.source_name.clone());
+                        // One line to a row: the list is the run's result, and a
+                        // cell that wraps puts the row's mark beside its own
+                        // second line, which reads as two rows. The cells are cut
+                        // instead, and the whole of a name is one hover, one
+                        // click, or a strip line away.
+                        ui.add_sized(
+                            egui::vec2(ROW_SOURCE_WIDTH, ROW_CELL_HEIGHT),
+                            egui::Label::new(entry.file.source_name.clone())
+                                .truncate()
+                                .show_tooltip_when_elided(true),
+                        );
                         let size = match entry.file.size {
                             Some(bytes) => format_bytes(bytes),
                             None => "size unknown".to_string(),
                         };
                         ui.label(size);
-                        ui.hyperlink_to(&entry.file.file_name, &entry.file.link_url);
+                        ui.hyperlink_to(short_name(&entry.file.file_name), &entry.file.link_url);
                         ui.end_row();
                     }
                 });
@@ -1064,7 +1143,20 @@ impl App for SelectionApp {
                 if !close_on_finish {
                     egui::Panel::bottom("end_actions").show(ui, |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Close").clicked() {
+                            // **OK** is the word for a run that is over, and it
+                            // sits in the corner where a dismiss button belongs.
+                            // It is the wider button, because it is the one every
+                            // end state answers, and it is the focused one, so the
+                            // run's last press can be Enter on the keyboard.
+                            let ok = ui.add_sized(
+                                egui::vec2(OK_WIDTH, OK_HEIGHT),
+                                egui::Button::new(egui::RichText::new("OK").strong()),
+                            );
+                            if !self.end_focused {
+                                ok.request_focus();
+                                self.end_focused = true;
+                            }
+                            if ok.clicked() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             if !partials.is_empty() {
@@ -1269,6 +1361,45 @@ mod tests {
         // Nothing picked, nothing to continue.
         assert!(!can_resume(Phase::Cancelled, &[]));
         assert!(!can_resume(Phase::Loading, &[]));
+    }
+
+    /// The strip's one line is the newest that can be read whole, so a run's
+    /// long path lines do not leave the strip showing half a path.
+    #[test]
+    fn the_strips_line_is_the_newest_that_fits() {
+        let line = |text: &str| log::Line {
+            level: Level::Info,
+            text: text.to_string(),
+        };
+        let short = line("archive: 658 extracted, 0 skipped");
+        let long = line(&format!("C:\\vpin\\{}", "a-long-folder-name\\".repeat(7)));
+        assert!(long.text.chars().count() > STRIP_LINE_MAX);
+
+        // The newest that fits, not the newest that is there.
+        let lines = vec![short.clone(), long.clone(), short.clone()];
+        assert_eq!(strip_line(&lines).unwrap().text, short.text);
+        let lines = vec![long.clone(), short.clone()];
+        assert_eq!(strip_line(&lines).unwrap().text, short.text);
+
+        // A run whose every line is long still gets its newest line cut to the
+        // strip, with the whole of it on hover: showing nothing is the worse
+        // choice.
+        assert_eq!(strip_line(std::slice::from_ref(&long)).unwrap().text, long.text);
+        assert!(strip_line(&[]).is_none());
+    }
+
+    /// A row's name keeps its ends: the head is what a source's files share and
+    /// the tail is the version and the ending, and the middle is what a row that
+    /// has to stay one line tall has no room for.
+    #[test]
+    fn a_rows_name_keeps_its_ends() {
+        assert_eq!(short_name("vpinball_10.2.zip"), "vpinball_10.2.zip");
+        let name = "VisualPinball_x64_10.2_GitHub_b1b8574f9c2c4b0a9d.zip";
+        let shown = short_name(name);
+        assert!(shown.starts_with("VisualPinball_x64_"));
+        assert!(shown.ends_with("9d.zip"));
+        assert!(shown.contains('\u{2026}'));
+        assert!(shown.chars().count() < name.chars().count());
     }
 
     #[test]

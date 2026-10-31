@@ -390,7 +390,7 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
 | `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
 | `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
-| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with a **Close** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
+| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with an **OK** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
 downloaded file asks about it first, which keeps the window open |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
 | `sound` | empty | Play this sound file after a run that downloaded something |
@@ -603,25 +603,30 @@ ends it. The strip at the bottom is the run's text, the same lines a console run
 prints — the token's provenance, which source was asked and what it offered, the
 download lines with their progress, the warnings, the errors. A window run keeps
 all of those in the strip and prints none of them, which is why a window run is
-never followed by a box. Closed, the strip is one line: the newest. Open, it
-is a list that follows the newest line, and its text can be selected and copied.
+never followed by a box. Closed, the strip is one line: the newest line short
+enough to read whole, since a path cut at the window's edge says nothing - a line
+that is cut gives its whole text on hover. Open, the strip is a list that follows
+the newest line, and its text can be selected and copied.
 The download list says what each row is doing by how its mark is drawn, and by
 nothing else: a spinning circle is a transfer, a turning amber square an archive
 being unpacked, a green check a finished file, a grey ring a row a cancel stopped
-mid-transfer. The list is the run's work, so it stays on screen when the run ends,
-under the answer - a mark that turns over a run that has ended would say the run
-is still going.
+mid-transfer. A row's file name keeps its ends and loses its middle to an
+ellipsis, because a row that wraps puts its mark beside its own second line, and
+a cut name gives its whole text on hover. The list is the run's work, so it stays
+on screen when the run ends, under the answer - a mark that turns over a run that
+has ended would say the run is still going.
 
 Because a GUI run's words live in that strip, the window stays open when the run
-ends — **Done**, **Cancelled** or **Failed** — with a **Close** button;
-`close_on_finish = true` gives the older habit of closing at once. A run
-**Cancelled** mid-transfer lists the half downloaded files and asks: **Keep**
-leaves them where they are, so the next run continues them, and **Delete**
-removes them. **Resume** starts the same rows again from where they stopped - the
-pieces on disk are what a transfer continues from - which is the answer **Keep**
-and the download again in one press; a finished run has nothing to resume, and a
-window that never started a download has no such button to offer. The question
-outranks `close_on_finish`, because a window that closes itself cannot ask.
+ends — **Done**, **Cancelled** or **Failed** — with an **OK** button to end it,
+and the button has the keys, so Enter and Space press it; `close_on_finish =
+true` gives the older habit of closing at once. A run **Cancelled** mid-transfer
+lists the half downloaded files and asks: **Keep** leaves them where they are, so
+the next run continues them, and **Delete** removes them. **Resume** starts the
+same rows again from where they stopped — the pieces on disk are what a transfer
+continues from — which is the answer **Keep** and the download again in one
+press; a finished run has nothing to resume, and a window that never started a
+download has no such button to offer. The question outranks `close_on_finish`,
+because a window that closes itself cannot ask.
 
 ### Picking an older version
 
