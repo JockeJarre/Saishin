@@ -295,12 +295,20 @@ const LOG_LINES_HEIGHT: f32 = 180.0;
 /// legible at a glance, and a run's lines still fill the strip's height.
 const LOG_TEXT_SIZE: f32 = 11.0;
 
-/// How many characters the strip's one line has room for. The window is
-/// `WINDOW_WIDTH` wide and the strip's text is monospace at `LOG_TEXT_SIZE`, so
-/// a line longer than this is cut at the window's edge - and a path or a url cut
-/// in the middle reads as noise, which is the reason the closed strip looks for
-/// a shorter line to show.
-const STRIP_LINE_MAX: usize = 110;
+/// The strip's monospace advance as a fraction of its text size: a monospace
+/// face is about 0.5 to 0.62 em wide. This turns a width into a number of
+/// characters, and the number does not have to be exact - a line a character too
+/// long is cut with an ellipsis and given in full on hover. Its job is to follow
+/// the window's width, so the strip reads a long line whole in a wide window and
+/// a short one in a narrow one, where a fixed count fits neither.
+const STRIP_CHAR_EM: f32 = 0.6;
+
+/// How many characters of the strip's text a width holds.
+fn strip_chars(width: f32) -> usize {
+    (f64::from(width) / f64::from(LOG_TEXT_SIZE * STRIP_CHAR_EM))
+        .floor()
+        .max(1.0) as usize
+}
 
 /// One line of the log strip: monospace, so paths, sizes and the columns of the
 /// progress lines keep their shape, and a colour for the two levels that need
@@ -317,20 +325,20 @@ fn log_line_text(line: &log::Line) -> egui::RichText {
     }
 }
 
-/// The strip's one line: the newest line that is short enough to be read whole.
-/// A run writes its progress and its summary in short lines and its paths and
-/// urls in long ones, so this is the newest line while the run moves and as it
-/// ends, and the long lines - a full path being written, a url - are passed over,
-/// because a path cut at the window's edge says nothing. Nothing is lost: every
-/// line is in the open strip, and the closed strip's text gives the whole of its
-/// line on hover.
-fn strip_line(lines: &[log::Line]) -> Option<&log::Line> {
+/// The strip's one line: the newest line that is short enough to be read whole
+/// in the width the strip has (`max_chars`). A run writes its progress and its
+/// summary in short lines and its paths and urls in long ones, so this is the
+/// newest line while the run moves and as it ends, and the long lines - a full
+/// path being written, a url - are passed over, because a path cut in the middle
+/// says nothing. Nothing is lost: every line is in the open strip, and the closed
+/// strip's text gives the whole of its line on hover.
+fn strip_line(lines: &[log::Line], max_chars: usize) -> Option<&log::Line> {
     let newest = lines.last()?;
     Some(
         lines
             .iter()
             .rev()
-            .find(|line| line.text.chars().count() <= STRIP_LINE_MAX)
+            .find(|line| line.text.chars().count() <= max_chars)
             .unwrap_or(newest),
     )
 }
@@ -514,9 +522,10 @@ impl SelectionApp {
     /// The run's text in a strip at the bottom of the window. The window is the
     /// report, so everything a console run prints is readable here: the token's
     /// provenance, which urls matched, the download lines, the warnings. Closed
-    /// it is one line - the newest that can be read whole, with a line cut at the
-    /// window's edge given in full on hover; open, a list that follows the newest
-    /// line and whose text can be selected and copied.
+    /// it is one line - the newest that can be read whole in the width there is,
+    /// with a line cut by that width given in full on hover; open, a list that
+    /// follows the newest line, its lines wrapped to the window's width, and whose
+    /// text can be selected and copied.
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         // The run writes from its own thread and egui draws on input, so a new
         // line has to ask for the frame that shows it.
@@ -527,11 +536,10 @@ impl SelectionApp {
             ui.ctx().request_repaint();
         }
 
-        // Out of self while the strip is drawn, and read through before it: the
-        // header's click is written while its content is read.
+        // Out of self while the strip is drawn: the header's click is written
+        // while its content is read.
         let lines = std::mem::take(&mut self.log_lines);
         let count = lines.len();
-        let strip = strip_line(&lines);
 
         // The lines are the point of this strip. The header's toggle needs the
         // left inset and nothing needs the right, so the frame hugs the right
@@ -548,12 +556,23 @@ impl SelectionApp {
                 style.spacing.scroll.floating = true;
                 style.spacing.scroll.floating_allocated_width = 0.0;
 
+                // The width the strip's text has, in characters. The window is
+                // whatever width the user left it, so the line the closed strip
+                // picks is chosen against the room there is, not a fixed count.
+                let chars = strip_chars(ui.available_width());
+
                 let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
                     .default_open(false)
                     .show_unindented(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .stick_to_bottom(true)
                             .max_height(LOG_LINES_HEIGHT)
+                            // Open in one direction only: a vertical scroll area
+                            // hands its content an unbounded width by default, and
+                            // a label with no width to wrap at draws one long line
+                            // and loses its end at the edge of the window. Ask for
+                            // the full width and the lines wrap to fill it.
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 for line in lines.iter() {
                                     ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
@@ -563,7 +582,7 @@ impl SelectionApp {
                 // The body is `None` exactly while the header is collapsed, which
                 // is the state the strip is in.
                 if header.body_returned.is_none() {
-                    if let Some(line) = strip {
+                    if let Some(line) = strip_line(&lines, chars) {
                         // `truncate` keeps the strip one line tall whatever the
                         // text, and the tooltip is what makes a line that is cut
                         // by that readable rather than merely short.
@@ -1002,6 +1021,26 @@ impl App for SelectionApp {
         match phase {
             Phase::Selecting => {
                 egui::Panel::bottom("actions").show(ui, |ui| {
+                    if self.entries.is_empty() {
+                        // The check is the whole run when it finds nothing: no
+                        // rows to pick, nothing to download, so one button answers
+                        // it. What the sources said is in the strip above, and the
+                        // heading says when one of them was refused.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let ok = ui.add_sized(
+                                egui::vec2(OK_WIDTH, OK_HEIGHT),
+                                egui::Button::new(egui::RichText::new("OK").strong()),
+                            );
+                            if !self.end_focused {
+                                ok.request_focus();
+                                self.end_focused = true;
+                            }
+                            if ok.clicked() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        return;
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Select all").clicked() {
                             for entry in self.entries.iter_mut() {
@@ -1419,8 +1458,10 @@ mod tests {
         assert!(can_resume(Phase::Cancelled, &[0, 3]));
     }
 
-    /// The strip's one line is the newest that can be read whole, so a run's
-    /// long path lines do not leave the strip showing half a path.
+    /// The strip's one line is the newest that can be read whole in the width the
+    /// strip has, so a run's long path lines do not leave the strip showing half a
+    /// path - and the same line a narrow window passes over is readable in a wide
+    /// one, because the count comes from the window's width.
     #[test]
     fn the_strips_line_is_the_newest_that_fits() {
         let line = |text: &str| log::Line {
@@ -1428,20 +1469,29 @@ mod tests {
             text: text.to_string(),
         };
         let short = line("archive: 658 extracted, 0 skipped");
-        let long = line(&format!("C:\\vpin\\{}", "a-long-folder-name\\".repeat(7)));
-        assert!(long.text.chars().count() > STRIP_LINE_MAX);
+        let long = line(&format!("C:\\vpin\\{}", "a-long-folder-name\\".repeat(9)));
+        let room = strip_chars(940.0);
+        assert!(long.text.chars().count() > room);
+        assert!(short.text.chars().count() <= room);
 
         // The newest that fits, not the newest that is there.
         let lines = vec![short.clone(), long.clone(), short.clone()];
-        assert_eq!(strip_line(&lines).unwrap().text, short.text);
-        let lines = vec![long.clone(), short.clone()];
-        assert_eq!(strip_line(&lines).unwrap().text, short.text);
+        assert_eq!(strip_line(&lines, room).unwrap().text, short.text);
 
-        // A run whose every line is long still gets its newest line cut to the
-        // strip, with the whole of it on hover: showing nothing is the worse
-        // choice.
-        assert_eq!(strip_line(std::slice::from_ref(&long)).unwrap().text, long.text);
-        assert!(strip_line(&[]).is_none());
+        // The same two lines in a window twice as wide: the long one is the
+        // newest, it fits, and it is what the strip shows. This is the reason the
+        // count comes from the width and is not a constant.
+        let two = vec![short.clone(), long.clone()];
+        assert_eq!(strip_line(&two, room).unwrap().text, short.text);
+        let wide = strip_chars(1880.0);
+        assert!(long.text.chars().count() <= wide);
+        assert_eq!(strip_line(&two, wide).unwrap().text, long.text);
+
+        // A run whose every line is long still gets its newest line, cut to what
+        // the strip has room for, with the whole of it on hover: showing nothing
+        // is the worse choice.
+        assert_eq!(strip_line(std::slice::from_ref(&long), 10).unwrap().text, long.text);
+        assert!(strip_line(&[], 10).is_none());
     }
 
     /// A row's name keeps its ends: the head is what a source's files share and
