@@ -33,8 +33,27 @@
 //   - The exit code is passed through, so a launcher in front of the program
 //     changes nothing for whoever watches the code.
 //
+// A typed command is a terminal run, and the launcher's whole job there is to
+// get it a terminal, because Windows gives a GUI-subsystem process none:
+//
+//   - The prompt that started the run is attached, and the program is handed
+//     that console - standard input, output and error inherited, no
+//     `CREATE_NO_WINDOW`, no `SAISHIN_LAUNCHER`. The run is the program's own:
+//     its full transcript, its token prompt, its exit code. The launcher
+//     captures nothing and adds no rule of its own.
+//   - Started where there is no prompt anywhere (a shortcut, the taskbar, a Run
+//     dialog), the command gets a console of its own: `cmd /k`, so the window
+//     keeps the words after the run and a prompt that asks for input gets keys.
+//   - No console to speak in and none to make: the box says a command prompt is
+//     needed, and the exit code is not 0. Nothing ever waits for input that
+//     nobody can see, which is what `saishin.exe --login` did before.
+//
+// The launcher reads no argument: a typed word goes to the program as it came,
+// so every decision about the words stays in the program, and a release's flags
+// are not written down in two files.
+//
 // Only std: this binary links no tokio, no eframe, no reqwest, which is why it
-// starts in milliseconds. The one window call it needs is declared by hand, the
+// starts in milliseconds. The window calls it needs are declared by hand, the
 // same way src/notifier.rs declares the box it draws.
 
 // No console window, ever: this is the PE subsystem flag that stops Windows
@@ -47,6 +66,13 @@ const PROGRAM: &str = "saishin-cli";
 /// Where the box goes when the box is the only report there is.
 #[cfg(windows)]
 const CAPTION: &str = "Saishin";
+
+/// The words for a command that needs a prompt where no prompt can be made.
+#[cfg(windows)]
+const NEEDS_PROMPT: &str = "This command needs a command prompt, and none was there to \
+open one in.\n\nRun it as saishin-cli.exe from a prompt, for example:\n\
+saishin-cli.exe --login\n\nA GitHub token can also come from the environment: set \
+GITHUB_TOKEN before the run.";
 
 /// `CREATE_NO_WINDOW`: start the child with a console it cannot see. Combined
 /// with piped handles, no terminal window is created for the child either.
@@ -65,6 +91,23 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let program = program_path();
+
+    // Words typed mean a terminal run, and the terminal has to be found before
+    // the program can speak in it: this process has no console, so the prompt
+    // that started us is attached, and a command started where there is none
+    // gets a console window of its own. See the header for the three ways.
+    if !args.is_empty() {
+        if attach_parent_console() {
+            std::process::exit(run_in_console(&program, &args));
+        }
+        if run_in_new_console(&program, &args) {
+            // The window is up with the run in it, and it keeps the words after
+            // the run: from here the window is the report.
+            std::process::exit(0);
+        }
+        box_up(NEEDS_PROMPT, false);
+        std::process::exit(1);
+    }
 
     let child = Command::new(&program)
         .args(&args)
@@ -111,6 +154,86 @@ fn main() {
         box_up(&text, code == 0);
     }
     std::process::exit(code);
+}
+
+/// The program in the prompt that started the launcher: its text goes to the
+/// screen as it is written, the keyboard answers its prompts, and its exit code
+/// is the launcher's. Nothing is piped, so nothing is buffered and no box is
+/// drawn, and `SAISHIN_LAUNCHER` stays unset: in a console the program is its
+/// own report, exactly as `saishin-cli` has always been.
+#[cfg(windows)]
+fn run_in_console(program: &std::path::Path, args: &[String]) -> i32 {
+    use std::process::{Command, Stdio};
+
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(ex) => {
+            eprintln!("Could not start {}: {ex}", program.display());
+            1
+        }
+    }
+}
+
+/// The command in a console window of its own, opened by `cmd /k` so the window
+/// keeps the words after the run, stays open to be read, and gives a prompt that
+/// asks for input a keyboard to read it from. True when the window came up: the
+/// launcher's part is done, and the window carries the report.
+#[cfg(windows)]
+fn run_in_new_console(program: &std::path::Path, args: &[String]) -> bool {
+    // `cmd` parses a command line of its own, so the words are put on one, with
+    // the program quoted: it sits beside saishin.exe, and that directory is
+    // often `C:\Program Files\...`.
+    let mut line = format!("\"{}\"", program.display());
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quoted(arg));
+    }
+    std::process::Command::new("cmd.exe")
+        .arg("/k")
+        .arg(line)
+        .spawn()
+        .is_ok()
+}
+
+/// One word as `cmd` wants it: between quotes when it has a space in it, which
+/// is what a path like `--config C:\My Files\saishin.ini` brings.
+#[cfg(windows)]
+fn quoted(arg: &str) -> String {
+    if arg.chars().any(char::is_whitespace) {
+        format!("\"{arg}\"")
+    } else {
+        arg.to_string()
+    }
+}
+
+/// The console of the process that started this one. A GUI-subsystem process is
+/// given none, which is the reason this binary exists, so a command typed into a
+/// prompt has to take that prompt's console from the parent before it can answer
+/// in it. False when there is no parent to take one from.
+#[cfg(windows)]
+fn attach_parent_console() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FreeConsole() -> i32;
+        fn AttachConsole(process: u32) -> i32;
+    }
+    // `(DWORD)-1`: the console of the parent process.
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    // Safety: neither call takes a pointer; they move this process between
+    // consoles and touch no memory of their own.
+    unsafe {
+        // FreeConsole's failure is the good case: it means nothing is attached
+        // to detach, which is what a GUI-subsystem start leaves.
+        FreeConsole();
+        AttachConsole(ATTACH_PARENT_PROCESS) != 0
+    }
 }
 
 #[cfg(not(windows))]

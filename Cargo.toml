@@ -14,7 +14,9 @@ license = "MIT"
 #   saishin       the launcher, src/launcher.rs. GUI subsystem, so an icon
 #                 launch gets no console window at all, and this is the binary
 #                 that carries the icon a shortcut, Explorer and the taskbar
-#                 show. It starts saishin-cli and reports its text in a box.
+#                 show. A double-click starts saishin-cli and reports its text in
+#                 a box; a typed command gets the prompt it was typed in, so
+#                 saishin.exe --login works from a terminal too.
 #
 # default-run keeps a plain cargo run on the program: the launcher answers in a
 # box, which is not what a terminal session wants.

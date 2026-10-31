@@ -108,6 +108,7 @@ starts:
 | File | Started from | What happens |
 | --- | --- | --- |
 | `saishin.exe` | a shortcut, a double-click, the taskbar | No console window at all. It starts `saishin-cli.exe` in the same directory, reads its text, and puts that report in a message box. |
+| `saishin.exe --login` | a terminal | A command with arguments runs in the terminal it was typed in: the program's own transcript, its prompts, its exit code. |
 | `saishin-cli.exe` | a terminal, a script, Task Scheduler | Prints as usual, the shell waits for it, the exit code arrives. |
 
 `saishin.exe` exists for one Windows detail. An icon launch of a console program
@@ -130,9 +131,20 @@ What a run through the launcher reports:
   strip at its bottom.
 - The exit code is passed through, so watching exit codes changes nothing.
 
-A terminal run of `saishin.exe` answers in a box rather than in the terminal, and
-cmd and PowerShell do not wait for a GUI-subsystem program. In a script, call
-`saishin-cli.exe`: it prints, and the shell waits for it.
+A command with arguments, such as `saishin.exe --login`, is a terminal run, and
+Windows gives a GUI-subsystem program no console of its own, so the launcher's
+whole job there is to find one. Attached to the prompt the command was typed in,
+the program answers in it itself: its full transcript, its token prompt, its exit
+code, exactly as `saishin-cli.exe` has always done, and the launcher adds no rule
+of its own about the words. Started where there is no prompt, a shortcut, a Run
+dialog, Task Scheduler, the command gets a console window of its own, which stays
+open after the run so its words can be read and a prompt that asks for something
+has a keyboard; when no console can be made, the box says a command prompt is
+needed and the exit code is not 0. Nothing ever waits for input nobody can see.
+
+One shell detail to know: `cmd` does not wait for a GUI-subsystem program, so its
+prompt comes back while the run is still printing; PowerShell does wait. In a
+script, call `saishin-cli.exe`: it prints, and the shell waits for it.
 
 On Linux and macOS there is no console window to avoid, so the program is all
 there is, and it is called `saishin-cli` there as well.
