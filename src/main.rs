@@ -15,6 +15,8 @@ use downloader::{format_bytes, Downloader};
 use error::AppError;
 use futures_util::future::join_all;
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -231,6 +233,28 @@ fn console_is_ours() -> bool {
     false
 }
 
+/// Whether a prompt asked of this process can be seen and answered: standard
+/// input is a console's, and a console is attached to answer it. A launcher's
+/// pipes are not standard input's console, and the run the launcher starts has
+/// no console at all - the standard handle is then a null one, and Windows calls
+/// a null handle a character device, which is why asking standard input alone
+/// says "console" where there is none to read the words or type keys into.
+#[cfg(windows)]
+fn a_console_can_answer() -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, size: u32) -> u32;
+    }
+    let mut processes = [0u32; 8];
+    // Zero when there is no console attached at all.
+    let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+    attached > 0
+}
+
 /// Which front end runs. The command line wins: `--gui` opens the window even
 /// when the config says headless, `--no-gui` is the escape hatch for a config
 /// with `gui = true` (a scheduled task, a script). Without a flag, `[general]
@@ -285,7 +309,7 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
         log::window_is_the_report();
     }
 
-    let token = resolve_token(&config, &selected, &http, options).await?;
+    let token = resolve_token(&config, Path::new(&config_path), &selected, &http, options).await?;
 
     let mut updated: Vec<String> = Vec::new();
     if use_gui(options, &config) {
@@ -445,6 +469,7 @@ fn select_sources(config: &AppConfig, options: &Options) -> Result<Vec<SourceCon
 
 async fn resolve_token(
     config: &AppConfig,
+    config_path: &Path,
     selected: &[SourceConfig],
     http: &Downloader,
     options: &Options,
@@ -485,6 +510,28 @@ async fn resolve_token(
         ));
     }
 
+    // A window run has no console to type a token into, and the prompt below is a
+    // console's: a double-click has none, and the words would be written where no
+    // one can read them and the run would wait for keys that cannot arrive. So the
+    // window asks in a box, and the prompt is opened where it can be answered. A
+    // window started from a terminal keeps the prompt it has.
+    #[cfg(windows)]
+    if use_gui(options, config) && !a_console_can_answer() {
+        let names = waiting_names(&github_sources, &actions_sources);
+        if notifier::ask(CAPTION, &token_box_text(&names)) {
+            match login_in_a_prompt(config, config_path) {
+                Some(token) => {
+                    log::detail("GitHub token taken from the secure store.");
+                    return Ok(Some(token));
+                }
+                None => log::warn(&without_a_token(&names)),
+            }
+        } else {
+            log::info(&without_a_token(&names));
+        }
+        return Ok(None);
+    }
+
     log::info("This source needs a GitHub account (private repository or authenticated action builds).");
     let token = secrets::prompt_for_token()?;
 
@@ -498,6 +545,97 @@ async fn resolve_token(
     secrets::store(config, &token)?;
     log::info("Token stored in the secure store. Scheduled runs will reuse it without prompting.");
     Ok(Some(token))
+}
+
+/// The caption every box of this program is under.
+#[cfg(windows)]
+const CAPTION: &str = "Saishin";
+
+/// The sources waiting on a token, named: a window's run has several, and an ask
+/// that does not say which ones is an ask about somebody else's configuration.
+#[cfg(windows)]
+fn waiting_names(sources: &[&SourceConfig], extra: &[&SourceConfig]) -> String {
+    let mut names: Vec<&str> = sources
+        .iter()
+        .filter(|source| source.private)
+        .map(|source| source.name.as_str())
+        .collect();
+    names.extend(extra.iter().map(|source| source.name.as_str()));
+    if names.is_empty() {
+        return "this source".to_string();
+    }
+    names.join(", ")
+}
+
+/// The whole ask, in the box: who is waiting, which token to make, where, and
+/// what the two answers do. The window has no strip yet at this point - the
+/// window opens after the token is settled - so the box carries all of it.
+#[cfg(windows)]
+fn token_box_text(names: &str) -> String {
+    format!(
+        "A GitHub token is needed and none is stored. The sources waiting on one \
+         are: {names}.\n\n\
+         Make one at https://github.com/settings/tokens under \"Generate new \
+         token (classic)\". Tick the 'public_repo' scope: that covers public \
+         repositories, their listings and their build downloads; add 'repo' for a \
+         private repository. A fine-grained token reaches only the repositories it \
+         was granted on, and a repository you do not control cannot be granted to \
+         it.\n\n\
+         Yes opens a command prompt running --login: paste the token there once, \
+         and this run reads it from this machine's credential store when that \
+         window is closed.\n\
+         No runs on without a token: {}",
+        anonymous_tail(names)
+    )
+}
+
+/// What a run without a token is good for: the listings of a public repository
+/// are public data, a build download is not.
+#[cfg(windows)]
+fn anonymous_tail(names: &str) -> String {
+    format!(
+        "the public listings of {names} are read anonymously (60 calls an hour), \
+         and their downloads are refused."
+    )
+}
+
+/// The line for the strip when the run goes on without a token, in answer to the
+/// box or after a prompt window that stored nothing.
+#[cfg(windows)]
+fn without_a_token(names: &str) -> String {
+    format!("Running without a token: {}", anonymous_tail(names))
+}
+
+/// `--login` in a command prompt of its own, for a window run with no console to
+/// prompt in. `cmd /k`, so the window keeps the words after the run and the paste
+/// can be read back; this run waits for that window to close, and the store has
+/// the token by then. The exe is this one at its own path, quoted: it sits in
+/// `C:\Program Files\...` as often as not, and `--config` rides along, because
+/// the store entry is named after the keyring service in that file.
+#[cfg(windows)]
+fn login_in_a_prompt(config: &AppConfig, config_path: &Path) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // A console the prompt window owns by itself: this run has none to hand out,
+    // and a window with no console of its own is a window nobody can type into.
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let exe = std::env::current_exe().ok()?;
+    let line = format!(
+        "\"{}\" --login --config \"{}\"",
+        exe.display(),
+        config_path.display()
+    );
+    if std::process::Command::new("cmd.exe")
+        .arg("/k")
+        .arg(line)
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .status()
+        .is_err()
+    {
+        log::warn("No command prompt could be opened, so the token cannot be entered.");
+        return None;
+    }
+    secrets::from_keyring(config)
 }
 
 async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
@@ -1784,6 +1922,55 @@ mod tests {
             sources: Vec::new(),
         };
         assert_eq!(github_web_base(&config), "https://ghe.example.com");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_token_ask_names_the_sources_waiting_on_it() {
+        let mut public = source(SourceKind::GitHub, false);
+        public.name = "flexdmd".to_string();
+        let mut private = source(SourceKind::GitHub, false);
+        private.name = "vpinball".to_string();
+        private.private = true;
+        let mut builds = source(SourceKind::Actions, false);
+        builds.name = "vpinball-builds".to_string();
+
+        // A public release source is answered without a token, so it does not ask.
+        assert_eq!(waiting_names(&[&public], &[]), "this source");
+        assert_eq!(
+            waiting_names(&[&private], &[&builds]),
+            "vpinball, vpinball-builds"
+        );
+        assert_eq!(waiting_names(&[&public], &[&builds]), "vpinball-builds");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_token_ask_carries_everything_the_window_has_to_say() {
+        // The box is up before the window is, so the box has to be the whole ask:
+        // who is waiting, which token to make, and what each answer does.
+        let text = token_box_text("vpinball-builds");
+        assert!(text.contains("vpinball-builds"));
+        assert!(text.contains("github.com/settings/tokens"));
+        assert!(text.contains("Generate new token (classic)"));
+        assert!(text.contains("public_repo"), "the measured minimum scope");
+        // The paragraph breaks are the box's layout: a wall of one line is not a
+        // thing to read in a dialog.
+        assert!(text.contains("are: vpinball-builds.\n\nMake one at"));
+        assert!(text.contains("cannot be granted to it.\n\nYes opens"));
+        assert!(text.contains("window is closed.\nNo runs on"));
+        assert!(text.contains("Yes opens a command prompt running --login"));
+        assert!(text.contains("No runs on without a token"));
+        assert!(!text.contains("ghp_"), "the box carries no token shape");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_without_a_token_says_what_it_is_good_for() {
+        let line = without_a_token("vpinball-builds");
+        assert!(line.starts_with("Running without a token: "));
+        assert!(line.contains("60 calls an hour"));
+        assert!(line.contains("downloads are refused"));
     }
 }
 

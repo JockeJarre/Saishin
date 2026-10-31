@@ -7,21 +7,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_PAGES: i64 = 10;
 
-/// The words for a call GitHub refused, which is a question about the token's
-/// reach and not about the network. A fine-grained token is granted on the
-/// repositories its owner picked, and it cannot be granted on a repository they
-/// do not control, which is the shape of most of these refusals; a classic token
-/// with the 'repo' scope reads every public repository. The listing of a public
-/// repository was already tried without a token by `api_get`, so a refusal that
-/// reaches here is a private repository, a repository the account cannot see, or
-/// an artifact download, which always wants a token.
-fn rejected(what: &str, status: u16) -> String {
+/// The words for a call GitHub refused, which is a question about the call's
+/// reach and not about the network. With a token in play it is a question about
+/// that token: a fine-grained one is granted on the repositories its owner
+/// picked, and it cannot be granted on a repository they do not control, which is
+/// the shape of most of these refusals; a classic token with 'public_repo' reads
+/// every public repository, and 'repo' adds the private ones. Without a token the
+/// call is asked of a public repository's anonymous allowance - 60 calls an hour,
+/// per machine - and GitHub answers a passed allowance with 403, so the sentence
+/// has to say which of the two the run is looking at.
+fn rejected(what: &str, status: u16, with_token: bool) -> String {
+    if with_token {
+        return format!(
+            "GitHub refused the token for {what} (HTTP {status}). \
+             A fine-grained token reaches only the repositories it was granted on, so \
+             for a repository you do not control store a classic token: 'public_repo' \
+             reads public repositories, including their artifact downloads, and 'repo' \
+             adds the private ones. Run 'saishin --login' to replace it."
+        );
+    }
     format!(
-        "GitHub refused the token for {what} (HTTP {status}). \
-         A fine-grained token reaches only the repositories it was granted on, so \
-         for a repository you do not control store a classic token with the 'repo' \
-         scope: it reads public repositories, and GitHub's artifact downloads need \
-         a token at all. Run 'saishin --login' to replace it."
+        "GitHub refused the call for {what} (HTTP {status}) - and no token was sent, \
+         so the call was an anonymous one. A public repository answers 60 of those an \
+         hour, per machine, and GitHub's answer for an allowance that has run out is \
+         403: this is the allowance, not the repository. Run 'saishin-cli --login' \
+         with a classic token, which is answered 5000 calls an hour; 'public_repo' is \
+         the scope that reads public repositories and their build downloads."
     )
 }
 
@@ -296,7 +307,11 @@ async fn get_release_page(
         .await
         .map_err(|ex| match &ex {
             AppError::Download { status, .. } if *status == 401 || *status == 403 => {
-                AppError::Auth(rejected(&format!("{}/{}", source.owner, source.repo), *status))
+                AppError::Auth(rejected(
+                    &format!("{}/{}", source.owner, source.repo),
+                    *status,
+                    token.is_some(),
+                ))
             }
             _ => ex,
         })?;
@@ -355,7 +370,7 @@ async fn get_run_page(http: &Downloader, url: &str, token: Option<&str>) -> Resu
         .await
         .map_err(|ex| match &ex {
             AppError::Download { status, .. } if *status == 401 || *status == 403 => {
-                AppError::Auth(rejected(&repository_of(url), *status))
+                AppError::Auth(rejected(&repository_of(url), *status, token.is_some()))
             }
             _ => ex,
         })?;
@@ -397,7 +412,11 @@ pub async fn get_artifacts(
         let url = format!("{}?per_page={per_page}&page={page}", run.artifacts_url);
         let body = api_get(http, &url, token).await.map_err(|ex| match &ex {
             AppError::Download { status, .. } if *status == 401 || *status == 403 => {
-                AppError::Auth(rejected(&repository_of(&run.artifacts_url), *status))
+                AppError::Auth(rejected(
+                    &repository_of(&run.artifacts_url),
+                    *status,
+                    token.is_some(),
+                ))
             }
             _ => ex,
         })?;
@@ -471,8 +490,9 @@ pub async fn check_repository_access(
             Err(AppError::Auth(format!(
                 "The token cannot read {}/{} (HTTP {status}). \
                  A fine-grained token reaches only the repositories it was granted \
-                 on, so give it this repository, or store a classic token with the \
-                 'repo' scope, and confirm your account can see the repository.",
+                 on, so give it this repository, or store a classic token - \
+                 'public_repo' reads public repositories, 'repo' reads private ones \
+                 - and confirm your account can see the repository.",
                 source.owner, source.repo
             )))
         }
@@ -621,13 +641,25 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_names_the_token_shape_that_reaches_the_repository() {
-        let words = rejected("vpinball/vpinball", 403);
+    fn a_refusal_with_a_token_names_the_token_shape_that_reaches_the_repository() {
+        let words = rejected("vpinball/vpinball", 403, true);
         assert!(words.contains("vpinball/vpinball"));
         assert!(words.contains("403"));
         assert!(words.contains("fine-grained"));
-        assert!(words.contains("classic token with the 'repo' scope"));
+        assert!(words.contains("'public_repo'"));
         assert!(words.contains("--login"));
+    }
+
+    #[test]
+    fn a_refusal_without_a_token_says_so_and_names_the_allowance() {
+        // A run with no token has no token to blame, and 403 is also GitHub's
+        // answer for an anonymous allowance that has run out: a sentence about a
+        // broken token would send the reader off to make a second one.
+        let words = rejected("vpinball/vpinball", 403, false);
+        assert!(words.contains("no token was sent"));
+        assert!(words.contains("60 of those an hour"));
+        assert!(words.contains("5000 calls an hour"));
+        assert!(!words.contains("fine-grained"));
     }
 
     #[test]
