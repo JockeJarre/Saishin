@@ -321,36 +321,97 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
         // The window opens with the sources not yet asked. The asking happens on
         // the window's worker thread, and the lines it logs are the progress: the
         // strip shows a source as soon as it answers, which is the tell that a
-        // run of several seconds is doing something.
-        updated.extend(gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone())?);
+        // run of several seconds is doing something. The window is the report; the
+        // names it returns are the run's answer to nobody but itself.
+        gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone())?;
     } else {
+        // A source that refuses to answer is not the end of a headless run. The
+        // sources that answer get their downloads, and the refusals are gathered
+        // and told at the end, where the reader of a scheduled job's log sees them
+        // after the work. The exit code is the first refusal's.
+        let mut failures: Vec<SourceFailure> = Vec::new();
+        let mut code = 0;
         for source in &selected {
-            let names = run_source(source, &config, &http, token.as_deref(), options).await?;
-            updated.extend(names.into_iter().map(|name| format!("{}: {name}", source.name)));
+            match run_source(source, &config, &http, token.as_deref(), options).await {
+                Ok(_) => {}
+                Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+                Err(ex) => {
+                    if code == 0 {
+                        code = ex.exit_code();
+                    }
+                    failures.push(SourceFailure {
+                        name: source.name.clone(),
+                        reason: ex.to_string(),
+                    });
+                }
+            }
+        }
+        if !failures.is_empty() {
+            report_sources(selected.len() - failures.len(), selected.len(), &failures);
+            return Ok(code);
         }
     }
 
-    if config.notify && !updated.is_empty() {
-        notifier::send("saishin", &updated.join(", "));
-    }
-    if !config.sound.is_empty() && !updated.is_empty() {
-        notifier::play_sound(&config.sound, &config.sound_player);
-    }
-
     Ok(0)
+}
+
+/// One source the run could not ask, with the words that say why. A run of
+/// several sources is not stopped by one of them being refused: the sources that
+/// answered get their rows and their downloads, and the refusals are the last
+/// lines, which is the answer to the question a run with one is really asking.
+pub(crate) struct SourceFailure {
+    pub(crate) name: String,
+    pub(crate) reason: String,
+}
+
+/// "2 of 3 sources answered" when a source was refused, nothing when all of them
+/// answered. A run where every source answered needs no count: its rows are the
+/// report.
+pub(crate) fn sources_note(answered: usize, total: usize) -> Option<String> {
+    if answered >= total {
+        None
+    } else {
+        Some(format!("{answered} of {total} sources answered"))
+    }
+}
+
+/// The tail of a check that met a refusal: how many sources answered, and then
+/// each source that did not, with its reason. The order is the point - the
+/// sources that worked are above, already told as their own blocks, and what is
+/// broken is the last thing a reader sees, where it is the thing to act on.
+fn report_sources(answered: usize, total: usize, failures: &[SourceFailure]) {
+    if let Some(note) = sources_note(answered, total) {
+        log::info(&format!("{note}."));
+    }
+    for failure in failures {
+        log::error(&format!("[{}] {}", failure.name, failure.reason));
+    }
 }
 
 /// What a front end asks the sources for: the files that are new, and the
 /// versions each group offers. Called from the window's worker thread, after the
 /// window is on screen, so the lines this logs are the progress a user reads in
 /// the window's strip.
+///
+/// One source being refused is reported, not propagated: the sources that
+/// answered are the part of the run a user can act on, and a run that stops at
+/// the first refusal shows only that refusal. The refusals come back with the
+/// rows, and the caller says so in its heading. A cancel is not a refusal, and
+/// goes back as an error, because the whole run is being stopped.
 pub(crate) async fn collect_new(
     selected: &[SourceConfig],
     config: &AppConfig,
     http: &Downloader,
     token: Option<&str>,
     options: &Options,
-) -> Result<(Vec<PendingFile>, HashMap<(String, String), Vec<PendingFile>>), AppError> {
+) -> Result<
+    (
+        Vec<PendingFile>,
+        HashMap<(String, String), Vec<PendingFile>>,
+        Vec<SourceFailure>,
+    ),
+    AppError,
+> {
     let per_source = join_all(
         selected
             .iter()
@@ -358,24 +419,33 @@ pub(crate) async fn collect_new(
     )
     .await;
     let mut pending: Vec<PendingFile> = Vec::new();
+    let mut failures: Vec<SourceFailure> = Vec::new();
     for (source, result) in selected.iter().zip(per_source) {
-        let (files, summary) = result?;
-        log::info(&format!("[{}]", source.name));
-        match source.kind {
-            SourceKind::GitHub => log::detail(&format!(
-                "github {}/{}, tag '{}'",
-                source.owner, source.repo, source.tag
-            )),
-            SourceKind::Actions => log::detail(&format!(
-                "actions {}/{}, workflow '{}'",
-                source.owner, source.repo, source.workflow
-            )),
-            SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+        match result {
+            Ok((files, summary)) => {
+                log::info(&format!("[{}]", source.name));
+                match source.kind {
+                    SourceKind::GitHub => log::detail(&format!(
+                        "github {}/{}, tag '{}'",
+                        source.owner, source.repo, source.tag
+                    )),
+                    SourceKind::Actions => log::detail(&format!(
+                        "actions {}/{}, workflow '{}'",
+                        source.owner, source.repo, source.workflow
+                    )),
+                    SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+                }
+                if !summary.is_empty() {
+                    log::detail(&summary);
+                }
+                pending.extend(files);
+            }
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(ex) => failures.push(SourceFailure {
+                name: source.name.clone(),
+                reason: ex.to_string(),
+            }),
         }
-        if !summary.is_empty() {
-            log::detail(&summary);
-        }
-        pending.extend(files);
     }
 
     let candidates: Vec<PendingFile> = pending
@@ -402,13 +472,30 @@ pub(crate) async fn collect_new(
         .collect();
 
     let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
-    for result in version_lists {
-        for group in result? {
-            versions.insert((group.source_name, group.group_key), group.versions);
+    for (source, result) in selected.iter().zip(version_lists) {
+        match result {
+            Ok(groups) => {
+                for group in groups {
+                    versions.insert((group.source_name, group.group_key), group.versions);
+                }
+            }
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(ex) => {
+                // The version list is the same source asked a second time, so a
+                // source already named above is not named twice: one source, one
+                // line saying what is wrong with it.
+                if !failures.iter().any(|failure| failure.name == source.name) {
+                    failures.push(SourceFailure {
+                        name: source.name.clone(),
+                        reason: ex.to_string(),
+                    });
+                }
+            }
         }
     }
 
-    Ok((new_entries, versions))
+    report_sources(selected.len() - failures.len(), selected.len(), &failures);
+    Ok((new_entries, versions, failures))
 }
 
 fn find_config() -> Result<String, AppError> {
@@ -492,7 +579,7 @@ async fn resolve_token(
     }
 
     if let Some(stored) = secrets::from_keyring(config) {
-        log::detail("GitHub token taken from the secure store.");
+        log::detail(&keyring_line(config));
         return Ok(Some(stored));
     }
 
@@ -521,7 +608,7 @@ async fn resolve_token(
         if notifier::ask(CAPTION, &token_box_text(&names)) {
             match login_in_a_prompt(config, config_path) {
                 Some(token) => {
-                    log::detail("GitHub token taken from the secure store.");
+                    log::detail(&keyring_line(config));
                     return Ok(Some(token));
                 }
                 None => log::warn(&without_a_token(&names)),
@@ -551,6 +638,17 @@ async fn resolve_token(
 #[cfg(windows)]
 const CAPTION: &str = "Saishin";
 
+/// The provenance line for a token read out of the credential store, with the
+/// entry it came out of. Naming the entry is the point: when the token is the
+/// wrong one, this is the line to compare with the keyring service the INI names,
+/// and 'saishin --logout' clears exactly that entry.
+fn keyring_line(config: &AppConfig) -> String {
+    format!(
+        "GitHub token taken from the secure store ({}).",
+        secrets::entry_name(config)
+    )
+}
+
 /// The sources waiting on a token, named: a window's run has several, and an ask
 /// that does not say which ones is an ask about somebody else's configuration.
 #[cfg(windows)]
@@ -578,9 +676,10 @@ fn token_box_text(names: &str) -> String {
          Make one at https://github.com/settings/tokens under \"Generate new \
          token (classic)\". Tick the 'public_repo' scope: that covers public \
          repositories, their listings and their build downloads; add 'repo' for a \
-         private repository. A fine-grained token reaches only the repositories it \
-         was granted on, and a repository you do not control cannot be granted to \
-         it.\n\n\
+         private repository. The answer to a token that cannot see one is 'Not \
+         Found', which reads like a missing file. A fine-grained token reaches \
+         only the repositories it was granted on, and a repository you do not \
+         control cannot be granted to it.\n\n\
          Yes opens a command prompt running --login: paste the token there once, \
          and this run reads it from this machine's credential store when that \
          window is closed.\n\
@@ -644,8 +743,12 @@ async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
         Ok(login) => {
             secrets::store(config, &token)?;
             log::info(&format!(
-                "Token verified for '{login}' and stored in the secure store."
+                "Token verified for '{login}' and stored in the secure store ({}).",
+                secrets::entry_name(config)
             ));
+            // The scopes are the part this check cannot see: a verified token with
+            // the wrong ones reads as a repository that does not exist.
+            log::info("The scopes live on the token: 'public_repo' reads public repositories, 'repo' private ones. A token that cannot see a private repository is answered \"Not Found\", which reads like a missing file.");
             Ok(0)
         }
         Err(AppError::Download { status: 401, .. }) | Err(AppError::Download { status: 403, .. }) => {

@@ -4,6 +4,7 @@ use crate::PendingFile;
 use crate::Options;
 use crate::config::AppConfig;
 use crate::collect_new;
+use crate::sources_note;
 use crate::config::SourceConfig;
 use crate::log::{self, Level};
 use std::time::Duration;
@@ -62,6 +63,10 @@ enum LoadState {
     Ready {
         entries: Vec<PendingFile>,
         versions: HashMap<(String, String), Vec<PendingFile>>,
+        /// "2 of 3 sources answered" when a source was refused, nothing when all
+        /// of them answered. The refusals themselves are in the strip below; this
+        /// is the heading that makes a user look at it.
+        note: Option<String>,
     },
     Failed(String),
 }
@@ -625,8 +630,10 @@ impl SelectionApp {
                 runtime.block_on(
                     async {
                         match collect_new(&job.sources, &job.config, &http, job.token.as_deref(), &job.options).await {
-                            Ok((entries, versions)) => {
-                                *load.lock().unwrap_or_else(|guard| guard.into_inner()) = LoadState::Ready { entries, versions };
+                            Ok((entries, versions, failures)) => {
+                                let total = job.sources.len();
+                                let note = sources_note(total - failures.len(), total);
+                                *load.lock().unwrap_or_else(|guard| guard.into_inner()) = LoadState::Ready { entries, versions, note };
                             }
                             Err(ex) => fail_load(&load, error_message(ex)),
                         }
@@ -912,9 +919,16 @@ impl App for SelectionApp {
                 LoadState::Working,
             );
             match taken {
-                LoadState::Ready { entries, versions } => {
+                LoadState::Ready { entries, versions, note } => {
                     self.adopt_rows(entries, versions);
-                    self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase = Phase::Selecting;
+                    let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
+                    if let Some(note) = note {
+                        // The rows are the whole story when nothing was refused,
+                        // so the heading is free to carry the part that is not a
+                        // row: a source that stayed silent has no row.
+                        progress.heading = note;
+                    }
+                    progress.phase = Phase::Selecting;
                     ctx.request_repaint();
                 }
                 LoadState::Failed(message) => {

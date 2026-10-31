@@ -16,7 +16,33 @@ const MAX_PAGES: i64 = 10;
 /// call is asked of a public repository's anonymous allowance - 60 calls an hour,
 /// per machine - and GitHub answers a passed allowance with 403, so the sentence
 /// has to say which of the two the run is looking at.
+///
+/// A 404 belongs here as well, because GitHub does not use it the way an HTTP
+/// server does: a private repository answers 404, not 403, to a caller that
+/// cannot see it, and so does a fine-grained token on a repository it was not
+/// granted on. So the answer that reads like "there is no such repository" is
+/// usually "this caller is not shown it", and saying that is the whole use of
+/// the sentence: a raw payload of `{"message": "Not Found"}` names neither the
+/// token, nor the scope, nor what to change.
 fn rejected(what: &str, status: u16, with_token: bool) -> String {
+    if status == 404 {
+        if with_token {
+            return format!(
+                "GitHub answered 404 for {what}, and that is what a repository answers to a \
+                 token it does not show: the token sent cannot read {what}. A classic token \
+                 needs the 'repo' scope to read a private repository ('public_repo' reads \
+                 public repositories only), and a fine-grained one is granted on the \
+                 repositories its owner picked. Run 'saishin --login' with a token of an \
+                 account that can see {what}, with 'repo' ticked for a private repository."
+            );
+        }
+        return format!(
+            "GitHub answered 404 for {what}, and no token was sent: a repository that is not \
+             public answers 404 to an anonymous call, so this is a reach, not a missing file. \
+             Run 'saishin-cli --login' with a classic token that can see {what} - 'repo' \
+             covers a private repository, 'public_repo' is enough for a public one."
+        );
+    }
     if with_token {
         return format!(
             "GitHub refused the token for {what} (HTTP {status}). \
@@ -94,11 +120,11 @@ fn anonymous_note(repository: &str) -> String {
     )
 }
 
-/// The answers that are about a token's reach: 401 and 403. GitHub's 404 for a
-/// repository that is not there, its 422, and a transport failure are not, and a
-/// call with no token can make none of those better.
+/// The answers that are about a token's reach: 401, 403, and the 404 GitHub
+/// gives for a repository the caller is not shown. A 422 and a transport
+/// failure are not, and a call with no token can make none of those better.
 fn was_refused(answer: &Result<String, AppError>) -> bool {
-    matches!(answer, Err(AppError::Download { status: 401 | 403, .. }))
+    matches!(answer, Err(AppError::Download { status: 401 | 403 | 404, .. }))
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +332,7 @@ async fn get_release_page(
     let body = api_get(http, &url, token)
         .await
         .map_err(|ex| match &ex {
-            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
                 AppError::Auth(rejected(
                     &format!("{}/{}", source.owner, source.repo),
                     *status,
@@ -369,7 +395,7 @@ async fn get_run_page(http: &Downloader, url: &str, token: Option<&str>) -> Resu
     let body = api_get(http, url, token)
         .await
         .map_err(|ex| match &ex {
-            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
                 AppError::Auth(rejected(&repository_of(url), *status, token.is_some()))
             }
             _ => ex,
@@ -411,7 +437,7 @@ pub async fn get_artifacts(
     for page in 1.. {
         let url = format!("{}?per_page={per_page}&page={page}", run.artifacts_url);
         let body = api_get(http, &url, token).await.map_err(|ex| match &ex {
-            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
                 AppError::Auth(rejected(
                     &repository_of(&run.artifacts_url),
                     *status,
@@ -616,10 +642,13 @@ mod tests {
         let refused = |status: u16| Err(AppError::Download { status, message: String::new() });
         assert!(was_refused(&refused(401)));
         assert!(was_refused(&refused(403)));
-        // A repository that is not there, a query GitHub will not take, a rate
-        // limit, and a call that never arrived are not a token's reach, and an
-        // anonymous call improves none of them.
-        assert!(!was_refused(&refused(404)));
+        // A private repository answers 404 to a caller it is not shown to, and so
+        // does a fine-grained token on a repository it was not granted on, so a 404
+        // is worth asking anonymously: the listing of a public repository answers
+        // there, which is the case a fine-grained token's 404 hides.
+        assert!(was_refused(&refused(404)));
+        // A query GitHub will not take, a rate limit, and a call that never
+        // arrived are not a token's reach, and an anonymous call improves none.
         assert!(!was_refused(&refused(422)));
         assert!(!was_refused(&refused(429)));
         assert!(!was_refused(&refused(0)));
@@ -660,6 +689,33 @@ mod tests {
         assert!(words.contains("60 of those an hour"));
         assert!(words.contains("5000 calls an hour"));
         assert!(!words.contains("fine-grained"));
+    }
+
+    #[test]
+    fn a_404_with_a_token_names_the_scope_that_makes_a_repository_visible() {
+        // GitHub's payload for this says only "Not Found", which is how a private
+        // repository answers a token it does not show: the sentence has to name
+        // what changes the answer, because a payload of one word sends a reader
+        // to check the URL of a source that was never wrong.
+        let words = rejected("JockeJarre/Saishin", 404, true);
+        assert!(words.contains("404"));
+        assert!(words.contains("JockeJarre/Saishin"));
+        assert!(words.contains("'repo'"));
+        assert!(words.contains("private repository"));
+        assert!(words.contains("fine-grained"));
+        assert!(words.contains("--login"));
+        // Not the 403 sentence: a 404 is not a spent allowance.
+        assert!(!words.contains("60 of those an hour"));
+    }
+
+    #[test]
+    fn a_404_without_a_token_calls_it_a_reach_and_not_a_missing_file() {
+        let words = rejected("JockeJarre/Saishin", 404, false);
+        assert!(words.contains("no token was sent"));
+        assert!(words.contains("404"));
+        assert!(words.contains("'repo'"));
+        assert!(words.contains("--login"));
+        assert!(!words.contains("60 of those an hour"));
     }
 
     #[test]

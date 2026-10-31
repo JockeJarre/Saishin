@@ -324,6 +324,26 @@ The token is never written to the INI file, never logged, and never included in 
 `.part` file. If you prefer not to use the keyring at all, export `GITHUB_TOKEN`
 from your scheduler and `--login` becomes unnecessary.
 
+### When a private repository answers 404
+
+A caller who cannot see a private repository is not told the repository exists:
+GitHub answers `404 Not Found`, the same words as for a file that is not there.
+The run repeats those words and adds who was asked, which is the part that says
+what to change.
+
+| Answer | Who was asked | What to do |
+| --- | --- | --- |
+| `404` with a token | The token cannot read that repository: no `repo` scope, a fine-grained token without a grant on it, or the token's account is not a collaborator. | Widen the classic token to `repo`, grant the repository to the fine-grained one, or use an account that has access. |
+| `404` without a token | Anonymous calls cannot see private repositories at all. | Store a token with `saishin --login`. |
+| `403` with a token | The token's account is not a collaborator. | Invite the account, and `--login` with its token. |
+| `403` without a token | The machine's anonymous allowance, 60 calls an hour, is spent. | Store a token: it raises the allowance to 5000 calls an hour. |
+
+The scope names are the ones on GitHub's token form. A classic token reads public
+repositories with `public_repo` and needs `repo` for a private one. A fine-grained
+token reaches only the repositories it was granted on, and a repository you do not
+control cannot be granted to it — which is why a personal classic token is what
+works for somebody else's private repository.
+
 ---
 
 ## Scheduled runs
@@ -732,6 +752,14 @@ parallel while the list is being built. CLI runs never make them.
 
 Use these in scheduler error handling to tell a broken config apart from a network
 outage or an expired credential.
+
+A headless run that one source refuses is not stopped by it. The sources that
+answered get their downloads, the refusals are the last lines of the output
+("2 of 3 sources answered." and then each source with its reason), and the exit
+code is the first refusal's: `2` for a listing GitHub refused, `1` for a source
+whose configuration is bad, `3` for a token that cannot be used. A window run
+reports the same refusals in its heading, "2 of 3 sources answered", and in the
+red lines of its strip.
 
 Downloads are written to a `.part` file and moved into place only after the
 transfer completes, so an interrupted run never leaves a truncated file that a
