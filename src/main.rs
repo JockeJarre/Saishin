@@ -15,12 +15,27 @@ use downloader::{format_bytes, Downloader};
 use error::AppError;
 use futures_util::future::join_all;
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, UNIX_EPOCH};
 
 const GENERATION_GAP_HOURS: i64 = 6;
+
+/// Build identity stamped by build.rs: the version from Cargo.toml, the
+/// commit, the target triple and the profile. Cargo.toml is the only place
+/// a version is ever written.
+const BUILD_VERSION: &str = env!("SAISHIN_VERSION");
+const BUILD_GIT: &str = env!("SAISHIN_GIT");
+const BUILD_TARGET: &str = env!("SAISHIN_TARGET");
+const BUILD_PROFILE: &str = env!("SAISHIN_PROFILE");
+
+/// One line for `-V`, and the tail of `--help`.
+fn version_string() -> String {
+    format!("saishin {BUILD_VERSION} ({BUILD_GIT}, {BUILD_TARGET}, {BUILD_PROFILE})")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFile {
@@ -62,8 +77,11 @@ struct Options {
     login: bool,
     logout: bool,
     show_help: bool,
+    show_version: bool,
     quiet: bool,
-    gui: bool,
+    /// GUI override for `[general] gui`: `Some(true)` from `--gui`, `Some(false)`
+    /// from `--no-gui`, `None` (no flag given) follows the config.
+    gui: Option<bool>,
 }
 
 impl Options {
@@ -73,13 +91,15 @@ impl Options {
         while i < args.len() {
             match args[i].as_str() {
                 "-h" | "--help" => options.show_help = true,
+                "-V" | "--version" => options.show_version = true,
                 "--dry-run" => options.dry_run = true,
                 "-f" | "--force" => options.force = true,
                 "--non-interactive" => options.non_interactive = true,
                 "--login" => options.login = true,
                 "--logout" => options.logout = true,
                 "-q" | "--quiet" => options.quiet = true,
-                "--gui" => options.gui = true,
+                "--gui" => options.gui = Some(true),
+                "--no-gui" => options.gui = Some(false),
                 "-c" | "--config" => {
                     options.config_path = Some(next_value(args, &mut i)?);
                 }
@@ -132,7 +152,15 @@ fn run() -> i32 {
         return 0;
     }
 
+    if options.show_version {
+        println!("{}", version_string());
+        return 0;
+    }
+
     log::set_quiet(options.quiet);
+    // The icon's launcher reads this run's text and boxes what it catches, so
+    // the run's lines are not for it: they stay unprinted, the problems do not.
+    log::set_launcher_report(std::env::var_os("SAISHIN_LAUNCHER").is_some());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -160,11 +188,97 @@ async fn async_main(options: &Options) -> i32 {
     match async_main_inner(options).await {
         Ok(code) => code,
         Err(ex) => {
-            log::error(&ex.to_string());
+            let message = ex.to_string();
+            log::error(&message);
+            // The window was going to show this and is not on screen to: give
+            // the words to the box, which is the launcher's making.
+            log::print_before_the_launcher(&message);
+            // The box is the system's own, so saying this costs no child process;
+            // it is a Windows thing, and the paths that end here on another
+            // platform have a console, a log, or the window to read the words in.
+            #[cfg(windows)]
+            if box_is_the_report() {
+                notifier::alert("Saishin", &message);
+            }
             ex.exit_code()
         }
     }
 }
+
+/// Whether a box is the only way this run can report a failure. The GUI took the
+/// report into a window and released the console, so nothing was printed; a
+/// console created for this process alone, which is what launching the exe from
+/// a shortcut gives, closes with it and hides the text. A terminal has a process
+/// of its own on the console and keeps the text, and a service has no console
+/// and writes to a log: neither wants a box.
+#[cfg(windows)]
+fn box_is_the_report() -> bool {
+    // A launcher running in front of this program (saishin.exe, the icon's
+    // target) reads the text we print and draws the box, so drawing one here
+    // too would report the same failure twice.
+    let launcher_reports = std::env::var_os("SAISHIN_LAUNCHER").is_some();
+    !launcher_reports && (!log::is_console_output() || console_is_ours())
+}
+
+#[cfg(windows)]
+fn console_is_ours() -> bool {
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, size: u32) -> u32;
+    }
+    let mut processes = [0u32; 8];
+    // Zero when there is no console attached, one for a console of our own.
+    let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+    attached == 1
+}
+
+/// Whether a prompt asked of this process can be seen and answered: standard
+/// input is a console's, and a console is attached to answer it. A launcher's
+/// pipes are not standard input's console, and the run the launcher starts has
+/// no console at all - the standard handle is then a null one, and Windows calls
+/// a null handle a character device, which is why asking standard input alone
+/// says "console" where there is none to read the words or type keys into.
+#[cfg(windows)]
+fn a_console_can_answer() -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, size: u32) -> u32;
+    }
+    let mut processes = [0u32; 8];
+    // Zero when there is no console attached at all.
+    let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+    attached > 0
+}
+
+/// Which front end runs. The command line wins: `--gui` opens the window even
+/// when the config says headless, `--no-gui` is the escape hatch for a config
+/// with `gui = true` (a scheduled task, a script). Without a flag, `[general]
+/// gui` decides.
+fn use_gui(options: &Options, config: &AppConfig) -> bool {
+    options.gui.unwrap_or(config.gui)
+}
+
+/// Give back a console that launching the exe from a shortcut created on its
+/// own. A terminal that started this process keeps its text, and a console
+/// attached to a parent is not ours to close.
+#[cfg(windows)]
+fn detach_console() {
+    // Kernel32 is already linked by the windowing stack.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FreeConsole() -> i32;
+    }
+    // Safety: a GUI run prints nothing after this point.
+    unsafe { FreeConsole() };
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}
 
 async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     let config_path = match &options.config_path {
@@ -185,92 +299,211 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     }
 
     let selected = select_sources(&config, options)?;
-    let token = resolve_token(&config, &selected, &http, options).await?;
 
-    let mut updated: Vec<String> = Vec::new();
-    if options.gui {
-        let per_source = join_all(
-            selected
-                .iter()
-                .map(|source| collect_pending(source, &config, &http, token.as_deref())),
-        )
-        .await;
-        let mut pending: Vec<PendingFile> = Vec::new();
-        for (source, result) in selected.iter().zip(per_source) {
-            let (files, summary) = result?;
-            log::info(&format!("[{}]", source.name));
-            match source.kind {
-                SourceKind::GitHub => log::detail(&format!(
-                    "github {}/{}, tag '{}'",
-                    source.owner, source.repo, source.tag
-                )),
-                SourceKind::Actions => log::detail(&format!(
-                    "actions {}/{}, workflow '{}'",
-                    source.owner, source.repo, source.workflow
-                )),
-                SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
-            }
-            if !summary.is_empty() {
-                log::detail(&summary);
-            }
-            pending.extend(files);
-        }
+    // Decided here, before the token is looked up: a run that opens the window
+    // prints no stream of text, and the token's provenance is part of that
+    // stream. The switch closes the warnings and the errors too - the strip
+    // shows them, and a launcher boxes whatever its pipes catch, which is how a
+    // run of extract warnings ended up in a box after its window closed.
+    if use_gui(options, &config) {
+        log::window_is_the_report();
+    }
 
-        let candidates: Vec<PendingFile> = pending
-            .into_iter()
-            .filter(|file| !file.file_name.is_empty())
-            .collect();
-        let (flags, version_lists) = tokio::join!(
-            join_all(
-                candidates
-                    .iter()
-                    .map(|file| is_new_artifact(&http, file, token.as_deref(), options.force)),
-            ),
-            join_all(
-                selected
-                    .iter()
-                    .map(|source| collect_versions(source, &config, &http, token.as_deref())),
-            )
-        );
-        let new_entries: Vec<PendingFile> = candidates
-            .into_iter()
-            .zip(flags)
-            .filter(|(_, is_new)| *is_new)
-            .map(|(file, _)| file)
-            .collect();
+    let token = resolve_token(&config, Path::new(&config_path), &selected, &http, options).await?;
 
-        let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
-        for result in version_lists {
-            for group in result? {
-                versions.insert((group.source_name, group.group_key), group.versions);
-            }
-        }
-
-        updated.extend(gui::run_gui(new_entries, versions, selected.clone(), config.clone(), token.clone(), options.clone())?);
+    if use_gui(options, &config) {
+        // The stream is already off (decided above, before the token). Here the
+        // problems go too: the console is released just below, and text in the
+        // console a double-click created is what keeps that window standing.
+        log::set_console_output(false);
+        detach_console();
+        // The window opens with the sources not yet asked. The asking happens on
+        // the window's worker thread, and the lines it logs are the progress: the
+        // strip shows a source as soon as it answers, which is the tell that a
+        // run of several seconds is doing something. The window is the report; the
+        // names it returns are the run's answer to nobody but itself.
+        gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone())?;
     } else {
+        // A source that refuses to answer is not the end of a headless run. The
+        // sources that answer get their downloads, and the refusals are gathered
+        // and told at the end, where the reader of a scheduled job's log sees them
+        // after the work. The exit code is the first refusal's.
+        let mut failures: Vec<SourceFailure> = Vec::new();
+        let mut code = 0;
         for source in &selected {
-            let names = run_source(source, &config, &http, token.as_deref(), options).await?;
-            updated.extend(names.into_iter().map(|name| format!("{}: {name}", source.name)));
+            match run_source(source, &config, &http, token.as_deref(), options).await {
+                Ok(_) => {}
+                Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+                Err(ex) => {
+                    if code == 0 {
+                        code = ex.exit_code();
+                    }
+                    failures.push(SourceFailure {
+                        name: source.name.clone(),
+                        reason: ex.to_string(),
+                    });
+                }
+            }
         }
-    }
-
-    if config.notify && !updated.is_empty() {
-        notifier::send("saishin", &updated.join(", "));
-    }
-    if !config.sound.is_empty() && !updated.is_empty() {
-        notifier::play_sound(&config.sound, &config.sound_player);
+        if !failures.is_empty() {
+            report_sources(selected.len() - failures.len(), selected.len(), &failures);
+            return Ok(code);
+        }
     }
 
     Ok(0)
 }
 
+/// One source the run could not ask, with the words that say why. A run of
+/// several sources is not stopped by one of them being refused: the sources that
+/// answered get their rows and their downloads, and the refusals are the last
+/// lines, which is the answer to the question a run with one is really asking.
+pub(crate) struct SourceFailure {
+    pub(crate) name: String,
+    pub(crate) reason: String,
+}
+
+/// "2 of 3 sources answered" when a source was refused, nothing when all of them
+/// answered. A run where every source answered needs no count: its rows are the
+/// report.
+pub(crate) fn sources_note(answered: usize, total: usize) -> Option<String> {
+    if answered >= total {
+        None
+    } else {
+        Some(format!("{answered} of {total} sources answered"))
+    }
+}
+
+/// The tail of a check that met a refusal: how many sources answered, and then
+/// each source that did not, with its reason. The order is the point - the
+/// sources that worked are above, already told as their own blocks, and what is
+/// broken is the last thing a reader sees, where it is the thing to act on.
+fn report_sources(answered: usize, total: usize, failures: &[SourceFailure]) {
+    if let Some(note) = sources_note(answered, total) {
+        log::info(&format!("{note}."));
+    }
+    for failure in failures {
+        log::error(&format!("[{}] {}", failure.name, failure.reason));
+    }
+}
+
+/// What a front end asks the sources for: the files that are new, and the
+/// versions each group offers. Called from the window's worker thread, after the
+/// window is on screen, so the lines this logs are the progress a user reads in
+/// the window's strip.
+///
+/// One source being refused is reported, not propagated: the sources that
+/// answered are the part of the run a user can act on, and a run that stops at
+/// the first refusal shows only that refusal. The refusals come back with the
+/// rows, and the caller says so in its heading. A cancel is not a refusal, and
+/// goes back as an error, because the whole run is being stopped.
+pub(crate) async fn collect_new(
+    selected: &[SourceConfig],
+    config: &AppConfig,
+    http: &Downloader,
+    token: Option<&str>,
+    options: &Options,
+) -> Result<
+    (
+        Vec<PendingFile>,
+        HashMap<(String, String), Vec<PendingFile>>,
+        Vec<SourceFailure>,
+    ),
+    AppError,
+> {
+    let per_source = join_all(
+        selected
+            .iter()
+            .map(|source| collect_pending(source, config, http, token)),
+    )
+    .await;
+    let mut pending: Vec<PendingFile> = Vec::new();
+    let mut failures: Vec<SourceFailure> = Vec::new();
+    for (source, result) in selected.iter().zip(per_source) {
+        match result {
+            Ok((files, summary)) => {
+                log::info(&format!("[{}]", source.name));
+                match source.kind {
+                    SourceKind::GitHub => log::detail(&format!(
+                        "github {}/{}, tag '{}'",
+                        source.owner, source.repo, source.tag
+                    )),
+                    SourceKind::Actions => log::detail(&format!(
+                        "actions {}/{}, workflow '{}'",
+                        source.owner, source.repo, source.workflow
+                    )),
+                    SourceKind::Url => log::detail(&format!("urls {}", source.urls.join(", "))),
+                }
+                if !summary.is_empty() {
+                    log::detail(&summary);
+                }
+                pending.extend(files);
+            }
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(ex) => failures.push(SourceFailure {
+                name: source.name.clone(),
+                reason: ex.to_string(),
+            }),
+        }
+    }
+
+    let candidates: Vec<PendingFile> = pending
+        .into_iter()
+        .filter(|file| !file.file_name.is_empty())
+        .collect();
+    let (flags, version_lists) = tokio::join!(
+        join_all(
+            candidates
+                .iter()
+                .map(|file| is_new_artifact(http, file, token, options.force)),
+        ),
+        join_all(
+            selected
+                .iter()
+                .map(|source| collect_versions(source, config, http, token)),
+        )
+    );
+    let new_entries: Vec<PendingFile> = candidates
+        .into_iter()
+        .zip(flags)
+        .filter(|(_, is_new)| *is_new)
+        .map(|(file, _)| file)
+        .collect();
+
+    let mut versions: HashMap<(String, String), Vec<PendingFile>> = HashMap::new();
+    for (source, result) in selected.iter().zip(version_lists) {
+        match result {
+            Ok(groups) => {
+                for group in groups {
+                    versions.insert((group.source_name, group.group_key), group.versions);
+                }
+            }
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(ex) => {
+                // The version list is the same source asked a second time, so a
+                // source already named above is not named twice: one source, one
+                // line saying what is wrong with it.
+                if !failures.iter().any(|failure| failure.name == source.name) {
+                    failures.push(SourceFailure {
+                        name: source.name.clone(),
+                        reason: ex.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    report_sources(selected.len() - failures.len(), selected.len(), &failures);
+    Ok((new_entries, versions, failures))
+}
+
 fn find_config() -> Result<String, AppError> {
     let current = std::env::current_dir()
-        .map(|dir| dir.join("config.ini").to_string_lossy().to_string())
-        .unwrap_or_else(|_| "config.ini".to_string());
+        .map(|dir| dir.join("saishin.ini").to_string_lossy().to_string())
+        .unwrap_or_else(|_| "saishin.ini".to_string());
     let beside_exe = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("config.ini").to_string_lossy().to_string()));
+        .and_then(|exe| exe.parent().map(|dir| dir.join("saishin.ini").to_string_lossy().to_string()));
     let mut candidates = vec![current];
     if let Some(path) = beside_exe {
         candidates.push(path);
@@ -281,7 +514,7 @@ fn find_config() -> Result<String, AppError> {
         }
     }
     Err(AppError::Config(
-        "No config.ini found. Pass one with --config <path>.".to_string(),
+        "No saishin.ini found. Pass one with --config <path>.".to_string(),
     ))
 }
 
@@ -322,6 +555,7 @@ fn select_sources(config: &AppConfig, options: &Options) -> Result<Vec<SourceCon
 
 async fn resolve_token(
     config: &AppConfig,
+    config_path: &Path,
     selected: &[SourceConfig],
     http: &Downloader,
     options: &Options,
@@ -344,7 +578,7 @@ async fn resolve_token(
     }
 
     if let Some(stored) = secrets::from_keyring(config) {
-        log::detail("GitHub token taken from the secure store.");
+        log::detail(&keyring_line(config));
         return Ok(Some(stored));
     }
 
@@ -362,6 +596,28 @@ async fn resolve_token(
         ));
     }
 
+    // A window run has no console to type a token into, and the prompt below is a
+    // console's: a double-click has none, and the words would be written where no
+    // one can read them and the run would wait for keys that cannot arrive. So the
+    // window asks in a box, and the prompt is opened where it can be answered. A
+    // window started from a terminal keeps the prompt it has.
+    #[cfg(windows)]
+    if use_gui(options, config) && !a_console_can_answer() {
+        let names = waiting_names(&github_sources, &actions_sources);
+        if notifier::ask(CAPTION, &token_box_text(&names)) {
+            match login_in_a_prompt(config, config_path) {
+                Some(token) => {
+                    log::detail(&keyring_line(config));
+                    return Ok(Some(token));
+                }
+                None => log::warn(&without_a_token(&names)),
+            }
+        } else {
+            log::info(&without_a_token(&names));
+        }
+        return Ok(None);
+    }
+
     log::info("This source needs a GitHub account (private repository or authenticated action builds).");
     let token = secrets::prompt_for_token()?;
 
@@ -377,14 +633,121 @@ async fn resolve_token(
     Ok(Some(token))
 }
 
+/// The caption every box of this program is under.
+#[cfg(windows)]
+const CAPTION: &str = "Saishin";
+
+/// The provenance line for a token read out of the credential store, with the
+/// entry it came out of. Naming the entry is the point: when the token is the
+/// wrong one, this is the line to compare with the keyring service the INI names,
+/// and 'saishin --logout' clears exactly that entry.
+fn keyring_line(config: &AppConfig) -> String {
+    format!(
+        "GitHub token taken from the secure store ({}).",
+        secrets::entry_name(config)
+    )
+}
+
+/// The sources waiting on a token, named: a window's run has several, and an ask
+/// that does not say which ones is an ask about somebody else's configuration.
+#[cfg(windows)]
+fn waiting_names(sources: &[&SourceConfig], extra: &[&SourceConfig]) -> String {
+    let mut names: Vec<&str> = sources
+        .iter()
+        .filter(|source| source.private)
+        .map(|source| source.name.as_str())
+        .collect();
+    names.extend(extra.iter().map(|source| source.name.as_str()));
+    if names.is_empty() {
+        return "this source".to_string();
+    }
+    names.join(", ")
+}
+
+/// The whole ask, in the box: who is waiting, which token to make, where, and
+/// what the two answers do. The window has no strip yet at this point - the
+/// window opens after the token is settled - so the box carries all of it.
+#[cfg(windows)]
+fn token_box_text(names: &str) -> String {
+    format!(
+        "A GitHub token is needed and none is stored. The sources waiting on one \
+         are: {names}.\n\n\
+         Make one at https://github.com/settings/tokens under \"Generate new \
+         token (classic)\". Tick the 'public_repo' scope: that covers public \
+         repositories, their listings and their build downloads; add 'repo' for a \
+         private repository. The answer to a token that cannot see one is 'Not \
+         Found', which reads like a missing file. A fine-grained token reaches \
+         only the repositories it was granted on, and a repository you do not \
+         control cannot be granted to it.\n\n\
+         Yes opens a command prompt running --login: paste the token there once, \
+         and this run reads it from this machine's credential store when that \
+         window is closed.\n\
+         No runs on without a token: {}",
+        anonymous_tail(names)
+    )
+}
+
+/// What a run without a token is good for: the listings of a public repository
+/// are public data, a build download is not.
+#[cfg(windows)]
+fn anonymous_tail(names: &str) -> String {
+    format!(
+        "the public listings of {names} are read anonymously (60 calls an hour), \
+         and their downloads are refused."
+    )
+}
+
+/// The line for the strip when the run goes on without a token, in answer to the
+/// box or after a prompt window that stored nothing.
+#[cfg(windows)]
+fn without_a_token(names: &str) -> String {
+    format!("Running without a token: {}", anonymous_tail(names))
+}
+
+/// `--login` in a command prompt of its own, for a window run with no console to
+/// prompt in. `cmd /k`, so the window keeps the words after the run and the paste
+/// can be read back; this run waits for that window to close, and the store has
+/// the token by then. The exe is this one at its own path, quoted: it sits in
+/// `C:\Program Files\...` as often as not, and `--config` rides along, because
+/// the store entry is named after the keyring service in that file.
+#[cfg(windows)]
+fn login_in_a_prompt(config: &AppConfig, config_path: &Path) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // A console the prompt window owns by itself: this run has none to hand out,
+    // and a window with no console of its own is a window nobody can type into.
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let exe = std::env::current_exe().ok()?;
+    let line = format!(
+        "\"{}\" --login --config \"{}\"",
+        exe.display(),
+        config_path.display()
+    );
+    if std::process::Command::new("cmd.exe")
+        .arg("/k")
+        .arg(line)
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .status()
+        .is_err()
+    {
+        log::warn("No command prompt could be opened, so the token cannot be entered.");
+        return None;
+    }
+    secrets::from_keyring(config)
+}
+
 async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
     let token = secrets::prompt_for_token()?;
     match github::validate_token(http, config, &token).await {
         Ok(login) => {
             secrets::store(config, &token)?;
             log::info(&format!(
-                "Token verified for '{login}' and stored in the secure store."
+                "Token verified for '{login}' and stored in the secure store ({}).",
+                secrets::entry_name(config)
             ));
+            // The scopes are the part this check cannot see: a verified token with
+            // the wrong ones reads as a repository that does not exist.
+            log::info("The scopes live on the token: 'public_repo' reads public repositories, 'repo' private ones. A token that cannot see a private repository is answered \"Not Found\", which reads like a missing file.");
             Ok(0)
         }
         Err(AppError::Download { status: 401, .. }) | Err(AppError::Download { status: 403, .. }) => {
@@ -395,8 +758,17 @@ async fn login(config: &AppConfig, http: &Downloader) -> Result<i32, AppError> {
     }
 }
 
+/// What a row is doing. A download and an unzip look the same from the outside,
+/// a row busy for several seconds, and they are not the same thing to wait for,
+/// so the window draws them apart.
+enum WorkState {
+    Downloading,
+    Extracting,
+    Done,
+}
+
 trait ProgressSink {
-    fn report(&self, _file: &PendingFile, _started: bool) {}
+    fn report(&self, _file: &PendingFile, _state: WorkState) {}
 }
 
 struct NullSink {}
@@ -748,7 +1120,7 @@ async fn download_pending(
             continue;
         }
 
-        report.report(file, true);
+        report.report(file, WorkState::Downloading);
         log::info(&format!(
             "Downloading {} of {}: {name}",
             index + 1,
@@ -765,7 +1137,9 @@ async fn download_pending(
                 return Err(AppError::Auth(format!(
                     "[{}] the server returned {status} for {name}. \
                      If the repository is private or the build is account-gated, run 'saishin --login' \
-                     and make sure the token has the 'repo' scope.",
+                     and make sure the token reaches this repository: a fine-grained token covers only \
+                     the repositories it was granted on, so a repository you do not control needs a \
+                     classic token with the 'repo' scope.",
                     source.name
                 )));
             }
@@ -811,6 +1185,9 @@ async fn download_pending(
             if let Some(extract) = &source.extract {
                 if zip_handler::is_archive(&name) {
                     log::detail(&format!("extracting into {}", extract.destination));
+                    // Unzipping a big archive is the longer half of the wait, so
+                    // the row says so while it runs.
+                    report.report(file, WorkState::Extracting);
                     zip_handler::extract(&destination, extract, options.force)?;
                     if !extract.keep_zip {
                         let _ = std::fs::remove_file(&destination);
@@ -820,7 +1197,14 @@ async fn download_pending(
             }
         }
 
-        report.report(file, false);
+        // A transfer **Cancel** stopped comes back from the download like a file
+        // that came down, so the mark is taken from the flag and not from the
+        // return: the row a cancel stopped keeps its busy mark, which is the ring
+        // of a stopped row once the run is over, and the count keeps counting
+        // only the files that finished.
+        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            report.report(file, WorkState::Done);
+        }
     }
 
     Ok(downloaded_names)
@@ -1358,14 +1742,97 @@ mod tests {
         };
         apply_names(&source, &mut file);
         // Only the last path segment survives, and path-hostile characters
-        // become underscores. Key and file name stay in step.
-        assert_eq!(file.file_name, "game_win.zip");
+        // become underscores. Key and file name stay in step. ':' is hostile
+        // on Windows only, so it survives on unix.
+        let sanitized = if cfg!(windows) {
+            "game_win.zip"
+        } else {
+            "game:win.zip"
+        };
+        assert_eq!(file.file_name, sanitized);
         // The group key is name-only: separators normalize, case folds.
-        assert_eq!(file.group_key, "game-win.zip");
+        assert_eq!(
+            file.group_key,
+            if cfg!(windows) {
+                "game-win.zip"
+            } else {
+                "game:win.zip"
+            }
+        );
         assert_eq!(
             file.destination,
-            Path::new("out").join("game_win.zip").to_string_lossy()
+            Path::new("out").join(sanitized).to_string_lossy()
         );
+    }
+
+    #[test]
+    fn options_parse_the_version_switch() {
+        let options = Options::parse(&["-V".to_string()]).expect("parses");
+        assert!(options.show_version);
+        assert_eq!(options.gui, None);
+        assert!(Options::parse(&["--version".to_string()])
+            .expect("parses")
+            .show_version);
+    }
+
+    #[test]
+    fn the_gui_switch_is_an_option_not_a_default() {
+        assert_eq!(Options::parse(&[]).expect("parses").gui, None);
+        assert_eq!(
+            Options::parse(&["--gui".to_string()]).expect("parses").gui,
+            Some(true)
+        );
+        assert_eq!(
+            Options::parse(&["--no-gui".to_string()]).expect("parses").gui,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_config_gui_setting_is_the_default_front_end() {
+        let headless = config_with_gui_flag(false);
+        let graphical = config_with_gui_flag(true);
+        let no_flag = Options::parse(&[]).expect("parses");
+        assert!(!use_gui(&no_flag, &headless));
+        assert!(use_gui(&no_flag, &graphical));
+    }
+
+    #[test]
+    fn command_line_gui_flags_win_over_the_config() {
+        let headless = config_with_gui_flag(false);
+        let graphical = config_with_gui_flag(true);
+        assert!(use_gui(
+            &Options::parse(&["--gui".to_string()]).expect("parses"),
+            &headless
+        ));
+        assert!(!use_gui(
+            &Options::parse(&["--no-gui".to_string()]).expect("parses"),
+            &graphical
+        ));
+    }
+
+    /// A config differing only in `[general] gui`.
+    fn config_with_gui_flag(gui: bool) -> AppConfig {
+        AppConfig {
+            base_directory: String::new(),
+            default_out_dir: String::new(),
+            github_api_url: "https://api.github.com".to_string(),
+            keyring_service: "saishin".to_string(),
+            window_centered: true,
+            close_on_finish: false,
+            gui,
+            releases: 10,
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn version_string_names_the_build() {
+        let line = version_string();
+        assert!(line.starts_with("saishin "));
+        assert!(line.contains(env!("SAISHIN_VERSION")));
+        // Same shape as Cargo.toml, so a release tag can be checked against it.
+        assert_eq!(env!("SAISHIN_VERSION"), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1525,11 +1992,10 @@ mod tests {
             default_out_dir: String::new(),
             github_api_url: "https://api.github.com".to_string(),
             keyring_service: "saishin".to_string(),
-            notify: false,
             window_centered: true,
+            close_on_finish: false,
+            gui: false,
             releases: 10,
-            sound: String::new(),
-            sound_player: String::new(),
             sources: Vec::new(),
         };
         assert_eq!(github_web_base(&config), "https://github.com");
@@ -1542,14 +2008,62 @@ mod tests {
             default_out_dir: String::new(),
             github_api_url: "https://ghe.example.com/api/v3".to_string(),
             keyring_service: "saishin".to_string(),
-            notify: false,
             window_centered: true,
+            close_on_finish: false,
+            gui: false,
             releases: 10,
-            sound: String::new(),
-            sound_player: String::new(),
             sources: Vec::new(),
         };
         assert_eq!(github_web_base(&config), "https://ghe.example.com");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_token_ask_names_the_sources_waiting_on_it() {
+        let mut public = source(SourceKind::GitHub, false);
+        public.name = "flexdmd".to_string();
+        let mut private = source(SourceKind::GitHub, false);
+        private.name = "vpinball".to_string();
+        private.private = true;
+        let mut builds = source(SourceKind::Actions, false);
+        builds.name = "vpinball-builds".to_string();
+
+        // A public release source is answered without a token, so it does not ask.
+        assert_eq!(waiting_names(&[&public], &[]), "this source");
+        assert_eq!(
+            waiting_names(&[&private], &[&builds]),
+            "vpinball, vpinball-builds"
+        );
+        assert_eq!(waiting_names(&[&public], &[&builds]), "vpinball-builds");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_token_ask_carries_everything_the_window_has_to_say() {
+        // The box is up before the window is, so the box has to be the whole ask:
+        // who is waiting, which token to make, and what each answer does.
+        let text = token_box_text("vpinball-builds");
+        assert!(text.contains("vpinball-builds"));
+        assert!(text.contains("github.com/settings/tokens"));
+        assert!(text.contains("Generate new token (classic)"));
+        assert!(text.contains("public_repo"), "the measured minimum scope");
+        // The paragraph breaks are the box's layout: a wall of one line is not a
+        // thing to read in a dialog.
+        assert!(text.contains("are: vpinball-builds.\n\nMake one at"));
+        assert!(text.contains("cannot be granted to it.\n\nYes opens"));
+        assert!(text.contains("window is closed.\nNo runs on"));
+        assert!(text.contains("Yes opens a command prompt running --login"));
+        assert!(text.contains("No runs on without a token"));
+        assert!(!text.contains("ghp_"), "the box carries no token shape");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_without_a_token_says_what_it_is_good_for() {
+        let line = without_a_token("vpinball-builds");
+        assert!(line.starts_with("Running without a token: "));
+        assert!(line.contains("60 calls an hour"));
+        assert!(line.contains("downloads are refused"));
     }
 }
 
@@ -1559,10 +2073,10 @@ fn print_usage() {
 saishin - download official releases from GitHub and other sources
 
 USAGE
-  saishin [config.ini] [options]
+  saishin [saishin.ini] [options]
 
 OPTIONS
-  -c, --config <path>    Configuration file (default: ./config.ini)
+  -c, --config <path>    Configuration file (default: ./saishin.ini)
   -s, --source <name>    Run only this source (repeatable)
       --dry-run          List what would be downloaded, download nothing
   -f, --force            Re-download and overwrite even when up to date
@@ -1571,6 +2085,8 @@ OPTIONS
       --logout           Remove the stored GitHub token, then exit
   -q, --quiet            Suppress progress and informational output
       --gui              Show a selection window for new artifacts before downloading
+      --no-gui           Run headless, ignoring [general] gui
+  -V, --version          Show the version, commit and target, then exit
   -h, --help             Show this help
 
 EXIT CODES

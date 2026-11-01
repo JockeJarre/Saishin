@@ -5,24 +5,71 @@ edition = "2021"
 description = "Keep files up to date from official GitHub releases, actions or any other URL, using an INI configuration file"
 license = "MIT"
 
+# Two binaries, both declared here. autobins is off so src/main.rs is not also
+# picked up as a second binary named after the package:
+#
+#   saishin-cli   the program, src/main.rs. Console subsystem: a terminal run
+#                 prints, the shell waits for it, the exit code arrives. Scripts
+#                 and scheduled tasks call this one.
+#   saishin       the launcher, src/launcher.rs. GUI subsystem, so an icon
+#                 launch gets no console window at all, and this is the binary
+#                 that carries the icon a shortcut, Explorer and the taskbar
+#                 show. A double-click starts saishin-cli and reports its text in
+#                 a box; a typed command gets the prompt it was typed in, so
+#                 saishin.exe --login works from a terminal too.
+#
+# default-run keeps a plain cargo run on the program: the launcher answers in a
+# box, which is not what a terminal session wants.
+autobins = false
+default-run = "saishin-cli"
+
 [[bin]]
-name = "saishin"
+name = "saishin-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "saishin"
+path = "src/launcher.rs"
+
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust-ini = "0.21"
-zip = "2"
+# Only deflate/stored archives are read; that keeps bzip2, lzma, zstd and the
+# AES stack out of the build.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 rpassword = "7"
 url = "2"
 futures-util = "0.3"
-eframe = "0.37"
-egui_extras = { version = "0.37", features = ["all_loaders"] }
+# eframe's default renderer is wgpu, which drags in naga, ash, gpu-allocator
+# and friends. This app draws a grid, so the glow (OpenGL) renderer is enough.
+# system_fonts stays on: the header kanji are outside egui's bundled font, and
+# this is the feature that lets eframe ask the system for a font carrying them.
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "system_fonts",
+    "glow",
+    "x11",
+    "wayland",
+] }
+# Cargo cannot enable features of a transitive dependency, so eframe's
+# `winit/default` is re-declared here: the same list winit ships as default.
+winit = { version = "0.30", features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+    "wayland-csd-adwaita",
+] }
+
+[build-dependencies]
+# Decodes and shrinks the header logo, which src/gui.rs embeds as raw RGBA8, so
+# no image decoder is linked into the binary.
+png = "0.18"
 
 # Platform credential stores: Credential Manager on Windows, Keychain on
 # macOS, Secret Service on Linux. Without these the keyring crate silently
@@ -38,4 +85,4 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["sync-secret-service"] }
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
+embed-resource = "3"

@@ -2,50 +2,174 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
-jobs:
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # --locked fails if Cargo.lock is missing or out of date, so the
-      # committed lockfile stays the single source of truth.
-      - run: cargo test --locked --all-targets
+env:
+  CARGO_TERM_COLOR: always
 
+jobs:
   build:
     name: build (${{ matrix.os }})
     strategy:
+      # Windows is listed first: it is the platform most downloads land on,
+      # so its job should be the first to get a runner.
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            binary: saishin
           - os: windows-latest
-            binary: saishin.exe
+            # program is the binary a terminal runs; launcher is the icon's
+            # target, and only Windows has one.
+            program: saishin-cli.exe
+            launcher: saishin.exe
+            # platform and arch go into the artifact name, spelled the way the
+            # names of the release bundles are spelled.
+            platform: windows
+            arch: x64
+          - os: ubuntu-latest
+            program: saishin-cli
+            launcher: ""
+            platform: linux
+            arch: x64
           - os: macos-latest
-            binary: saishin
+            program: saishin-cli
+            launcher: ""
+            platform: macos
+            arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --locked --release
+
+      # Cargo.toml holds the version, so the artifact names match the binary's
+      # own -V output and the tags cut with scripts/release.
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          test -n "$version" || { echo "::error::No version = \"...\" in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Built saishin $version" >> "$GITHUB_STEP_SUMMARY"
+
+      # Cargo and target/ caches keyed on Cargo.lock: a push that does not
+      # change dependencies reuses the whole dependency build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: saishin-v1
+
+      # saishin.ico is generated artwork and git-ignored, so it is not in the
+      # checkout, and build.rs would embed no icon at all. Regenerate it from
+      # the masters before the build; the check below fails the run when the
+      # icon did not end up in the executable.
+      - name: Generate the Windows icon
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          python -m pip install --quiet pillow
+          python saishin-png-icon-set/make_saishin_ico.py
+
+      # keyring needs D-Bus, glow/glutin needs EGL/GLX, reqwest needs OpenSSL.
+      # winit's wayland-dlopen feature loads libwayland at runtime, so the
+      # wayland headers are not needed at build time.
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev libssl-dev pkg-config \
+            libegl1-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev
+
+      # --locked fails if Cargo.lock is missing or out of date, so the
+      # committed lockfile stays the single source of truth.
+      - name: Build
+        run: cargo build --locked --release
+
+      # The name is the whole identity of the build in one string: version from
+      # Cargo.toml, the short commit sha, the CI run number as the build number
+      # (Actions has no separate build counter; the run number is the #NN in the
+      # run list), platform and architecture. build.rs takes its sha from the
+      # same GITHUB_SHA and cuts it to the same seven characters, so the sha in
+      # the name is the sha `-V` prints. On a pull request both are the merge
+      # commit, so the two never disagree.
+      - name: Name the artifact
+        id: name
+        shell: bash
+        run: |
+          sha="${GITHUB_SHA:0:7}"
+          if [ "${#sha}" -ne 7 ]; then
+            echo "::error::GITHUB_SHA is not a commit sha: '$GITHUB_SHA'"
+            exit 1
+          fi
+          stem="saishin-${{ steps.version.outputs.version }}-${sha}-r${GITHUB_RUN_NUMBER}-${{ matrix.platform }}-${{ matrix.arch }}"
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          echo "- $stem.zip" >> "$GITHUB_STEP_SUMMARY"
+
+      # One directory holding the files. Actions zips an artifact by itself, so
+      # staging is all the packaging there is: what arrives in the browser is a
+      # single zip with the binaries and the annotated sample configuration at
+      # its root, named after the artifact, which is named after the build.
+      # Windows ships the launcher next to the program, so that an icon launch
+      # opens no console window (src/launcher.rs); elsewhere the program is all
+      # there is.
+      - name: Stage the artifact
+        shell: bash
+        env:
+          PROGRAM: ${{ matrix.program }}
+          LAUNCHER: ${{ matrix.launcher }}
+        run: |
+          mkdir dist
+          cp "target/release/$PROGRAM" dist/
+          if [ -n "$LAUNCHER" ]; then cp "target/release/$LAUNCHER" dist/; fi
+          cp saishin.ini.template dist/
+          # The staged program carries the identity build.rs stamped into it.
+          # Only the program is asked: the launcher is a GUI-subsystem binary
+          # with no console to print -V into.
+          "./dist/$PROGRAM" -V
+
+      # A missing icon is only cosmetics, so build.rs warns and continues. The
+      # promise is kept here instead: both exes that ship carry the resource.
+      # The launcher is the one Explorer, a shortcut and the taskbar show; the
+      # program gets the same icon, so a folder view shows a branded icon for
+      # it too.
+      - name: Check the embedded icon
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          ./scripts/check-icon.ps1 dist/saishin.exe
+          ./scripts/check-icon.ps1 dist/saishin-cli.exe
+
+      # The version resource is what a file's Properties window, Explorer's
+      # Version columns and an installer's "which of these two files is newer"
+      # rule read, so it is checked the way the icon is: the version from
+      # Cargo.toml, the sha build.rs takes from the same GITHUB_SHA, and a
+      # description naming which of the two shipped files the window is
+      # describing. GITHUB_RUN_NUMBER is not in the resource: a version resource
+      # compares, and the run number of a re-run is not a property of the code.
+      - name: Check the embedded version
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          ./scripts/check-version.ps1 dist/saishin.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
+          ./scripts/check-version.ps1 dist/saishin-cli.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}-${{ matrix.os }}
-          path: target/release/${{ matrix.binary }}
+          name: ${{ steps.name.outputs.stem }}
+          path: dist/*
+          if-no-files-found: error
 
   icon:
-    # The Windows executable embeds saishin-png-icon-set/saishin.ico, which is
-    # generated from the masters. Regenerate it here and fail if the
-    # committed .ico differs, so artwork changes can never be forgotten.
-    name: icon freshness
+    # The .ico is generated artwork and git-ignored, so it is never in the
+    # checkout: the Windows build job regenerates it from the masters before
+    # building. This job runs the same generator, where pillow is one pip
+    # install away, and checks that the result is the multi-size icon the
+    # executable needs, so artwork trouble is reported here in seconds instead
+    # of as a shipped binary without an icon.
+    name: icon from the masters
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,4 +178,31 @@ jobs:
           python-version: "3.x"
       - run: pip install pillow
       - run: python3 saishin-png-icon-set/make_saishin_ico.py
-      - run: git diff --exit-code -- saishin-png-icon-set/saishin.ico
+      - name: The icon holds the sizes the exe needs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import struct
+          import sys
+
+          path = "saishin-png-icon-set/saishin.ico"
+          data = open(path, "rb").read()
+          if data[:4] != b"\x00\x00\x01\x00":
+              sys.exit(f"{path} is not an ICO file")
+
+          entries = struct.unpack_from("<H", data, 4)[0]
+          sizes = []
+          for index in range(entries):
+              off = 6 + 16 * index
+              width = data[off] or 256
+              height = data[off + 1] or 256
+              payload = struct.unpack_from("<I", data, off + 8)[0]
+              if data[off + 4:off + 6] != b"\x01\x00" or payload == 0:
+                  sys.exit(f"{path}: entry {index} is not a single-plane PNG image")
+              sizes.append((width, height))
+
+          want = [(16, 16), (32, 32), (48, 48), (256, 256)]
+          print(f"{path}: {entries} entries, {sizes}")
+          if sizes != want:
+              sys.exit(f"{path} holds {sizes}, expected {want}")
+          PY

@@ -28,8 +28,17 @@ pub fn from_environment() -> Option<String> {
     None
 }
 
+/// The entry of the credential store a token lives in, in the words a person
+/// reads: the part a credential manager shows, without the crate's suffix. The
+/// INI's 'keyring_service' is what tells two configurations' entries apart, so a
+/// strip line about a token can name the one it read, and '--logout' can name the
+/// one it clears.
+pub(crate) fn entry_name(config: &AppConfig) -> String {
+    format!("{}.{TOKEN_SERVICE}", config.keyring_service)
+}
+
 fn entry(config: &AppConfig) -> Result<keyring::Entry, keyring::Error> {
-    let target = format!("{}.{TOKEN_SERVICE}/{TOKEN_USER}", config.keyring_service);
+    let target = format!("{}/{}", entry_name(config), TOKEN_USER);
     keyring::Entry::new_with_target(&target, &config.keyring_service, TOKEN_USER)
 }
 
@@ -110,7 +119,10 @@ pub fn remove(config: &AppConfig) {
 pub fn prompt_for_token() -> Result<String, AppError> {
     log::info("");
     log::info("A GitHub personal access token is required.");
-    log::info("Create one at https://github.com/settings/tokens with 'repo' scope.");
+    log::info("Create one at https://github.com/settings/tokens: 'Generate new token (classic)'.");
+    log::info("Tick 'public_repo': it reads public repositories and their build downloads.");
+    log::info("Add 'repo' for a private repository. A fine-grained token reaches only");
+    log::info("the repositories it was granted on, so it cannot read one you do not control.");
     log::info("It is stored in this machine's secure credential store and never written to disk by saishin.");
 
     if !io::stdin().is_terminal() {

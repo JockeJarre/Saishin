@@ -1,4 +1,10 @@
-# Saishin
+<div align="center">
+
+<img src="saishin_logo.png" alt="Saishin — 最新" width="340" />
+
+# Saishin — 最新
+
+</div>
 
 A small cross-platform Rust command line tool that keeps files up to date from
 official GitHub releases/actions — or from any other URL — using an INI configuration file.
@@ -16,6 +22,7 @@ including scheduled ones — reuse it without ever prompting again.
 
 - [Requirements](#requirements)
 - [Build and run](#build-and-run)
+- [Version and releases](#version-and-releases)
 - [Quick start](#quick-start)
 - [Authentication](#authentication)
 - [Scheduled runs](#scheduled-runs)
@@ -34,8 +41,24 @@ including scheduled ones — reuse it without ever prompting again.
 - [Rust toolchain](https://rustup.rs/) (stable). Install via `rustup`, then
   the `cargo` command below just works.
 
-Nothing else. There is no dependency on Windows-only APIs or on
-platform-specific tooling.
+Nothing else on Windows and macOS. There is no dependency on Windows-only APIs
+or on platform-specific tooling.
+
+On Linux, the GUI needs system libraries at build time — D-Bus for the
+keyring, OpenSSL for HTTPS, EGL/GLX for the renderer:
+
+```bash
+sudo apt-get install -y libdbus-1-dev libssl-dev pkg-config \
+  libegl1-mesa-dev libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev
+```
+
+Wayland support loads `libwayland` at runtime, so those headers are not needed.
+
+The header of the GUI spells 最新 out as text beside the logo, and the app ships
+no CJK font: eframe's system font fallback takes one from the machine. Windows
+and macOS have one, on Linux install `fonts-noto-cjk` (Debian, Ubuntu) or
+`google-noto-cjk-fonts` (Fedora). A machine without such a font gets the logo on
+its own: the word is left out of the header rather than set in boxes.
 
 ---
 
@@ -46,10 +69,10 @@ git clone <this-repo>
 cd saishin
 
 cargo build --release
-./target/release/saishin --config config.ini
+./target/release/saishin-cli --config saishin.ini
 ```
 
-During development, `cargo run -- --config config.ini` builds (debug) and runs
+During development, `cargo run -- --config saishin.ini` builds (debug) and runs
 in one step, and `cargo test` runs the test suite.
 
 To target another platform, install its target once and cross-compile:
@@ -69,10 +92,141 @@ cargo build --release --target aarch64-apple-darwin
 ```
 
 Replace the identifiers with `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`
-or `x86_64-apple-darwin` as needed. The Windows executable embeds
-`saishin-png-icon-set/saishin.ico` at build time (see `build.rs`); to
-regenerate it after artwork changes, run
-`python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow).
+or `x86_64-apple-darwin` as needed. Both Windows executables embed
+`saishin-png-icon-set/saishin.ico` (see `build.rs`). That .ico is generated
+artwork and is not in the repository, so on a fresh checkout generate it first —
+`python3 saishin-png-icon-set/make_saishin_ico.py` (needs Pillow) — otherwise
+the build warns and produces an executable without an icon. The CI jobs that
+ship a binary do generate it, and `scripts/check-icon.ps1` fails the run when
+the icon did not end up in the executable.
+
+### The two Windows files
+
+A Windows download is two executables, and the difference is only in how the run
+starts:
+
+| File | Started from | What happens |
+| --- | --- | --- |
+| `saishin.exe` | a shortcut, a double-click, the taskbar | No console window at all. It starts `saishin-cli.exe` in the same directory, reads its text, and puts that report in a message box. |
+| `saishin.exe --login` | a terminal | A command with arguments runs in the terminal it was typed in: the program's own transcript, its prompts, its exit code. |
+| `saishin-cli.exe` | a terminal, a script, Task Scheduler | Prints as usual, the shell waits for it, the exit code arrives. |
+
+`saishin.exe` exists for one Windows detail. An icon launch of a console program
+gets a console, and on a machine whose console host is Windows Terminal that is a
+terminal window for a few hundred milliseconds, titled with the exe path, before
+the GUI window opens. No call inside the process can stop the host from drawing
+it; the PE subsystem is what decides whether a console exists in the first
+place. So the launcher is marked as a GUI-subsystem binary, which is also the
+binary carrying the icon, and it is std-only, so it starts in milliseconds.
+
+Both files carry their version in their Windows properties, so a downloaded exe
+names its build without a terminal being opened: Properties, Version shows the
+file version `1.0.0` and the product version `1.0.0 (a1b2c3d-ci)` — the version
+from `Cargo.toml` and the commit the build came from, the same two `-V` prints —
+beside a description naming which of the two files the window describes. The job
+that ships the Windows files fails when an exe carries no icon, or no version of
+its own.
+
+What a run through the launcher reports:
+
+- The box is for problems. A headless run's warnings and errors become the box;
+  a run with nothing wrong says nothing, exits 0, and gets no box. A progress
+  line and a source's log are not something to read in a dialog, so under a
+  launcher they stay unprinted — a terminal run's transcript, and a script's or
+  scheduled task's log, keep every line.
+- A run that opens the GUI window prints nothing at all, warnings and errors
+  included: the window is the report, and its lines are readable in the log
+  strip at its bottom.
+- The exit code is passed through, so watching exit codes changes nothing.
+
+A command with arguments, such as `saishin.exe --login`, is a terminal run, and
+Windows gives a GUI-subsystem program no console of its own, so the launcher's
+whole job there is to find one. Attached to the prompt the command was typed in,
+the program answers in it itself: its full transcript, its token prompt, its exit
+code, exactly as `saishin-cli.exe` has always done, and the launcher adds no rule
+of its own about the words. Started where there is no prompt, a shortcut, a Run
+dialog, Task Scheduler, the command gets a console window of its own, which stays
+open after the run so its words can be read and a prompt that asks for something
+has a keyboard; when no console can be made, the box says a command prompt is
+needed and the exit code is not 0. Nothing ever waits for input nobody can see.
+
+One shell detail to know: `cmd` does not wait for a GUI-subsystem program, so its
+prompt comes back while the run is still printing; PowerShell does wait. In a
+script, call `saishin-cli.exe`: it prints, and the shell waits for it.
+
+On Linux and macOS there is no console window to avoid, so the program is all
+there is, and it is called `saishin-cli` there as well.
+
+---
+
+## Version and releases
+
+The version lives in exactly one place: `version` in `Cargo.toml`. Everything
+else is derived from it at build time by `build.rs`.
+
+```bash
+./target/release/saishin-cli --version
+saishin 1.0.0 (e88e2c3, x86_64-pc-windows-msvc, release)
+```
+
+That line names the version from `Cargo.toml`, the commit the binary was built
+from (`-dirty` for a tree with uncommitted changes, `-ci` for a CI build), the
+target triple and the profile. Nothing has to be kept in sync by hand.
+
+### Every push
+
+`.github/workflows/ci.yml` builds release binaries for Windows, Linux and
+macOS, and uploads one artifact per platform, named
+`saishin-<version>-<sha>-r<run>-<platform>-<arch>`. Downloading an artifact
+gives a zip holding the executables and `saishin.ini.template` - on Windows the
+launcher and the program, elsewhere the program alone - and the program's own
+`-V` line names the same version and sha. The artifacts are on
+the run page under **Artifacts**, which is the quickest way to get a build of a
+branch: push, open the run, download. Dependency builds are cached per
+`Cargo.lock`, so a push that changes no dependency reuses them.
+
+### Making a release
+
+1. Bump the version, commit it and tag it, in one command:
+
+   ```powershell
+   pwsh scripts/release.ps1 1.1.0
+   ```
+
+   The script refuses a dirty tree and a malformed version, updates
+   `Cargo.toml` and `Cargo.lock`, commits `Release v1.1.0` and tags it
+   `v1.1.0`. A prerelease label is allowed too (`1.1.0-rc1`).
+
+2. Publish:
+
+   ```bash
+   git push main --follow-tags
+   ```
+
+`.github/workflows/release.yml` runs on any `v*` tag. It first checks that the
+tag matches the version in `Cargo.toml`, and fails with a message saying so
+when it does not, so a binary can never claim a version it is not. Then it
+builds all three platforms and publishes a GitHub Release with one bundle per
+platform:
+
+```
+saishin-1.1.0-x86_64-pc-windows-msvc.zip
+saishin-1.1.0-x86_64-unknown-linux-gnu.tar.gz
+saishin-1.1.0-aarch64-apple-darwin.tar.gz
+```
+
+Each bundle contains the binaries, `saishin.ini.template` and this README. The
+release notes are generated from the changes since the last release, and the
+new release is marked as the latest.
+
+A published tag can be taken back:
+
+```bash
+git tag -d v1.1.0 && git push main :refs/tags/v1.1.0
+```
+
+then delete the release on the Releases page and run the script again with
+the version you meant.
 
 ---
 
@@ -81,19 +235,19 @@ regenerate it after artwork changes, run
 1. Copy the example configuration and edit it:
 
    ```bash
-   cp config.ini.example config.ini
+   cp saishin.ini.template saishin.ini
    ```
 
 2. Check what would happen without downloading anything:
 
    ```bash
-   ./target/release/saishin --config config.ini --dry-run
+   ./target/release/saishin-cli --config saishin.ini --dry-run
    ```
 
 3. Run it:
 
    ```bash
-   ./target/release/saishin --config config.ini
+   ./target/release/saishin-cli --config saishin.ini
    ```
 
 Start with `--help` for the full option list.
@@ -106,11 +260,40 @@ Public GitHub releases need no credentials. Sources that are account-gated — a
 private repository, or builds published only to signed-in accounts — set
 `private = true`, and then a token is required.
 
-The token is a GitHub **personal access token** with the `repo` scope. Create one at
-<https://github.com/settings/tokens>.
+The token is a GitHub **personal access token**. Create one at
+<https://github.com/settings/tokens>. GitHub offers two shapes, and the difference
+matters for a repository you do not control:
+
+| Token | What it can read |
+| --- | --- |
+| Classic | Every repository your account can see — yours, and everybody else's public ones. This is the one that works everywhere. |
+| Fine-grained | Only the repositories it was granted on, with the permissions ticked on it. A repository you do not control cannot be granted to it, so a call to one comes back refused. |
+
+For `type = actions` that works out as: listing the runs and artifacts of a
+*public* repository is public data, and saishin reads it without a token when the
+token is refused — GitHub answers 60 calls an hour that way, and the log says so —
+while **downloading** an artifact always needs a token, and for a repository you do
+not control that token has to be a classic one. Its smallest useful scope is
+`public_repo`: it covers listing *and* downloading a public repository's build
+artifacts, measured against `vpinball/vpinball`, where such a token is handed the
+signed download URL. `repo` is only needed on top of it for a private repository.
+
+The form, filled in the way that works for the sources this tool is usually
+pointed at:
+
+| Field | Value |
+| --- | --- |
+| Note | `Saishin downloader` — any name that says what the token is for |
+| Expiration | Your choice; `90 days` is GitHub's default. When it lapses, run `--login` again. |
+| Select scopes | Tick **`public_repo`** (Access public repositories) — listings and build downloads of every public repository. Tick **`repo`** (Full control of private repositories) as well for a source with `private = true`. Leave the other scopes alone; nothing here reads commit status, deployments, invitations or security events. |
+
+<img src="GitHubToken.png" alt="GitHub's New personal access token (classic) form: Note 'Saishin downloader', Expiration 90 days, and public_repo ticked while repo is not" width="680" />
+
+Then press **Generate token**, copy it — it starts with `ghp_` and is shown once —
+and hand it to saishin, which verifies it and stores it:
 
 ```bash
-./target/release/saishin --login
+./target/release/saishin-cli --login
 ```
 
 You are prompted once, the token is verified against the GitHub API, and it is then
@@ -125,7 +308,7 @@ written to the platform's credential store:
 Remove it again with:
 
 ```bash
-./target/release/saishin --logout
+./target/release/saishin-cli --logout
 ```
 
 ### Where the token is looked up
@@ -141,6 +324,26 @@ The token is never written to the INI file, never logged, and never included in 
 `.part` file. If you prefer not to use the keyring at all, export `GITHUB_TOKEN`
 from your scheduler and `--login` becomes unnecessary.
 
+### When a private repository answers 404
+
+A caller who cannot see a private repository is not told the repository exists:
+GitHub answers `404 Not Found`, the same words as for a file that is not there.
+The run repeats those words and adds who was asked, which is the part that says
+what to change.
+
+| Answer | Who was asked | What to do |
+| --- | --- | --- |
+| `404` with a token | The token cannot read that repository: no `repo` scope, a fine-grained token without a grant on it, or the token's account is not a collaborator. | Widen the classic token to `repo`, grant the repository to the fine-grained one, or use an account that has access. |
+| `404` without a token | Anonymous calls cannot see private repositories at all. | Store a token with `saishin --login`. |
+| `403` with a token | The token's account is not a collaborator. | Invite the account, and `--login` with its token. |
+| `403` without a token | The machine's anonymous allowance, 60 calls an hour, is spent. | Store a token: it raises the allowance to 5000 calls an hour. |
+
+The scope names are the ones on GitHub's token form. A classic token reads public
+repositories with `public_repo` and needs `repo` for a private one. A fine-grained
+token reaches only the repositories it was granted on, and a repository you do not
+control cannot be granted to it — which is why a personal classic token is what
+works for somebody else's private repository.
+
 ---
 
 ## Scheduled runs
@@ -150,13 +353,13 @@ will then either reuse the stored token or fail with exit code `3` and a message
 telling you to run `--login` once.
 
 ```bash
-saishin --config /etc/saishin/config.ini --non-interactive
+saishin-cli --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ### Linux (cron)
 
 ```cron
-17 */6 * * * /usr/local/bin/saishin --config /etc/saishin/config.ini --non-interactive >> /var/log/saishin.log 2>&1
+17 */6 * * * /usr/local/bin/saishin-cli --config /etc/saishin/saishin.ini --non-interactive >> /var/log/saishin.log 2>&1
 ```
 
 ### Linux (systemd timer)
@@ -168,7 +371,7 @@ Description=saishin
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/saishin --config /etc/saishin/config.ini --non-interactive
+ExecStart=/usr/local/bin/saishin-cli --config /etc/saishin/saishin.ini --non-interactive
 ```
 
 ```ini
@@ -205,9 +408,9 @@ that no secure store is available and falls back to environment variables. Use
   <string>com.saishin</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/saishin</string>
+    <string>/usr/local/bin/saishin-cli</string>
     <string>--config</string>
-    <string>/etc/saishin/config.ini</string>
+    <string>/etc/saishin/saishin.ini</string>
     <string>--non-interactive</string>
   </array>
   <key>StartCalendarInterval</key>
@@ -224,8 +427,8 @@ that no secure store is available and falls back to environment variables. Use
 
 ```powershell
 Register-ScheduledTask -TaskName saishin -Action (
-  New-ScheduledTaskAction -Execute 'C:\tools\saishin.exe' `
-    -Argument '--config C:\saishin\config.ini --non-interactive'
+  New-ScheduledTaskAction -Execute 'C:\tools\saishin-cli.exe' `
+    -Argument '--config C:\saishin\saishin.ini --non-interactive'
 ) -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(6) `
     -RepetitionInterval (New-TimeSpan -Hours 6)) -RunLevel Limited
 ```
@@ -241,6 +444,12 @@ user.
 Every section other than `[general]` is one source. Relative paths resolve against
 the directory containing the INI file.
 
+Values are read exactly as they are written: a backslash is a path separator, not
+an escape character, so `out = C:\Saishin\tables` names that directory. (Earlier
+builds ran the INI reader with escape processing on, which ate the backslash and
+turned `C:\Saishin\tables` into `C:Saishinstables`. One backslash is correct; a
+doubled `\\` now stays doubled, which Windows also accepts.)
+
 ### `[general]`
 
 | Key | Default | Meaning |
@@ -248,10 +457,16 @@ the directory containing the INI file.
 | `out_dir` | `downloads` | Default download directory for sources without their own `out` |
 | `github_api_url` | `https://api.github.com` | API root; override for GitHub Enterprise |
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
-| `notify` | `false` | One desktop notification per run, after all sources, listing downloaded files. Uses `powershell` (Windows), `osascript` (macOS), `notify-send` (Linux) |
+| `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
+| `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with an **OK** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
+downloaded file asks about it first, which keeps the window open |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
-| `sound` | empty | Play this sound file after a run that downloaded something |
-| `sound_player` | empty | Command used to play the sound; the file is appended as the last argument. Default: `afplay` (macOS), `ffplay` (Windows, Linux) |
+
+A `[general]` section from an older build may still name `notify`, `sound` and
+`sound_player`. Those keys started a desktop toast and a sound player, the two
+places a run used a program of its own, and both are gone: a run spawns nothing,
+which is also why the line `Sound failed: program not found` cannot come back. A
+key with no field is ignored, so an older file loads unchanged.
 
 ### Common keys (every source)
 
@@ -281,6 +496,35 @@ release, paginating in batches of 100 up to a cap of 1000 releases.
 Downloaded GitHub files have their modification time set to the release publish
 date (or the workflow run creation date for action artifacts), so `keep`
 retention orders by that date rather than by download time.
+
+### `type = actions`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `owner` | *(required)* | Repository owner or organisation |
+| `repo` | *(required)* | Repository name |
+| `workflow` | *(all)* | Only runs of workflows whose name matches this glob: the `name:` at the top of the file (`CI` for `ci.yml`), and for a dispatched run its display title. Only completed, successful runs count |
+| `runs` | `10` | How many recent runs of that workflow to walk |
+
+Listing the artifacts of a public repository is public data, and saishin reads it
+without a token when the token is refused (see [Authentication](#authentication));
+downloading one always needs a token, and for a repository you do not control that
+has to be a classic token — `public_repo` is the smallest scope that works (see
+[Authentication](#authentication)). Each run contributes its artifacts; `filters`
+match the **artifact name**, and the downloaded file is
+that name plus `.zip` when it does not already end in `.zip` — GitHub hands out an
+artifact as a zip named after it. Expired artifacts are skipped. The timestamp a
+file's freshness is judged by is the run's creation date.
+
+```ini
+[saishin_builds]
+type = actions
+owner = JockeJarre
+repo = Saishin
+workflow = CI
+filters = *windows-x64*
+out = ./builds/actions
+```
 
 ### `type = url`
 
@@ -365,29 +609,33 @@ following normal filesystem expectations.
 ## Command line options
 
 ```
-saishin [config.ini] [options]
+saishin [saishin.ini] [options]
 ```
 
 | Option | Effect |
 | --- | --- |
-| `-c`, `--config <path>` | Configuration file. Defaults to `./config.ini`, then next to the executable |
+| `-c`, `--config <path>` | Configuration file. Defaults to `./saishin.ini`, then next to the executable |
 | `-s`, `--source <name>` | Run only this source. Repeatable |
 | `--dry-run` | Report what would be downloaded and extracted, download nothing |
 | `-f`, `--force` | Re-download and overwrite even when a file is already current |
 | `--non-interactive` | Never prompt. Fail with exit code `3` if credentials are missing |
 | `--login` | Prompt for a token, verify it, store it, then exit |
 | `--logout` | Remove the stored token, then exit |
-| `--gui` | Show a selection window for new artifacts before downloading |
+| `--gui` | Show a selection window for new artifacts before downloading, with no console output |
+| `--no-gui` | Run headless, ignoring `gui = true` in the configuration |
 | `-q`, `--quiet` | Suppress progress and informational output |
+| `-V`, `--version` | Print the version, commit, target and profile, then exit |
 | `-h`, `--help` | Show usage |
 
 The configuration path may also be given positionally, as in
-`saishin config.ini`.
+`saishin-cli saishin.ini`. The default name is `saishin.ini`, the name of the
+template in the download. A file still called `config.ini` from the earlier
+examples works when it is passed with `--config`.
 
 ### GUI selection
 
 ```bash
-./target/release/saishin --config config.ini --gui
+./target/release/saishin-cli --config saishin.ini --gui
 ```
 
 Instead of downloading every new artifact, `--gui` opens a window listing the
@@ -395,9 +643,78 @@ new artifacts — each with a checkbox (checked by default), a hyperlink to its
 GitHub release, workflow run, or source page, and its size. Uncheck the ones
 you do not want, then press **Download selected**. **Cancel** aborts the run;
 **Select all** / **Select none** reset the checkboxes. Only the checked
-artifacts are downloaded; the rest of the run (changelogs, archive handling,
-notifications) proceeds as usual. The window needs a display server, so use
+artifacts are downloaded; the rest of the run (changelogs, archive handling)
+proceeds as usual. The window needs a display server, so use
 the plain CLI mode for headless scheduled runs.
+
+The same front end can be chosen in the configuration, which is what a desktop
+shortcut wants:
+
+```ini
+[general]
+gui = true
+```
+
+A switch on the command line wins over the key, so the same configuration still
+runs headless for one-off terminal work with `--no-gui`, and `--gui` opens the
+window for a configuration that is headless by default.
+
+A GUI run keeps the console out of it: the window carries the report, so nothing
+is printed. That is not cosmetic. An exe of this kind is a console-subsystem
+program, so launching it from a shortcut gives it a console, and text in that
+console is what keeps a command window standing beside the selection window. The
+console is released as the window opens, and the run starts no program of its
+own: nothing that can pop a window behind the window, and nothing that answers
+"program not found". Started from a terminal, `--gui`
+therefore prints nothing while the window is open; `--no-gui` is the run that
+writes text. A configuration that fails before any window can open still prints,
+because then the console is the only report there is - and when even that
+console closes with the process, which is what launching the exe from a shortcut
+gives, the same words arrive in a box on the desktop.
+
+A window run that finds a source needing a token, with none stored and no console
+to type into, asks in a box: which sources are waiting, where to make the token
+and which scopes to tick, and what each answer does. **Yes** opens a command
+prompt running `--login`, waits for that window to be closed — the token is
+pasted there once — and this run then reads it from the credential store. **No**
+runs on without a token, which lists a public repository and stops at its
+downloads, and the strip says so. A window started from a terminal keeps the
+console prompt it has, and a scheduled run with `--non-interactive` is answered
+neither way: it fails with exit code `3`, the way a scheduled run has to.
+
+The window opens as soon as the configuration and the token are settled, before
+the sources are asked: a run of several sources takes seconds, and the window
+shows **Checking sources...** with a spinner while they answer, and **Cancel**
+ends it. The strip at the bottom is the run's text, the same lines a console run
+prints — the token's provenance, which source was asked and what it offered, the
+download lines with their progress, the warnings, the errors. A window run keeps
+all of those in the strip and prints none of them, which is why a window run is
+never followed by a box. Closed, the strip is one line: the newest line short
+enough to read whole, since a path cut at the window's edge says nothing — a line
+that is cut gives its whole text on hover. Open, the strip is a list that follows
+the newest line, and its text can be selected and copied.
+The download list says what each row is doing by how its mark is drawn, and by
+nothing else: a spinning circle is a transfer, a turning amber square an archive
+being unpacked, a green check a finished file, a grey ring a row a cancel stopped
+mid-transfer. A row's file name keeps its ends and loses its middle to an
+ellipsis, because a row that wraps puts its mark beside its own second line, and
+a cut name gives its whole text on hover. The list is the run's work, so it stays
+on screen when the run ends, under the answer - a mark that turns over a run that
+has ended would say the run is still going.
+
+Because a GUI run's words live in that strip, the window stays open when the run
+ends — **Done**, **Cancelled** or **Failed** — with an **OK** button to end it,
+and the button has the keys, so Enter and Space press it; `close_on_finish =
+true` gives the older habit of closing at once. A run **Cancelled** mid-transfer
+lists the half downloaded files and asks: **Keep** leaves them where they are, so
+the next run continues them, and **Delete** removes them. **Resume** starts the
+same rows again from where they stopped — the pieces on disk are what a transfer
+continues from — which is the answer **Keep** and the download again in one
+press; a finished run has nothing to resume, and a window that never started a
+download has no such button to offer. **Delete** takes that answer away along
+with the files: the window goes back to the rows, their boxes as the last run
+left them, ready to start the pick over. The question outranks `close_on_finish`,
+because a window that closes itself cannot ask.
 
 ### Picking an older version
 
@@ -440,9 +757,20 @@ parallel while the list is being built. CLI runs never make them.
 Use these in scheduler error handling to tell a broken config apart from a network
 outage or an expired credential.
 
+A headless run that one source refuses is not stopped by it. The sources that
+answered get their downloads, the refusals are the last lines of the output
+("2 of 3 sources answered." and then each source with its reason), and the exit
+code is the first refusal's: `2` for a listing GitHub refused, `1` for a source
+whose configuration is bad, `3` for a token that cannot be used. A window run
+reports the same refusals in its heading, "2 of 3 sources answered", and in the
+red lines of its strip.
+
 Downloads are written to a `.part` file and moved into place only after the
 transfer completes, so an interrupted run never leaves a truncated file that a
-later run would mistake for current.
+later run would mistake for current. The piece is also where a download resumes
+from: a run that continues a stopped transfer asks the server for the bytes after
+what is already on disk. A cancelled download leaves the piece there on purpose,
+and a window run asks what to do with it.
 
 ---
 
@@ -450,20 +778,30 @@ later run would mistake for current.
 
 ```
 saishin/
-├── Cargo.toml            crate definition and dependencies
+├── Cargo.toml            the two binaries, the dependencies, the version
 ├── Cargo.lock            pinned dependency versions
-├── build.rs              embeds the .ico into the Windows executable
-├── config.ini.example      annotated example configuration
+├── build.rs              stamps the build identity, embeds the Windows .ico,
+│                         decodes the header logo into raw pixels
+├── saishin-png-icon-set/ the logo PNG (header art, and the build input for it)
+│                         and saishin.ico
+├── saishin.ini.template      annotated example configuration
 ├── README.md
+├── .github/workflows/
+│   ├── ci.yml            builds all three platforms on every push
+│   └── release.yml       publishes a release from a v* tag
+├── scripts/
+│   ├── release.ps1       bump the version, commit it, tag it
+│   └── check-icon.ps1    fails the CI build when the exe has no icon resource
 ├── src/
-│   ├── main.rs           argument parsing, orchestration, exit codes
+│   ├── launcher.rs       the icon's target: starts saishin-cli, boxes its report
+│   ├── main.rs           the program: arguments, orchestration, exit codes
 │   ├── config.rs         INI model and validation
 │   ├── glob.rs           glob to regular expression
 │   ├── secrets.rs        token prompt, storage and lookup order
 │   ├── github.rs         release discovery and asset selection
 │   ├── downloader.rs     HTTP transfer, skip detection, progress
 │   ├── zip_handler.rs    archive extraction rules
-│   ├── notifier.rs       desktop notifications and sounds
+│   ├── notifier.rs       the one box, for a run with no console left to read
 │   ├── log.rs            output helpers
 │   └── error.rs          error type and exit codes
 └── tests/
@@ -486,7 +824,13 @@ saishin/
 | [`chrono`](https://crates.io/crates/chrono) | MIT/Apache-2.0 | Release date parsing and timestamps |
 | [`rpassword`](https://crates.io/crates/rpassword) | MIT/Apache-2.0 | Hidden token prompt |
 | [`url`](https://crates.io/crates/url) | MIT/Apache-2.0 | File names from plain URLs |
-| [`winres`](https://crates.io/crates/winres) (Windows only) | MIT | Embeds the icon into the executable |
+| [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) | MIT/Apache-2.0 | The `--gui` window, rendered with OpenGL (glow) |
+| [`png`](https://crates.io/crates/png) (build only) | MIT/Apache-2.0 | Decodes and shrinks the header logo at build time, so the binary needs no image decoder |
+| [`embed-resource`](https://crates.io/crates/embed-resource) (Windows only) | MIT/Apache-2.0 | Embeds the icon into the executable |
 
-The exact versions are pinned in `Cargo.lock`. The initial build needs network
+The exact versions are pinned in `Cargo.lock`. The GUI and archive
+dependencies are pulled with a reduced feature set — the glow renderer
+instead of wgpu, the png decoder instead of every image format, deflate
+zip entries only — which keeps the wgpu, naga, bzip2, lzma and zstd C
+builds out of the tree. The initial build needs network
 access for crates.io; subsequent builds use the local cargo cache.

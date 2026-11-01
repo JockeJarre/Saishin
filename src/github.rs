@@ -3,8 +3,129 @@ use crate::downloader::Downloader;
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_PAGES: i64 = 10;
+
+/// The words for a call GitHub refused, which is a question about the call's
+/// reach and not about the network. With a token in play it is a question about
+/// that token: a fine-grained one is granted on the repositories its owner
+/// picked, and it cannot be granted on a repository they do not control, which is
+/// the shape of most of these refusals; a classic token with 'public_repo' reads
+/// every public repository, and 'repo' adds the private ones. Without a token the
+/// call is asked of a public repository's anonymous allowance - 60 calls an hour,
+/// per machine - and GitHub answers a passed allowance with 403, so the sentence
+/// has to say which of the two the run is looking at.
+///
+/// A 404 belongs here as well, because GitHub does not use it the way an HTTP
+/// server does: a private repository answers 404, not 403, to a caller that
+/// cannot see it, and so does a fine-grained token on a repository it was not
+/// granted on. So the answer that reads like "there is no such repository" is
+/// usually "this caller is not shown it", and saying that is the whole use of
+/// the sentence: a raw payload of `{"message": "Not Found"}` names neither the
+/// token, nor the scope, nor what to change.
+fn rejected(what: &str, status: u16, with_token: bool) -> String {
+    if status == 404 {
+        if with_token {
+            return format!(
+                "GitHub answered 404 for {what}, and that is what a repository answers to a \
+                 token it does not show: the token sent cannot read {what}. A classic token \
+                 needs the 'repo' scope to read a private repository ('public_repo' reads \
+                 public repositories only), and a fine-grained one is granted on the \
+                 repositories its owner picked. Run 'saishin --login' with a token of an \
+                 account that can see {what}, with 'repo' ticked for a private repository."
+            );
+        }
+        return format!(
+            "GitHub answered 404 for {what}, and no token was sent: a repository that is not \
+             public answers 404 to an anonymous call, so this is a reach, not a missing file. \
+             Run 'saishin-cli --login' with a classic token that can see {what} - 'repo' \
+             covers a private repository, 'public_repo' is enough for a public one."
+        );
+    }
+    if with_token {
+        return format!(
+            "GitHub refused the token for {what} (HTTP {status}). \
+             A fine-grained token reaches only the repositories it was granted on, so \
+             for a repository you do not control store a classic token: 'public_repo' \
+             reads public repositories, including their artifact downloads, and 'repo' \
+             adds the private ones. Run 'saishin --login' to replace it."
+        );
+    }
+    format!(
+        "GitHub refused the call for {what} (HTTP {status}) - and no token was sent, \
+         so the call was an anonymous one. A public repository answers 60 of those an \
+         hour, per machine, and GitHub's answer for an allowance that has run out is \
+         403: this is the allowance, not the repository. Run 'saishin-cli --login' \
+         with a classic token, which is answered 5000 calls an hour; 'public_repo' is \
+         the scope that reads public repositories and their build downloads."
+    )
+}
+
+/// The `owner/repo` a GitHub API URL is about, for a message that has nothing
+/// else to go by: `.../repos/{owner}/{repo}/actions/runs/{id}/artifacts`.
+fn repository_of(url: &str) -> String {
+    match url.find("/repos/") {
+        Some(at) => url[at + "/repos/".len()..]
+            .split('/')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => url.to_string(),
+    }
+}
+
+/// One GitHub API call, and the same call made a second time with the token left
+/// at home when GitHub refuses the one it was sent with.
+///
+/// A fine-grained token is granted on the repositories its owner picked, and
+/// GitHub's answer for every other is 403, which reads as a broken token. GitHub
+/// writes of these permissions that they "are required to access private
+/// resources" and that "some endpoints can also be used to access public
+/// resources without these permissions", so a refusal is tried again without a
+/// token: the listings of a public repository answer there, and a private one
+/// does not answer at all. Only a success changes anything. A listing refused
+/// with a token and without one reports the token's answer, which is the one that
+/// explains something.
+async fn api_get(http: &Downloader, url: &str, token: Option<&str>) -> Result<String, AppError> {
+    let first = http.get_string(url, token).await;
+    if token.is_none() || !was_refused(&first) {
+        return first;
+    }
+    match http.get_string(url, None).await {
+        Ok(body) => {
+            say_once(&repository_of(url));
+            Ok(body)
+        }
+        Err(_) => first,
+    }
+}
+
+/// A source asks once for its runs and once per run for its artifacts, so a
+/// default `runs = 10` makes eleven calls, and eleven copies of one sentence
+/// would push the run's own lines out of a window's strip. So the run is told
+/// once, and the name of the repository in it is the answer to "which one?".
+static ANONYMOUS: AtomicBool = AtomicBool::new(false);
+
+fn say_once(repository: &str) {
+    if !ANONYMOUS.swap(true, Ordering::Relaxed) {
+        crate::log::detail(&anonymous_note(repository));
+    }
+}
+
+fn anonymous_note(repository: &str) -> String {
+    format!(
+        "GitHub refused the token for {repository}; its public listing was read \
+         without a token (60 calls an hour are open without one)."
+    )
+}
+
+/// The answers that are about a token's reach: 401, 403, and the 404 GitHub
+/// gives for a repository the caller is not shown. A 422 and a transport
+/// failure are not, and a call with no token can make none of those better.
+fn was_refused(answer: &Result<String, AppError>) -> bool {
+    matches!(answer, Err(AppError::Download { status: 401 | 403 | 404, .. }))
+}
 
 #[derive(Debug, Clone)]
 pub struct GhAsset {
@@ -208,15 +329,14 @@ async fn get_release_page(
         "{}/repos/{}/{}/releases?per_page={per_page}&page={page}",
         config.github_api_url, source.owner, source.repo
     );
-    let body = http
-        .get_string(&url, token)
+    let body = api_get(http, &url, token)
         .await
         .map_err(|ex| match &ex {
-            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
-                AppError::Auth(format!(
-                    "GitHub rejected the request for {}/{} (HTTP {status}). \
-                     The token is missing, invalid, or lacks the 'repo' scope. Run 'saishin --login' to replace it.",
-                    source.owner, source.repo
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
+                AppError::Auth(rejected(
+                    &format!("{}/{}", source.owner, source.repo),
+                    *status,
+                    token.is_some(),
                 ))
             }
             _ => ex,
@@ -260,7 +380,7 @@ pub async fn get_runs(
             "{}/repos/{}/{}/actions/runs?per_page={per_page}&page={page}",
             config.github_api_url, source.owner, source.repo
         );
-        let batch = get_run_page(http, config, &url, token).await?;
+        let batch = get_run_page(http, &url, token).await?;
         let full = batch.len() as i64 >= per_page;
         runs.extend(batch.into_iter().filter(|run| filter(run)));
         if !full || runs.len() as i64 >= max_runs {
@@ -271,22 +391,12 @@ pub async fn get_runs(
     Ok(runs)
 }
 
-async fn get_run_page(
-    http: &Downloader,
-    config: &AppConfig,
-    url: &str,
-    token: Option<&str>,
-) -> Result<Vec<GhRun>, AppError> {
-    let body = http
-        .get_string(url, token)
+async fn get_run_page(http: &Downloader, url: &str, token: Option<&str>) -> Result<Vec<GhRun>, AppError> {
+    let body = api_get(http, url, token)
         .await
         .map_err(|ex| match &ex {
-            AppError::Download { status, .. } if *status == 401 || *status == 403 => {
-                AppError::Auth(format!(
-                    "GitHub rejected the request for {}/repos/.../actions/runs (HTTP {status}). \
-                     The token is missing, invalid, or lacks the 'repo' scope. Run 'saishin --login' to replace it.",
-                    config.github_api_url
-                ))
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
+                AppError::Auth(rejected(&repository_of(url), *status, token.is_some()))
             }
             _ => ex,
         })?;
@@ -326,7 +436,16 @@ pub async fn get_artifacts(
     let mut artifacts = Vec::new();
     for page in 1.. {
         let url = format!("{}?per_page={per_page}&page={page}", run.artifacts_url);
-        let body = http.get_string(&url, token).await?;
+        let body = api_get(http, &url, token).await.map_err(|ex| match &ex {
+            AppError::Download { status, .. } if matches!(*status, 401 | 403 | 404) => {
+                AppError::Auth(rejected(
+                    &repository_of(&run.artifacts_url),
+                    *status,
+                    token.is_some(),
+                ))
+            }
+            _ => ex,
+        })?;
         let parsed: ArtifactsJson = serde_json::from_str(&body)
             .map_err(|_| AppError::Download { status: 0, message: format!("Unexpected artifacts payload from {url}.") })?;
         let full = parsed.artifacts.len() as i64 >= per_page;
@@ -396,7 +515,10 @@ pub async fn check_repository_access(
         Err(AppError::Download { status, .. }) if status == 401 || status == 403 || status == 404 => {
             Err(AppError::Auth(format!(
                 "The token cannot read {}/{} (HTTP {status}). \
-                 Give the token the 'repo' scope and confirm your account has access to the repository.",
+                 A fine-grained token reaches only the repositories it was granted \
+                 on, so give it this repository, or store a classic token - \
+                 'public_repo' reads public repositories, 'repo' reads private ones \
+                 - and confirm your account can see the repository.",
                 source.owner, source.repo
             )))
         }
@@ -513,5 +635,95 @@ mod tests {
         assert_eq!(parsed.assets.len(), 1);
         assert_eq!(parsed.assets[0].size, 0);
         assert!(parsed.assets[0].browser_download_url.is_empty());
+    }
+
+    #[test]
+    fn only_a_refusal_is_a_question_a_call_without_a_token_can_answer() {
+        let refused = |status: u16| Err(AppError::Download { status, message: String::new() });
+        assert!(was_refused(&refused(401)));
+        assert!(was_refused(&refused(403)));
+        // A private repository answers 404 to a caller it is not shown to, and so
+        // does a fine-grained token on a repository it was not granted on, so a 404
+        // is worth asking anonymously: the listing of a public repository answers
+        // there, which is the case a fine-grained token's 404 hides.
+        assert!(was_refused(&refused(404)));
+        // A query GitHub will not take, a rate limit, and a call that never
+        // arrived are not a token's reach, and an anonymous call improves none.
+        assert!(!was_refused(&refused(422)));
+        assert!(!was_refused(&refused(429)));
+        assert!(!was_refused(&refused(0)));
+        assert!(!was_refused(&Ok("payload".to_string())));
+    }
+
+    #[test]
+    fn an_api_url_says_which_repository_it_is_about() {
+        assert_eq!(
+            repository_of("https://api.github.com/repos/vpinball/vpinball/actions/runs/41187570440/artifacts"),
+            "vpinball/vpinball"
+        );
+        assert_eq!(
+            repository_of("https://ghe.example.com/repos/JockeJarre/VPinballX.starter/releases?per_page=100"),
+            "JockeJarre/VPinballX.starter"
+        );
+        // A URL that names no repository is reported as it came.
+        assert_eq!(repository_of("https://api.github.com/user"), "https://api.github.com/user");
+    }
+
+    #[test]
+    fn a_refusal_with_a_token_names_the_token_shape_that_reaches_the_repository() {
+        let words = rejected("vpinball/vpinball", 403, true);
+        assert!(words.contains("vpinball/vpinball"));
+        assert!(words.contains("403"));
+        assert!(words.contains("fine-grained"));
+        assert!(words.contains("'public_repo'"));
+        assert!(words.contains("--login"));
+    }
+
+    #[test]
+    fn a_refusal_without_a_token_says_so_and_names_the_allowance() {
+        // A run with no token has no token to blame, and 403 is also GitHub's
+        // answer for an anonymous allowance that has run out: a sentence about a
+        // broken token would send the reader off to make a second one.
+        let words = rejected("vpinball/vpinball", 403, false);
+        assert!(words.contains("no token was sent"));
+        assert!(words.contains("60 of those an hour"));
+        assert!(words.contains("5000 calls an hour"));
+        assert!(!words.contains("fine-grained"));
+    }
+
+    #[test]
+    fn a_404_with_a_token_names_the_scope_that_makes_a_repository_visible() {
+        // GitHub's payload for this says only "Not Found", which is how a private
+        // repository answers a token it does not show: the sentence has to name
+        // what changes the answer, because a payload of one word sends a reader
+        // to check the URL of a source that was never wrong.
+        let words = rejected("JockeJarre/Saishin", 404, true);
+        assert!(words.contains("404"));
+        assert!(words.contains("JockeJarre/Saishin"));
+        assert!(words.contains("'repo'"));
+        assert!(words.contains("private repository"));
+        assert!(words.contains("fine-grained"));
+        assert!(words.contains("--login"));
+        // Not the 403 sentence: a 404 is not a spent allowance.
+        assert!(!words.contains("60 of those an hour"));
+    }
+
+    #[test]
+    fn a_404_without_a_token_calls_it_a_reach_and_not_a_missing_file() {
+        let words = rejected("JockeJarre/Saishin", 404, false);
+        assert!(words.contains("no token was sent"));
+        assert!(words.contains("404"));
+        assert!(words.contains("'repo'"));
+        assert!(words.contains("--login"));
+        assert!(!words.contains("60 of those an hour"));
+    }
+
+    #[test]
+    fn the_note_about_a_listing_read_without_a_token_names_it_and_its_price() {
+        let words = anonymous_note("vpinball/vpinball");
+        assert!(words.contains("vpinball/vpinball"));
+        assert!(words.contains("without a token"));
+        // The rate a run is spending its calls at is the part worth knowing.
+        assert!(words.contains("60 calls an hour"));
     }
 }
