@@ -11,6 +11,17 @@ pub enum SourceKind {
     Actions,
 }
 
+/// One `pattern -> name` pair of the `extract_as` key: an entry whose archive
+/// path matches `pattern` is written to `target` under `extract_to` instead of
+/// to its own path inside the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameRule {
+    /// Glob matched against the entry path — the same string `extract` matches.
+    pub pattern: String,
+    /// Destination path relative to `extract_to`, `/`-separated.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOptions {
     pub patterns: Vec<String>,
@@ -18,6 +29,9 @@ pub struct ExtractOptions {
     pub strip_prefix: i64,
     pub overwrite: bool,
     pub keep_zip: bool,
+    /// Checked in order, first match wins; an entry no rule matches keeps the
+    /// name it has in the archive.
+    pub renames: Vec<RenameRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +310,75 @@ fn read_extract(
         strip_prefix,
         overwrite: get_bool(sections, section, "overwrite", false)?,
         keep_zip: get_bool(sections, section, "keep_zip", true)?,
+        renames: read_renames(sections, section)?,
     }))
+}
+
+/// `extract_as = *.exe -> app.exe, docs/README* -> README.txt`
+///
+/// Every comma-separated item is a glob, an arrow (`->` or `=>`) and the name
+/// the match is written as. The arrow is found by its `>`, so a pattern may
+/// itself contain `-` and `=`.
+fn read_renames(sections: &Sections, section: &str) -> Result<Vec<RenameRule>, AppError> {
+    let mut rules = Vec::new();
+    for item in get_list(sections, section, "extract_as") {
+        let Some((raw_pattern, raw_target)) = split_arrow(&item) else {
+            return Err(AppError::Config(format!(
+                "Section [{section}]: 'extract_as' item '{item}' needs an arrow, as in '*.exe -> app.exe'."
+            )));
+        };
+        let pattern = raw_pattern.trim().replace('\\', "/");
+        if pattern.is_empty() {
+            return Err(AppError::Config(format!(
+                "Section [{section}]: 'extract_as' item '{item}' has no pattern before the arrow."
+            )));
+        }
+        rules.push(RenameRule {
+            pattern,
+            target: clean_target(section, &item, raw_target)?,
+        });
+    }
+    Ok(rules)
+}
+
+fn split_arrow(item: &str) -> Option<(&str, &str)> {
+    let index = item.find('>')?;
+    let before = &item[..index];
+    if !before.ends_with('-') && !before.ends_with('=') {
+        return None;
+    }
+    // The arrow is the '>' and the '-' or '=' in front of it.
+    Some((&item[..index - 1], &item[index + 1..]))
+}
+
+/// A rename target is always a path **inside** `extract_to`: relative, with no
+/// `..` segment and no drive letter, so a rename can never write outside the
+/// destination the way a crafted archive entry cannot.
+fn clean_target(section: &str, item: &str, raw: &str) -> Result<String, AppError> {
+    let raw = raw.trim();
+    let text = raw.replace('\\', "/");
+    let reject = |reason: &str| -> AppError {
+        AppError::Config(format!(
+            "Section [{section}]: 'extract_as' item '{item}' names '{raw}', which {reason}."
+        ))
+    };
+    if text.is_empty() {
+        return Err(reject("has no file name after the arrow"));
+    }
+    if text.starts_with('/') {
+        return Err(reject("is an absolute path; the name is taken relative to extract_to"));
+    }
+    let segments: Vec<&str> = text.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    if segments.is_empty() {
+        return Err(reject("has no file name after the arrow"));
+    }
+    if segments.iter().any(|s| *s == "..") {
+        return Err(reject("would leave the destination directory"));
+    }
+    if segments[0].ends_with(':') {
+        return Err(reject("is an absolute path; the name is taken relative to extract_to"));
+    }
+    Ok(segments.join("/"))
 }
 
 fn resolve_output_directory(
@@ -512,6 +594,65 @@ mod tests {
             .destination
             .ends_with("C:\\Saishin\\tables\\vpin-mame"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parses_extract_as_pairs() {
+        let path = write_ini(
+            "extract-as.ini",
+            "[demo]\ntype = github\nowner = o\nrepo = r\nextract = *\nextract_as = *.exe -> bin/mytool.exe, docs/README* => README.txt\n",
+        );
+        let config = load(&path).expect("load");
+        let extract = config.sources[0].extract.as_ref().expect("extract");
+        assert_eq!(
+            extract.renames,
+            vec![
+                RenameRule {
+                    pattern: "*.exe".to_string(),
+                    target: "bin/mytool.exe".to_string()
+                },
+                RenameRule {
+                    pattern: "docs/README*".to_string(),
+                    target: "README.txt".to_string()
+                },
+            ]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_windows_rename_target_is_read_as_a_relative_path() {
+        let path = write_ini(
+            "extract-as-win.ini",
+            "[demo]\ntype = github\nowner = o\nrepo = r\nextract = *\nextract_as = Tables\\*.vpt -> tables\\pinball.vpt\n",
+        );
+        let config = load(&path).expect("load");
+        let extract = config.sources[0].extract.as_ref().expect("extract");
+        assert_eq!(extract.renames[0].pattern, "Tables/*.vpt");
+        assert_eq!(extract.renames[0].target, "tables/pinball.vpt");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_extract_as_items_that_would_escape_the_destination() {
+        for (item, phrase) in [
+            ("*.exe", "needs an arrow"),
+            ("*.exe -> ", "has no file name after the arrow"),
+            ("*.exe -> ../../elsewhere.exe", "would leave the destination"),
+            ("*.exe -> /opt/x.exe", "is an absolute path"),
+            ("*.exe -> C:/x.exe", "is an absolute path"),
+        ] {
+            let path = write_ini(
+                "extract-as-bad.ini",
+                &format!("[demo]\ntype = github\nowner = o\nrepo = r\nextract = *\nextract_as = {item}\n"),
+            );
+            let err = load(&path).expect_err("must fail");
+            assert!(
+                err.to_string().contains(phrase),
+                "'{item}': {err} must mention '{phrase}'"
+            );
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]

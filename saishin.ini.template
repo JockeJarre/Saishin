@@ -65,6 +65,11 @@ changelog = true
 ; strip_prefix = 1
 ; overwrite = true
 ; keep_zip = true
+; extract_as gives the files it extracts names of your own, as
+; 'glob -> name' pairs. The globs match the same entry paths 'extract' matches,
+; the name is relative to extract_to, the first matching rule wins, and an entry
+; no rule matches keeps its name from the archive.
+; extract_as = *.exe -> bin/saishin.exe, docs/README* -> README.txt
 
 
 ; ---------------------------------------------------------------------------
