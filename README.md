@@ -559,6 +559,7 @@ source sets `extract`, so a source never unpacks anything by accident.
 | `extract` | *(none)* | Comma-separated globs of entries to extract. Extraction is skipped entirely when absent |
 | `extract_to` | `<out>/<section>` | Destination directory for the unpacked files |
 | `strip_prefix` | `0` | Number of leading path segments to drop. Use `1` for archives that wrap everything in one folder |
+| `extract_as` | *(none)* | Comma-separated `glob -> name` pairs: the entries a glob matches are written under a chosen name instead of the name they have in the archive |
 | `overwrite` | `false` | Replace files that already exist. Otherwise existing files are left alone |
 | `keep_zip` | `true` | Set to `false` to delete the archive once extraction finished |
 
@@ -585,11 +586,57 @@ keep_zip = false
 `--force` makes `--overwrite` unnecessary; it overrides both the download and the
 extraction step.
 
+### Naming the extracted files
+
+`extract_as` gives a matching entry a name of your own choosing. Each item is a
+glob, an arrow (`->` or `=>`) and the name to write it as, and the items are
+comma-separated like every other list:
+
+```ini
+extract = *.exe, *.dll, docs/*
+extract_to = ./tools
+extract_as = *.exe -> bin/mytool.exe, docs/README* -> README.txt
+```
+
+- The glob is matched against the same path `extract` matches, that is the entry
+  path **after** `strip_prefix` has dropped its leading segments. The same
+  wildcards apply, and a pattern with no `/` also matches the bare file name.
+- The name is taken relative to `extract_to`, so it may open subdirectories
+  (`bin/mytool.exe`). Backslashes work as they do anywhere else in the file.
+- The rules are checked in order and the first match wins. An entry no rule
+  matches keeps the name it has in the archive, so a list renames only what it
+  names.
+- The name is always inside `extract_to`: an absolute path, a drive letter or a
+  `..` segment is refused as a configuration error, and an item with no arrow is
+  refused too.
+- One name matched by two rules, and one name two entries are renamed to, are
+  both said out loud: the first rule wins, and of two entries the one extracted
+  last is the one that stays.
+
+The usual use is an archive whose file names carry a version, a platform or a
+wrapper folder, where a fixed name is what the shortcut, the script or the
+scheduled task wants:
+
+```ini
+[tools]
+type = github
+owner = someowner
+repo = sometools
+filters = *-windows-x64.zip
+out = ./downloads/tools
+extract = *.exe
+extract_to = ./tools
+strip_prefix = 1
+extract_as = *.exe -> bin/mytool.exe
+overwrite = true
+keep_zip = false
+```
+
 ---
 
 ## Glob patterns
 
-Filters and `extract` accept these wildcards:
+Filters, `extract` and the patterns of `extract_as` accept these wildcards:
 
 | Pattern | Matches |
 | --- | --- |
