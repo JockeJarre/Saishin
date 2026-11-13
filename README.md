@@ -457,7 +457,7 @@ doubled `\\` now stays doubled, which Windows also accepts.)
 | `out_dir` | `downloads` | Default download directory for sources without their own `out` |
 | `github_api_url` | `https://api.github.com` | API root; override for GitHub Enterprise |
 | `keyring_service` | `saishin` | Label used for the token in the secure store |
-| `gui` | `false` | Open the selection window instead of running headless. `--gui` and `--no-gui` on the command line win over this key |
+| `gui` | `off` | Which entry point opens the selection window when the command line says nothing: `off`, `launcher` (the icon's `saishin`, double-clicked), `cli` (a terminal `saishin-cli`) or `always`. `true` is `launcher` and `false` is `off`. `--gui` and `--no-gui` win over this key |
 | `close_on_finish` | `false` | `false` keeps the window open when the run ends, on its end state with an **OK** button, so the log strip stays readable. `true` closes the window as soon as the run ends. A run that leaves a half
 downloaded file asks about it first, which keeps the window open |
 | `releases` | `10` | How many recent releases, or workflow runs, the `--gui` version dropdown offers per artifact. A source may override it |
@@ -621,8 +621,8 @@ saishin [saishin.ini] [options]
 | `--non-interactive` | Never prompt. Fail with exit code `3` if credentials are missing |
 | `--login` | Prompt for a token, verify it, store it, then exit |
 | `--logout` | Remove the stored token, then exit |
-| `--gui` | Show a selection window for new artifacts before downloading, with no console output |
-| `--no-gui` | Run headless, ignoring `gui = true` in the configuration |
+| `--gui` | Open the selection window, with no console output. A terminal run is headless without it, whatever `gui` says |
+| `--no-gui` | Run headless, ignoring the `gui` key |
 | `-q`, `--quiet` | Suppress progress and informational output |
 | `-V`, `--version` | Print the version, commit, target and profile, then exit |
 | `-h`, `--help` | Show usage |
@@ -652,8 +652,26 @@ shortcut wants:
 
 ```ini
 [general]
-gui = true
+gui = launcher
 ```
+
+The key names the **entry point** that gets the window, because the two want
+opposite things: a `saishin-cli` typed into a terminal wants its transcript, and a
+double-click of the icon wants a window without a console in front of it. A
+program started by the icon's launcher (`saishin`, `saishin.exe`) is recognised by
+the environment variable that launcher sets for its child, so the key can tell the
+two apart:
+
+| `gui` | terminal `saishin-cli` | double-clicked `saishin` |
+| --- | --- | --- |
+| `off` (the default, `false`) | headless | headless, report in a box |
+| `launcher` (`true`) | **headless** | window |
+| `cli` | window | headless, report in a box |
+| `always` | window | window |
+
+The words `never` for `off`, `terminal` for `cli` and `both` for `always` are
+accepted too. The launcher run that stays headless is the one whose text the
+launcher puts in a box, which is how a scheduled double-click reports a problem.
 
 A switch on the command line wins over the key, so the same configuration still
 runs headless for one-off terminal work with `--no-gui`, and `--gui` opens the
