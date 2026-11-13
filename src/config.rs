@@ -41,8 +41,7 @@ pub struct SourceConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppConfig {
-    // Base directory of the INI file; currently informational only.
+pub struct AppConfig {    // Base directory of the INI file; currently informational only.
     #[allow(dead_code)]
     pub base_directory: String,
     pub default_out_dir: String,
@@ -52,14 +51,46 @@ pub struct AppConfig {
     /// What the window does when a run ends. False keeps it open, on the end
     /// state with a Close button, so the log strip stays readable.
     pub close_on_finish: bool,
-    /// Open the GUI by default (`[general] gui`). `--gui` and `--no-gui` on the
-    /// command line win over this.
-    pub gui: bool,
+    /// Open the GUI by default (`[general] gui`). Which entry point that means
+    /// is the key's own choice, and `--gui` / `--no-gui` on the command line
+    /// win over it.
+    pub gui: GuiMode,
     pub releases: i64,
     pub sources: Vec<SourceConfig>,
 }
 
 type Sections = HashMap<String, HashMap<String, String>>;
+
+/// What `[general] gui` asks for: which entry point opens the window when the
+/// command line says nothing. The two entry points are the icon's launcher
+/// (`saishin`, `saishin.exe` on a double-click, which starts the program with
+/// `SAISHIN_LAUNCHER` set) and the program run from a terminal
+/// (`saishin-cli`), and they want opposite things: the icon wants a window, a
+/// terminal typed at wants its transcript. `true` is the launcher, which is
+/// what the key has meant all along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuiMode {
+    /// Headless everywhere: the window comes from `--gui` alone.
+    #[default]
+    Off,
+    /// The window under the launcher, headless in a terminal.
+    Launcher,
+    /// The window for a terminal run, headless under the launcher.
+    Cli,
+    /// The window from both.
+    Always,
+}
+
+impl GuiMode {
+    pub fn opens_window_for(self, from_launcher: bool) -> bool {
+        match self {
+            GuiMode::Off => false,
+            GuiMode::Launcher => from_launcher,
+            GuiMode::Cli => !from_launcher,
+            GuiMode::Always => true,
+        }
+    }
+}
 
 pub fn load(path: &str) -> Result<AppConfig, AppError> {
     if !Path::new(path).exists() {
@@ -96,7 +127,7 @@ pub fn load(path: &str) -> Result<AppConfig, AppError> {
         keyring_service: get_string(&sections, GENERAL_SECTION, "keyring_service", "saishin"),
         window_centered: get_bool(&sections, GENERAL_SECTION, "window_centered", true)?,
             close_on_finish: get_bool(&sections, GENERAL_SECTION, "close_on_finish", false)?,
-        gui: get_bool(&sections, GENERAL_SECTION, "gui", false)?,
+        gui: read_gui(&sections, GENERAL_SECTION)?,
         releases: get_int(&sections, GENERAL_SECTION, "releases", 10)?,
         sources: Vec::new(),
     };
@@ -266,6 +297,25 @@ fn read_source(
     }
 
     Ok(Some(source))
+}
+
+/// `[general] gui`: the words the key takes, and the two old booleans among
+/// them, so the file of a machine that has been updating for years keeps
+/// behaving as it always did.
+fn read_gui(sections: &Sections, section: &str) -> Result<GuiMode, AppError> {
+    let raw = get_string(sections, section, "gui", "");
+    Ok(match raw.to_lowercase().as_str() {
+        "" => GuiMode::Off,
+        "launcher" | "true" | "yes" | "on" | "1" => GuiMode::Launcher,
+        "off" | "never" | "false" | "no" | "0" => GuiMode::Off,
+        "cli" | "terminal" => GuiMode::Cli,
+        "always" | "both" => GuiMode::Always,
+        _ => {
+            return Err(AppError::Config(format!(
+                "Section [{section}]: 'gui' must be off, launcher, cli, always, true or false, not '{raw}'."
+            )))
+        }
+    })
 }
 
 fn read_extract(
@@ -462,31 +512,54 @@ mod tests {
     fn the_general_gui_key_picks_the_graphical_front_end() {
         const ONE_SOURCE: &str = "[files]\ntype = url\nurls = https://example.com/a.zip\n";
 
-        let on = load(&write_ini(
-            "gui.ini",
-            &format!("[general]\ngui = true\n\n{ONE_SOURCE}"),
-        ))
-        .expect("loads");
-        assert!(on.gui);
+        let mode = |value: &str| {
+            load(&write_ini(
+                "gui.ini",
+                &format!("[general]\ngui = {value}\n\n{ONE_SOURCE}"),
+            ))
+            .expect("loads")
+            .gui
+        };
 
-        let off = load(&write_ini(
-            "gui_off.ini",
-            &format!("[general]\ngui = off\n\n{ONE_SOURCE}"),
-        ))
-        .expect("loads");
-        assert!(!off.gui);
-
-        let unwritten = load(&write_ini("gui_default.ini", ONE_SOURCE)).expect("loads");
-        assert!(!unwritten.gui, "the CLI stays the default");
+        assert_eq!(mode("launcher"), GuiMode::Launcher);
+        assert_eq!(mode("cli"), GuiMode::Cli);
+        assert_eq!(mode("always"), GuiMode::Always);
+        assert_eq!(mode("off"), GuiMode::Off);
+        // The old booleans keep their meaning: true is the launcher's window,
+        // which is what a double-click of the icon does today.
+        assert_eq!(mode("true"), GuiMode::Launcher);
+        assert_eq!(mode("yes"), GuiMode::Launcher);
+        assert_eq!(mode("false"), GuiMode::Off);
+        assert_eq!(
+            load(&write_ini("gui_default.ini", ONE_SOURCE))
+                .expect("loads")
+                .gui,
+            GuiMode::Off,
+            "the CLI stays the default"
+        );
 
         let bad = write_ini(
             "gui_bad.ini",
             &format!("[general]\ngui = sometimes\n\n{ONE_SOURCE}"),
         );
         let err = load(&bad).expect_err("must fail");
-        assert!(err
-            .to_string()
-            .contains("'gui' must be true or false, not 'sometimes'"));
+        assert!(
+            err.to_string()
+                .contains("'gui' must be off, launcher, cli, always, true or false, not 'sometimes'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gui_modes_name_the_entry_point_that_gets_the_window() {
+        assert!(!GuiMode::Off.opens_window_for(true));
+        assert!(!GuiMode::Off.opens_window_for(false));
+        assert!(GuiMode::Launcher.opens_window_for(true));
+        assert!(!GuiMode::Launcher.opens_window_for(false));
+        assert!(!GuiMode::Cli.opens_window_for(true));
+        assert!(GuiMode::Cli.opens_window_for(false));
+        assert!(GuiMode::Always.opens_window_for(true));
+        assert!(GuiMode::Always.opens_window_for(false));
     }
 
     #[test]
