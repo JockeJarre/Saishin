@@ -16,6 +16,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# The actions sit on the majors declaring `runs.using: node24`: the runners
+# dropped Node 20 in September 2026, force a Node 20 action onto Node 24 and
+# warn about it at the end of every job. upload-artifact and download-artifact
+# move together, because the download side has to be at least as new as the
+# upload side.
+
 jobs:
   version:
     name: version matches the tag
@@ -23,7 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check the tag against Cargo.toml
         id: version
         shell: bash
@@ -64,7 +70,7 @@ jobs:
             archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -145,7 +151,7 @@ jobs:
           ./scripts/check-version.ps1 "$env:BUNDLE/saishin.exe" -Version "$env:VERSION" -Sha $sha
           ./scripts/check-version.ps1 "$env:BUNDLE/saishin-cli.exe" -Version "$env:VERSION" -Sha $sha
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bundle-${{ matrix.target }}
           path: saishin-*-${{ matrix.target }}.${{ matrix.archive }}
@@ -156,12 +162,12 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: bundle-*
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: saishin ${{ needs.version.outputs.version }}
