@@ -1,4 +1,4 @@
-use crate::config::ExtractOptions;
+use crate::config::{ExtractOptions, RenameRule};
 use crate::{glob, log};
 use std::fs;
 use std::io::Read;
@@ -36,6 +36,10 @@ pub fn extract(
 
     let mut written = 0;
     let mut skipped = 0;
+    // Two entries renamed to one name is a real archive layout (two platforms'
+    // `app.exe` in one zip), so the collision is said out loud rather than left
+    // to the last write winning in silence.
+    let mut renamed_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|ex| {
@@ -63,13 +67,29 @@ pub fn extract(
             continue;
         }
 
-        let target = join_inside(&root, &relative);
+        let target_rule = options
+            .renames
+            .iter()
+            .find(|rule| glob::matches(&relative, &rule.pattern));
+        let written_as = match target_rule {
+            Some(rule) => rule.target.as_str(),
+            None => relative.as_str(),
+        };
+        let target = join_inside(&root, written_as);
         let Some(target) = target else {
             log::warn(&format!(
                 "refusing to extract outside the destination: {raw_name}"
             ));
             continue;
         };
+        if let Some(rule) = target_rule {
+            if !renamed_targets.insert(rule.target.clone()) {
+                log::warn(&format!(
+                    "more than one entry maps to {}, the last one extracted wins",
+                    rule.target
+                ));
+            }
+        }
 
         if target.exists() && !force && !options.overwrite {
             skipped += 1;
@@ -100,7 +120,10 @@ pub fn extract(
             }
         })?;
         written += 1;
-        log::progress(&format!("extracted {relative}"));
+        match target_rule {
+            Some(rule) => log::progress(&format!("extracted {relative} as {}", rule.target)),
+            None => log::progress(&format!("extracted {relative}")),
+        }
     }
 
     let summary = format!("archive: {written} extracted, {skipped} skipped");
@@ -199,10 +222,18 @@ mod tests {
         ExtractOptions {
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
             destination: destination.to_string_lossy().to_string(),
-            strip_prefix: 0,
-            overwrite: false,
-            keep_zip: true,
+            ..ExtractOptions::default()
         }
+    }
+
+    fn rules(pairs: &[(&str, &str)]) -> Vec<RenameRule> {
+        pairs
+            .iter()
+            .map(|(pattern, target)| RenameRule {
+                pattern: pattern.to_string(),
+                target: target.to_string(),
+            })
+            .collect()
     }
 
     #[test]
@@ -283,6 +314,64 @@ mod tests {
             std::fs::read_to_string(destination.join("data.txt")).expect("file"),
             "new"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_as_renames_matched_entries() {
+        let dir = workdir("rename");
+        let archive = dir.join("a.zip");
+        make_archive(
+            &archive,
+            &[
+                ("wrapper/tool.exe", "exe"),
+                ("wrapper/tool.dll", "dll"),
+                ("wrapper/docs/README.md", "readme"),
+            ],
+        );
+        let destination = dir.join("out");
+        let mut opts = options(&destination, &["*"]);
+        opts.strip_prefix = 1;
+        opts.renames = rules(&[
+            ("*.exe", "bin/mytool.exe"),
+            ("docs/README.md", "README.txt"),
+        ]);
+
+        extract(archive.to_str().unwrap(), &opts, false).expect("extract");
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("bin/mytool.exe")).expect("renamed exe"),
+            "exe"
+        );
+        assert!(!destination.join("tool.exe").exists(), "the old name is gone");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("README.txt")).expect("renamed readme"),
+            "readme"
+        );
+        // An entry no rule matches keeps the path it has in the archive.
+        assert_eq!(
+            std::fs::read_to_string(destination.join("tool.dll")).expect("untouched dll"),
+            "dll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_first_matching_rule_wins() {
+        let dir = workdir("rename-first");
+        let archive = dir.join("a.zip");
+        make_archive(&archive, &[("app.exe", "exe")]);
+        let destination = dir.join("out");
+        let mut opts = options(&destination, &["*"]);
+        opts.renames = rules(&[("*", "any.exe"), ("*.exe", "never.exe")]);
+
+        extract(archive.to_str().unwrap(), &opts, false).expect("extract");
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("any.exe")).expect("first rule wins"),
+            "exe"
+        );
+        assert!(!destination.join("never.exe").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

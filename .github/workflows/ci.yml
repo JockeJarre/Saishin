@@ -9,6 +9,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every action below sits on the major that declares `runs.using: node24`. The
+# runners dropped Node 20 in September 2026 and force a Node 20 action onto
+# Node 24, which ends every job with the warning
+# 'Node.js 20 is deprecated. The following actions target Node.js 20 ...'.
+# Moving to the Node 24 majors is what silences it: checkout v5, setup-python
+# v6 and upload-artifact v6 are those releases, and rust-cache v2 (2.9) and
+# dtolnay/rust-toolchain (a composite action) already need nothing of the sort.
+
 jobs:
   build:
     name: build (${{ matrix.os }})
@@ -39,7 +47,7 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
 
       # Cargo.toml holds the version, so the artifact names match the binary's
@@ -156,7 +164,7 @@ jobs:
           ./scripts/check-version.ps1 dist/saishin.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
           ./scripts/check-version.ps1 dist/saishin-cli.exe -Version "${{ steps.version.outputs.version }}" -Sha $sha
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.name.outputs.stem }}
           path: dist/*
@@ -172,8 +180,8 @@ jobs:
     name: icon from the masters
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - run: pip install pillow
