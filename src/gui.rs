@@ -285,10 +285,16 @@ const HEADER_WORD_SIZE: f32 = 34.0;
 const HEADER_SIDE_MARGIN: i8 = 12;
 const _: () = assert!(HEADER_ROW > HEADER_LOGO && HEADER_LOGO > HEADER_WORD_SIZE);
 
-/// The height the log strip takes when it is open. Past that the list scrolls and
-/// keeps following the newest line, so a run of a thousand lines cannot make the
-/// window a thousand rows tall.
+/// The height the log strip starts with when it is open. The strip is
+/// resizable by its divider, so this is only the first height; past it the
+/// list scrolls and keeps following the newest line, so a run of a thousand
+/// lines cannot make the window a thousand rows tall.
 const LOG_LINES_HEIGHT: f32 = 180.0;
+/// The least height the strip's divider can be dragged to: the header row and
+/// a couple of lines. Below that the list is a strip with extra steps, and a
+/// divider dragged that far has meant to close the strip, which the header's
+/// click says properly.
+const LOG_MIN_HEIGHT: f32 = 80.0;
 
 /// The strip's text size. The small style is 9 pt and the body 13 pt, and a log
 /// sits between them: paths, sizes and the columns of the progress lines stay
@@ -541,61 +547,118 @@ impl SelectionApp {
         let lines = std::mem::take(&mut self.log_lines);
         let count = lines.len();
 
+        // Which side of the strip this frame is. The collapsing header keeps
+        // its open state under its id, and both sides give theirs the same
+        // id_salt, so clicking the triangle on either side carries the toggle
+        // to the other; this copy is what picks the panel to draw.
+        let open_id = ui.scope_id().with("log-strip-open");
+        let mut open = ui.data_mut(|d| d.get_persisted::<bool>(open_id)).unwrap_or(false);
+
         // The lines are the point of this strip. The header's toggle needs the
         // left inset and nothing needs the right, so the frame hugs the right
         // edge; the body is drawn unindented, because the 18 pt of indent a
         // collapsing header asks its body for is width a wrapped path line loses
         // and gains nothing by; and the scrollbar floats over the text instead of
         // taking a column of its own.
-        egui::Panel::bottom("log")
-            .frame(egui::Frame::new().fill(ui.style().visuals.panel_fill).inner_margin(
+        let frame = |ui: &egui::Ui| {
+            egui::Frame::new().fill(ui.style().visuals.panel_fill).inner_margin(
                 egui::Margin { left: 8, right: 2, top: 2, bottom: 2 },
-            ))
-            .show(ui, |ui| {
-                let style = ui.style_mut();
-                style.spacing.scroll.floating = true;
-                style.spacing.scroll.floating_allocated_width = 0.0;
+            )
+        };
 
-                // The width the strip's text has, in characters. The window is
-                // whatever width the user left it, so the line the closed strip
-                // picks is chosen against the room there is, not a fixed count.
-                let chars = strip_chars(ui.available_width());
+        if open {
+            // A resizable panel: its top edge is a divider the pointer can
+            // take, and egui remembers the height it leaves. The height is
+            // only honoured while the contents fill the panel, so the list
+            // below asks for the panel's whole remaining height rather than a
+            // fixed 180 pt, and the divider has the full edge to drag on.
+            egui::Panel::bottom("log")
+                .resizable(true)
+                .default_size(LOG_LINES_HEIGHT)
+                .min_size(LOG_MIN_HEIGHT)
+                .frame(frame(ui))
+                .show(ui, |ui| {
+                    let style = ui.style_mut();
+                    style.spacing.scroll.floating = true;
+                    style.spacing.scroll.floating_allocated_width = 0.0;
 
-                let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
-                    .default_open(false)
-                    .show_unindented(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
-                            .max_height(LOG_LINES_HEIGHT)
-                            // Open in one direction only: a vertical scroll area
-                            // hands its content an unbounded width by default, and
-                            // a label with no width to wrap at draws one long line
-                            // and loses its end at the edge of the window. Ask for
-                            // the full width and the lines wrap to fill it.
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for line in lines.iter() {
-                                    ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
-                                }
-                            });
-                    });
-                // The body is `None` exactly while the header is collapsed, which
-                // is the state the strip is in.
-                if header.body_returned.is_none() {
-                    if let Some(line) = strip_line(&lines, chars) {
+                    let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
+                        .id_salt("log")
+                        .default_open(true)
+                        .show_unindented(ui, |ui| {
+                            let list_height = ui.available_height();
+                            egui::ScrollArea::vertical()
+                                .stick_to_bottom(true)
+                                .max_height(list_height)
+                                // Fill both ways: a vertical scroll area hands
+                                // its content an unbounded width by default, and
+                                // a label with no width to wrap at draws one long
+                                // line that loses its end at the window's edge;
+                                // a height that shrinks to its rows would leave
+                                // the space the divider's drag gained unused.
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for line in lines.iter() {
+                                        ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                                    }
+                                });
+                        });
+                    // The body is `None` exactly while the header's click has
+                    // closed it, and the strip's one-line side takes the next
+                    // frame. The divider's remembered height is the open panel's
+                    // own state and waits under the strip for the next opening.
+                    if header.body_returned.is_none() {
+                        open = false;
+                    }
+                });
+        } else {
+            // The closed strip is a panel of its own, unresizable: a resizable
+            // panel keeps the height the divider left it, and that much empty
+            // frame under a one-line strip is not a strip at all. Its id is not
+            // the open panel's, so its own small size is what gets stored and
+            // the strip's list keeps the height the last drag left.
+            egui::Panel::bottom("log_closed")
+                .frame(frame(ui))
+                .show(ui, |ui| {
+                    let style = ui.style_mut();
+                    style.spacing.scroll.floating = true;
+                    style.spacing.scroll.floating_allocated_width = 0.0;
+
+                    // The width the strip's text has, in characters. The window
+                    // is whatever width the user left it, so the line the closed
+                    // strip picks is chosen against the room there is, not a
+                    // fixed count.
+                    let chars = strip_chars(ui.available_width());
+
+                    let header = egui::CollapsingHeader::new(format!("Log ({count} lines)"))
+                        .id_salt("log")
+                        .default_open(false)
+                        .show_unindented(ui, |_ui| {});
+                    if header.body_returned.is_some() {
+                        // The body ran, so the triangle has been clicked: the
+                        // strip asks to be the open side from the next frame.
+                        open = true;
+                    } else if let Some(line) = strip_line(&lines, chars) {
                         // `truncate` keeps the strip one line tall whatever the
                         // text, and the tooltip is what makes a line that is cut
                         // by that readable rather than merely short.
-                        ui.add(
+                        let strip = ui.add(
                             egui::Label::new(log_line_text(line))
                                 .selectable(true)
                                 .truncate()
                                 .show_tooltip_when_elided(true),
                         );
+                        // A plain click opens the strip too; a selection drag is
+                        // not a click, so copying a path out of the strip keeps
+                        // working.
+                        if strip.clicked() {
+                            open = true;
+                        }
                     }
-                }
-            });
+                });
+        }
 
+        ui.data_mut(|d| d.insert_persisted(open_id, open));
         self.log_lines = lines;
     }
 

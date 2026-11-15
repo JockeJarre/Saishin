@@ -21,11 +21,13 @@ out_dir = ./downloads
 ; Optional. Name under which the token is filed in the OS secure store.
 ; keyring_service = saishin
 
-; Optional. Which front end runs. true opens the selection window (for a
-; desktop button); false keeps the run headless for a script or a scheduled
-; task. A --gui / --no-gui switch on the command line wins over this key.
-; Default: false.
-; gui = true
+; Optional. Which entry point opens the selection window when the command line
+; says nothing: off, launcher (the icon's saishin, double-clicked), cli (a
+; terminal saishin-cli) or always. A terminal run is headless under launcher,
+; which is what 'true' means; 'false' is off. A --gui / --no-gui switch on the
+; command line wins over this key.
+; Default: off.
+; gui = launcher
 
 ; Optional. What the selection window does when the run ends. false keeps it
 ; open on its end state, with an OK button, so the log strip at the bottom

@@ -10,7 +10,7 @@ mod secrets;
 mod zip_handler;
 
 use chrono::{DateTime, Utc};
-use config::{AppConfig, SourceConfig, SourceKind};
+use config::{AppConfig, GuiMode, SourceConfig, SourceKind};
 use downloader::{format_bytes, Downloader};
 use error::AppError;
 use futures_util::future::join_all;
@@ -257,10 +257,26 @@ fn a_console_can_answer() -> bool {
 
 /// Which front end runs. The command line wins: `--gui` opens the window even
 /// when the config says headless, `--no-gui` is the escape hatch for a config
-/// with `gui = true` (a scheduled task, a script). Without a flag, `[general]
-/// gui` decides.
-fn use_gui(options: &Options, config: &AppConfig) -> bool {
-    options.gui.unwrap_or(config.gui)
+/// that asks for a window (a scheduled task, a script).
+///
+/// With no flag, `[general] gui` decides, and it decides **per entry point**:
+/// `saishin-cli` typed in a terminal is a run that wants its transcript, and a
+/// double-click of the icon is a run that wants a window, so the same `true`
+/// cannot mean both. The launcher's run is recognised by the environment
+/// variable it sets for its child, and the key's words name which of the two
+/// gets the window — `launcher` (what `true` means) is the launcher only, so a
+/// terminal run stays headless until it asks for `--gui`.
+fn use_gui(options: &Options, config: &AppConfig, from_launcher: bool) -> bool {
+    options
+        .gui
+        .unwrap_or_else(|| config.gui.opens_window_for(from_launcher))
+}
+
+/// Whether this run is the icon's launcher's child. The launcher sets this for
+/// its child alone, so a program started from a terminal, a script or a
+/// scheduled task never reads as one.
+fn started_by_launcher() -> bool {
+    std::env::var_os("SAISHIN_LAUNCHER").is_some()
 }
 
 /// Give back a console that launching the exe from a shortcut created on its
@@ -305,13 +321,15 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
     // stream. The switch closes the warnings and the errors too - the strip
     // shows them, and a launcher boxes whatever its pipes catch, which is how a
     // run of extract warnings ended up in a box after its window closed.
-    if use_gui(options, &config) {
+    let gui_run = use_gui(options, &config, started_by_launcher());
+    if gui_run {
         log::window_is_the_report();
     }
 
-    let token = resolve_token(&config, Path::new(&config_path), &selected, &http, options).await?;
+    let token =
+        resolve_token(&config, Path::new(&config_path), &selected, &http, options, gui_run).await?;
 
-    if use_gui(options, &config) {
+    if gui_run {
         // The stream is already off (decided above, before the token). Here the
         // problems go too: the console is released just below, and text in the
         // console a double-click created is what keeps that window standing.
@@ -553,12 +571,16 @@ fn select_sources(config: &AppConfig, options: &Options) -> Result<Vec<SourceCon
         .collect())
 }
 
+// gui_run and config_path are read only where a window run has no console to
+// prompt a token in, which is the Windows path.
+#[cfg_attr(not(windows), allow(unused_variables))]
 async fn resolve_token(
     config: &AppConfig,
     config_path: &Path,
     selected: &[SourceConfig],
     http: &Downloader,
     options: &Options,
+    gui_run: bool,
 ) -> Result<Option<String>, AppError> {
     let github_sources: Vec<&SourceConfig> = selected
         .iter()
@@ -602,7 +624,7 @@ async fn resolve_token(
     // window asks in a box, and the prompt is opened where it can be answered. A
     // window started from a terminal keeps the prompt it has.
     #[cfg(windows)]
-    if use_gui(options, config) && !a_console_can_answer() {
+    if gui_run && !a_console_can_answer() {
         let names = waiting_names(&github_sources, &actions_sources);
         if notifier::ask(CAPTION, &token_box_text(&names)) {
             match login_in_a_prompt(config, config_path) {
@@ -1789,30 +1811,47 @@ mod tests {
     }
 
     #[test]
-    fn the_config_gui_setting_is_the_default_front_end() {
-        let headless = config_with_gui_flag(false);
-        let graphical = config_with_gui_flag(true);
+    fn the_config_gui_key_names_the_entry_point_that_gets_the_window() {
+        let headless = config_with_gui_mode(GuiMode::Off);
+        let launcher_only = config_with_gui_mode(GuiMode::Launcher);
+        let cli_only = config_with_gui_mode(GuiMode::Cli);
+        let both = config_with_gui_mode(GuiMode::Always);
         let no_flag = Options::parse(&[]).expect("parses");
-        assert!(!use_gui(&no_flag, &headless));
-        assert!(use_gui(&no_flag, &graphical));
+
+        // A `saishin-cli` typed in a terminal: no flag means no window, which is
+        // what gui = true has always given a terminal run in practice, and what
+        // gui = true silently stopped being once the key opened a window here.
+        assert!(!use_gui(&no_flag, &headless, false));
+        assert!(!use_gui(&no_flag, &launcher_only, false));
+        assert!(use_gui(&no_flag, &cli_only, false));
+        assert!(use_gui(&no_flag, &both, false));
+
+        // The icon's launcher: gui = launcher (today's `true`) opens the window,
+        // and gui = cli keeps that run headless.
+        assert!(!use_gui(&no_flag, &headless, true));
+        assert!(use_gui(&no_flag, &launcher_only, true));
+        assert!(!use_gui(&no_flag, &cli_only, true));
+        assert!(use_gui(&no_flag, &both, true));
     }
 
     #[test]
     fn command_line_gui_flags_win_over_the_config() {
-        let headless = config_with_gui_flag(false);
-        let graphical = config_with_gui_flag(true);
+        let headless = config_with_gui_mode(GuiMode::Off);
+        let graphical = config_with_gui_mode(GuiMode::Always);
         assert!(use_gui(
             &Options::parse(&["--gui".to_string()]).expect("parses"),
-            &headless
+            &headless,
+            false
         ));
         assert!(!use_gui(
             &Options::parse(&["--no-gui".to_string()]).expect("parses"),
-            &graphical
+            &graphical,
+            true
         ));
     }
 
     /// A config differing only in `[general] gui`.
-    fn config_with_gui_flag(gui: bool) -> AppConfig {
+    fn config_with_gui_mode(gui: GuiMode) -> AppConfig {
         AppConfig {
             base_directory: String::new(),
             default_out_dir: String::new(),
@@ -1994,7 +2033,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             window_centered: true,
             close_on_finish: false,
-            gui: false,
+            gui: GuiMode::Off,
             releases: 10,
             sources: Vec::new(),
         };
@@ -2010,7 +2049,7 @@ mod tests {
             keyring_service: "saishin".to_string(),
             window_centered: true,
             close_on_finish: false,
-            gui: false,
+            gui: GuiMode::Off,
             releases: 10,
             sources: Vec::new(),
         };
@@ -2084,7 +2123,8 @@ OPTIONS
       --login            Store or replace the GitHub token, then exit
       --logout           Remove the stored GitHub token, then exit
   -q, --quiet            Suppress progress and informational output
-      --gui              Show a selection window for new artifacts before downloading
+      --gui              Open the selection window; a terminal run is headless
+                         without it, whatever [general] gui says
       --no-gui           Run headless, ignoring [general] gui
   -V, --version          Show the version, commit and target, then exit
   -h, --help             Show this help
