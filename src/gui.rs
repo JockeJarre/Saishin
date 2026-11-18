@@ -1028,6 +1028,19 @@ impl App for SelectionApp {
             if self.centered_at_startup {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 self.shown = true;
+            } else if cfg!(target_os = "macos") {
+                // The window is already on screen (winit cannot create it
+                // hidden on macOS). Place it once, when the monitor size is
+                // known, and never send OuterPosition again: the loop below
+                // re-sends every frame and the window visibly jittered, the
+                // show/hide churn being the flicker the Mac tester saw.
+                let monitor = ctx.input(|i| i.viewport().monitor_size);
+                if let Some(m) = monitor {
+                    let size = egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT);
+                    let target = egui::pos2(m.x / 2.0 - size.x / 2.0, m.y / 2.0 - size.y / 2.0);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                    self.shown = true;
+                }
             } else {
                 let (monitor, outer) = ctx.input(|i| {
                     let v = i.viewport();
@@ -1441,6 +1454,11 @@ pub fn run_gui(
     let load = Arc::new(Mutex::new(LoadState::Working));
 
     let mut native_options = eframe::NativeOptions::default();
+    // Never eframe's built-in centering: on macOS it is the same hide/center/
+    // show dance, and winit cannot honor hidden-before-map there, so it
+    // flickers (emilk/egui#4724). Windows centers pre-map via
+    // centered_position(); macOS centers once in logic(); X11/Wayland centers
+    // in the existing loop, where hidden-at-creation is honored.
     native_options.centered = false;
     native_options.persist_window = false;
     // The window icon is the logo, taken as the pixels the build script wrote:
@@ -1450,7 +1468,12 @@ pub fn run_gui(
         width: LOGO_SIZE as u32,
         height: LOGO_SIZE as u32,
     });
-    let startup_center = if window_centered {
+    // Windows centers pre-map (centered_position reads the work area) and
+    // starts hidden. macOS starts visible: winit cannot create a window hidden
+    // there, and logic() places it in one jump. Elsewhere the window starts
+    // hidden and logic() centers and shows it.
+    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    let startup_center = if window_centered && !cfg!(target_os = "macos") {
         centered_position(WINDOW_WIDTH, WINDOW_HEIGHT)
     } else {
         None
@@ -1462,7 +1485,9 @@ pub fn run_gui(
         .with_icon(app_icon);
     builder = match startup_center {
         Some([x, y]) => builder.with_position([x, y]).with_visible(false),
-        None => builder.with_visible(!window_centered),
+        // On macOS, start visible: hidden-before-map is what winit cannot
+        // honor, and logic() places the window in one jump.
+        None => builder.with_visible(window_centered && cfg!(target_os = "macos") || !window_centered),
     };
     native_options.viewport = builder;
     let gui_result = Arc::clone(&result);
