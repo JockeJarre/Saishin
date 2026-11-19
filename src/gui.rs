@@ -752,6 +752,17 @@ fn field(ui: &mut egui::Ui, label: &str, text: &str, hint: &str, value: &mut Str
     response.on_hover_text(text);
 }
 
+/// A clipboard line made to fit a one-line field: the line breaks and tabs
+/// the copy carries become `", "` - the separator the list fields speak - and
+/// the ends of the whole are trimmed.
+fn paste_clean(text: &str) -> String {
+    text.split(['\n', '\r', '\t'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn check_field(ui: &mut egui::Ui, label: &str, text: &str, value: &mut bool) {
     let response = ui
         .horizontal(|ui| {
@@ -777,7 +788,9 @@ fn icon_button(
     draw: fn(&egui::Painter, egui::Rect, egui::Color32),
 ) -> bool {
     let _ = salt;
-    let (rect, response) = ui.allocate_at_least(egui::vec2(ICON_SIZE, ICON_SIZE), egui::Sense::hover());
+    // Click sense, not just hover: a hover-only response reports no clicks,
+    // and the mark would answer nothing.
+    let (rect, response) = ui.allocate_at_least(egui::vec2(ICON_SIZE, ICON_SIZE), egui::Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(rect.shrink(1.0), 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
@@ -1010,6 +1023,59 @@ impl SelectionApp {
                 });
             });
         close
+    }
+
+    /// The sections with no rows, listed with the marks: a source that found
+    /// nothing new is invisible in the table above, and a person editing the
+    /// file from the window has to be able to reach those too - they are the
+    /// majority of it on a quiet day. One row per section, trash and pencil
+    /// at the left, the name saying which. `seen` is the table's sources,
+    /// lower-cased; the empty screen passes nothing and lists every section.
+    fn quiet_list(
+        &self,
+        ui: &mut egui::Ui,
+        model: &ConfigModel,
+        seen: &[String],
+    ) -> Option<(String, bool)> {
+        let quiet: Vec<&EditableSource> = model
+            .sources
+            .iter()
+            .filter(|section| !seen.contains(&section.name.to_lowercase()))
+            .collect();
+        if quiet.is_empty() {
+            return None;
+        }
+        let mut action: Option<(String, bool)> = None;
+        ui.add_space(10.0);
+        ui.weak("sources with no new artifacts:");
+        for section in quiet {
+            let name = section.name.clone();
+            ui.horizontal(|ui| {
+                let trash = icon_button(
+                    ui,
+                    &format!("trash-{name}"),
+                    &format!("Delete [{name}] from saishin.ini"),
+                    TRASH_RED,
+                    paint_trash,
+                );
+                let edit = icon_button(
+                    ui,
+                    &format!("edit-{name}"),
+                    &format!("Edit [{name}]"),
+                    PENCIL_BLUE,
+                    paint_pencil,
+                );
+                if trash {
+                    action = Some((name.clone(), false));
+                }
+                if edit {
+                    action = Some((name, true));
+                }
+                ui.label(section.name.clone());
+                ui.weak("no new artifacts");
+            });
+        }
+        action
     }
 
     /// Write the model and restart the check against it. The typed sources are
@@ -1697,6 +1763,19 @@ impl App for SelectionApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The clipboard hands over whole lines - browser address bars and ini
+        // snippets carry newlines and tabs - and the fields are one line
+        // wide, with the list fields read as comma separated. Straightening
+        // the paste here, before any field sees it, is what turns a pasted
+        // block of urls into one list field the loader can read.
+        ui.ctx().input_mut(|input| {
+            for event in &mut input.events {
+                if let egui::Event::Paste(text) = event {
+                    *text = paste_clean(text);
+                }
+            }
+        });
+
         let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
 
         // The two kanji are outside egui's bundled font, so the glyphs have to
@@ -1801,8 +1880,23 @@ impl App for SelectionApp {
                         // this is the window's one screen for saying so.
                         if self.model.sources.is_empty() {
                             ui.label("No sources in saishin.ini. Use **Add source** below.");
-                        } else {
-                            ui.label("No new artifacts.");
+                            return;
+                        }
+                        ui.label("No new artifacts.");
+                        // The sections are all reachable here: none of them has
+                        // rows, so the list below is the whole file.
+                        let model = self.model.clone();
+                        if let Some((name, is_edit)) = self.quiet_list(ui, &model, &[]) {
+                            self.editor = if is_edit {
+                                match model.find(&name) {
+                                    Some(section) => {
+                                        Editor::Edit(name, SourceForm::from_source(section))
+                                    }
+                                    None => Editor::Closed,
+                                }
+                            } else {
+                                Editor::ConfirmDelete(name)
+                            };
                         }
                         return;
                     }
@@ -1820,6 +1914,17 @@ impl App for SelectionApp {
                     // The rows ask the model for the section a name edits,
                     // and the drawing loop already borrows the app.
                     let model = self.model.clone();
+                    // The marks ride the first row of each source only: the
+                    // rows of one source stand under one section, and the
+                    // marks above its name answer for all of them.
+                    let mut last_source: Option<String> = None;
+                    // Which sections have rows: the ones without are listed
+                    // under the table, where their marks can reach them too.
+                    let seen: Vec<String> = self
+                        .entries
+                        .iter()
+                        .map(|entry| entry.file.source_name.to_lowercase())
+                        .collect();
 
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -1835,32 +1940,38 @@ impl App for SelectionApp {
                                     ui.strong("file");
                                     ui.end_row();
                                     for (index, entry) in self.entries.iter_mut().enumerate() {
-                                        // Checkmark first, then the two editor
-                                        // marks: every row says which source it
-                                        // came from, so every row is where that
-                                        // source is deleted or edited.
+                                        // Checkmark on every row; the trash and
+                                        // the pencil only where the source
+                                        // starts: the marks edit one section,
+                                        // and repeating them per row is noise.
                                         let source = entry.file.source_name.clone();
+                                        let marks = last_source
+                                            .as_deref()
+                                            .map_or(true, |prev| !prev.eq_ignore_ascii_case(&source));
+                                        last_source = Some(source.clone());
                                         ui.horizontal(|ui| {
                                             ui.checkbox(&mut entry.selected, "");
-                                            let trash = icon_button(
-                                                ui,
-                                                &format!("trash-{source}"),
-                                                &format!("Delete [{source}] from saishin.ini"),
-                                                TRASH_RED,
-                                                paint_trash,
-                                            );
-                                            let edit = icon_button(
-                                                ui,
-                                                &format!("edit-{source}"),
-                                                &format!("Edit [{source}]"),
-                                                PENCIL_BLUE,
-                                                paint_pencil,
-                                            );
-                                            if trash {
-                                                row_action = Some((source.clone(), false));
-                                            }
-                                            if edit {
-                                                row_action = Some((source, true));
+                                            if marks {
+                                                let trash = icon_button(
+                                                    ui,
+                                                    &format!("trash-{source}"),
+                                                    &format!("Delete [{source}] from saishin.ini"),
+                                                    TRASH_RED,
+                                                    paint_trash,
+                                                );
+                                                let edit = icon_button(
+                                                    ui,
+                                                    &format!("edit-{source}"),
+                                                    &format!("Edit [{source}]"),
+                                                    PENCIL_BLUE,
+                                                    paint_pencil,
+                                                );
+                                                if trash {
+                                                    row_action = Some((source.clone(), false));
+                                                }
+                                                if edit {
+                                                    row_action = Some((source, true));
+                                                }
                                             }
                                         });
                                         ui.label(entry.file.source_name.clone());
@@ -1912,6 +2023,13 @@ impl App for SelectionApp {
                                         ui.end_row();
                                     }
                                 });
+
+                            // The sources the run found nothing new for stand
+                            // below the table, so the marks reach every section
+                            // in the file, not just the ones with rows.
+                            if let Some(action) = self.quiet_list(ui, &model, &seen) {
+                                row_action = Some(action);
+                            }
                         });
 
                     if let Some((name, is_edit)) = row_action {
