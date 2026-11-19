@@ -840,7 +840,11 @@ impl SelectionApp {
                 let name = name.clone();
                 let mut close = false;
                 let mut remove = false;
-                egui::Modal::new(egui::Id::unique("delete_source")).show(ui.ctx(), |ui| {
+                // The id is from the name, not unique: a unique id would be
+                // a new one every frame, and the dialog's widgets - the
+                // fields above all - need to be the same widget between
+                // frames to be writable.
+                egui::Modal::new(egui::Id::new("delete_source")).show(ui.ctx(), |ui| {
                     ui.heading("Delete source?");
                     ui.label(format!("Remove [{name}] from saishin.ini?"));
                         ui.label("Files already downloaded stay on disk.");
@@ -853,7 +857,9 @@ impl SelectionApp {
                                 egui::vec2(OK_WIDTH, OK_HEIGHT),
                                 egui::Button::new(egui::RichText::new("Delete").strong()),
                             );
-                            del.request_focus();
+                            if ui.ctx().memory(|m| m.focused().is_none()) {
+                                del.request_focus();
+                            }
                             if del.clicked() {
                                 remove = true;
                             }
@@ -895,7 +901,11 @@ impl SelectionApp {
         form: &mut SourceForm,
     ) -> bool {
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("source_form")).show(ui.ctx(), |ui| {
+        // The id is from the name and stays: it is one window serving both
+        // **Add source** and **Edit source**, and its widgets - the text
+        // fields most of all - are only editable while the id says they are
+        // the same widget from frame to frame.
+        egui::Modal::new(egui::Id::new("source_form")).show(ui.ctx(), |ui| {
             ui.heading(title);
 
                 egui::ScrollArea::vertical()
@@ -958,7 +968,13 @@ impl SelectionApp {
                         egui::vec2(OK_WIDTH, OK_HEIGHT),
                         egui::Button::new(egui::RichText::new("Save").strong()),
                     );
-                    save.request_focus();
+                    // The keys are handed over only while the dialog holds
+                    // nothing focused: asked every frame, the request would
+                    // pull the caret out of any field the cursor picked, and
+                    // the fields could not be typed in at all.
+                    if ui.ctx().memory(|m| m.focused().is_none()) {
+                        save.request_focus();
+                    }
                     if save.clicked() {
                         match form.apply(model, old_name.as_deref()) {
                             Err(msg) => form.error = msg,
