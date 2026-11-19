@@ -825,54 +825,6 @@ fn paint_pencil(painter: &egui::Painter, r: egui::Rect, color: egui::Color32) {
 }
 
 impl SelectionApp {
-    /// The sources of saishin.ini as a row of named chips: trash at the far
-    /// left of each, pencil at the right, exactly where the run's rows say
-    /// which source they came from.
-    fn sources_bar(&mut self, ui: &mut egui::Ui) {
-        // The model is cloned, as the log strip clones its lines: the drawing
-        // loop borrows it, and a click writes self.editor.
-        let model = self.model.clone();
-        let mut action: Option<(String, bool)> = None;
-        ui.horizontal(|ui| {
-            ui.weak("sources:");
-            for source in &model.sources {
-                let name = source.name.clone();
-                let trash = icon_button(
-                    ui,
-                    &format!("trash-{name}"),
-                    &format!("Delete [{name}] from saishin.ini"),
-                    TRASH_RED,
-                    paint_trash,
-                );
-                ui.label(&name);
-                let edit = icon_button(
-                    ui,
-                    &format!("edit-{name}"),
-                    &format!("Edit [{name}]"),
-                    PENCIL_BLUE,
-                    paint_pencil,
-                );
-                if trash {
-                    action = Some((name.clone(), false));
-                }
-                if edit {
-                    action = Some((name, true));
-                }
-                ui.separator();
-            }
-        });
-        if let Some((name, is_edit)) = action {
-            self.editor = if is_edit {
-                match model.find(&name) {
-                    Some(source) => Editor::Edit(name, SourceForm::from_source(source)),
-                    None => Editor::Closed,
-                }
-            } else {
-                Editor::ConfirmDelete(name)
-            };
-        }
-    }
-
     /// The modal dialogs, drawn over the panel of whichever phase is showing.
     /// The editor is taken out and put back, as the log strip takes its lines:
     /// the dialog writes while the app is read.
@@ -1827,7 +1779,6 @@ impl App for SelectionApp {
 
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.heading("Saishin - new artifacts");
-                    self.sources_bar(ui);
 
                     if self.entries.is_empty() {
                         // Every source deleted is a legal state of the file, and
@@ -1845,8 +1796,14 @@ impl App for SelectionApp {
 
                     // Picking a version changes rows, so the picks are
                     // collected while drawing and applied once the list is
-                    // rendered.
+                    // rendered. The same pattern serves the row's trash and
+                    // pencil: a click is remembered, and the editor opens
+                    // when the grid has let go of the entries.
                     let mut picks: Vec<(usize, usize)> = Vec::new();
+                    let mut row_action: Option<(String, bool)> = None;
+                    // The rows ask the model for the section a name edits,
+                    // and the drawing loop already borrows the app.
+                    let model = self.model.clone();
 
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -1862,7 +1819,34 @@ impl App for SelectionApp {
                                     ui.strong("file");
                                     ui.end_row();
                                     for (index, entry) in self.entries.iter_mut().enumerate() {
-                                        ui.checkbox(&mut entry.selected, "");
+                                        // Checkmark first, then the two editor
+                                        // marks: every row says which source it
+                                        // came from, so every row is where that
+                                        // source is deleted or edited.
+                                        let source = entry.file.source_name.clone();
+                                        ui.horizontal(|ui| {
+                                            ui.checkbox(&mut entry.selected, "");
+                                            let trash = icon_button(
+                                                ui,
+                                                &format!("trash-{source}"),
+                                                &format!("Delete [{source}] from saishin.ini"),
+                                                TRASH_RED,
+                                                paint_trash,
+                                            );
+                                            let edit = icon_button(
+                                                ui,
+                                                &format!("edit-{source}"),
+                                                &format!("Edit [{source}]"),
+                                                PENCIL_BLUE,
+                                                paint_pencil,
+                                            );
+                                            if trash {
+                                                row_action = Some((source.clone(), false));
+                                            }
+                                            if edit {
+                                                row_action = Some((source, true));
+                                            }
+                                        });
                                         ui.label(entry.file.source_name.clone());
                                         let size = match entry.file.size {
                                             Some(bytes) => format_bytes(bytes),
@@ -1913,6 +1897,20 @@ impl App for SelectionApp {
                                     }
                                 });
                         });
+
+                    if let Some((name, is_edit)) = row_action {
+                        self.editor = if is_edit {
+                            match model.find(&name) {
+                                Some(section) => Editor::Edit(name, SourceForm::from_source(section)),
+                                // A row whose section is gone (edited away in
+                                // this very frame) opens nothing.
+                                None => Editor::Closed,
+                            }
+                        } else {
+                            Editor::ConfirmDelete(name)
+                        };
+                        ui.ctx().request_repaint();
+                    }
 
                     if !picks.is_empty() {
                         apply_picks(&mut self.entries, &mut self.families, picks);
