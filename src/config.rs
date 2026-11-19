@@ -75,6 +75,262 @@ pub struct AppConfig {    // Base directory of the INI file; currently informati
 
 type Sections = HashMap<String, HashMap<String, String>>;
 
+/// One source section as the editor sees it: the section name and the
+/// `key = value` lines exactly as they stand in the file, in file order.
+/// Values are never escaped and never resolved, so a path stays a path
+/// (`C:\Saishin\tables` survives) and keys this build has no field for ride
+/// along untouched. The typed view, `SourceConfig`, is derived on demand by
+/// `to_source`, so parsing keeps one home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditableSource {
+    pub name: String,
+    pub pairs: Vec<(String, String)>,
+}
+
+/// The file as the editor sees it: everything up to and including the
+/// `[general]` block is kept verbatim - comments, blank lines, all of it - and
+/// the source sections are the editable pairs. `save` writes the header back
+/// byte for byte and regenerates the sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigModel {
+    pub path: String,
+    /// The file text up to the first source section, header comments and the
+    /// `[general]` section included. Written back as it was read.
+    pub header: String,
+    pub sources: Vec<EditableSource>,
+}
+
+impl EditableSource {
+    /// The value of `key`, case-insensitive, last occurrence winning as the
+    /// loader's map does.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        let want = key.to_lowercase();
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(k, _)| k.to_lowercase() == want)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Sets `key` to `value`. An existing key keeps its written case and place;
+    /// a new key is appended. An empty value removes the key, which is how the
+    /// editor spells "this type has no use for that parameter".
+    pub fn set(&mut self, key: &str, value: &str) {
+        let want = key.to_lowercase();
+        let hits: Vec<usize> = self
+            .pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| k.to_lowercase() == want)
+            .map(|(i, _)| i)
+            .collect();
+        if value.is_empty() {
+            for i in hits.into_iter().rev() {
+                self.pairs.remove(i);
+            }
+            return;
+        }
+        match hits.first() {
+            Some(&first) => {
+                self.pairs[first].1 = value.to_string();
+                // Keep the one-winner contract the loader's map has.
+                for i in hits.into_iter().rev().skip(1) {
+                    self.pairs.remove(i);
+                }
+            }
+            None => self.pairs.push((key.to_string(), value.to_string())),
+        }
+    }
+
+    /// The typed view, through the loader's own `read_source`: the same rules,
+    /// the same defaults and the same error words a bad file gets at load time.
+    pub fn to_source(
+        &self,
+        default_out: &str,
+        base_dir: &str,
+        default_releases: i64,
+    ) -> Result<SourceConfig, AppError> {
+        let mut sections: Sections = HashMap::new();
+        let keys = sections.entry(self.name.to_lowercase()).or_default();
+        for (key, value) in &self.pairs {
+            keys.insert(key.to_lowercase(), value.clone());
+        }
+        read_source(&sections, &self.name, default_out, base_dir, default_releases)?
+            .ok_or_else(|| AppError::Config(format!("Section [{}] has no type.", self.name)))
+    }
+}
+
+impl ConfigModel {
+    pub fn find(&self, name: &str) -> Option<&EditableSource> {
+        self.sources.iter().find(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    // The editor reaches sections through `merge_source`/`remove`; a live
+    // handle is only ever wanted from tests, so the method is test-only.
+    #[cfg(test)]
+    pub fn find_mut(&mut self, name: &str) -> Option<&mut EditableSource> {
+        self.sources.iter_mut().find(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.sources.len();
+        self.sources.retain(|s| !s.name.eq_ignore_ascii_case(name));
+        self.sources.len() != before
+    }
+
+    /// A section name from free text: the name is kept as typed, with the
+    /// characters that would break an INI header (`[] = ; #` and newlines)
+    /// replaced, so a repo name or a URL tail lands in one piece.
+    pub fn sanitize_name(raw: &str) -> String {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .map(|c| match c {
+                '[' | ']' | '=' | ';' | '#' | '\n' | '\r' => '_',
+                c => c,
+            })
+            .collect();
+        let cleaned = cleaned.trim_matches(|c| c == '.' || c == '_' || c == '-').to_string();
+        if cleaned.is_empty() {
+            "source".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    /// `base` made unique against the model, case-insensitively the way the
+    /// loader reads section names: `demo`, taken, becomes `demo-2`.
+    pub fn unique_name(&self, base: &str) -> String {
+        let base = Self::sanitize_name(base);
+        if self.find(&base).is_none() {
+            return base;
+        }
+        for n in 2.. {
+            let candidate = format!("{base}-{n}");
+            if self.find(&candidate).is_none() {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+}
+
+/// Read the file for the editor. Unlike `load` this tolerates a file with no
+/// source sections at all - deleting every source is a legal edit, and the
+/// file has to come back as the state it shows. The strict "No sources
+/// defined" rule belongs to the CLI, where a job with nothing to do is an
+/// error, and `load` keeps it.
+pub fn load_model(path: &str) -> Result<ConfigModel, AppError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|ex| AppError::Config(format!("Could not read {path}: {ex}")))?;
+    Ok(parse_model(path, &text))
+}
+
+fn parse_model(path: &str, text: &str) -> ConfigModel {
+    let mut header = String::new();
+    let mut sources: Vec<EditableSource> = Vec::new();
+    let mut in_general = true;
+    let mut current: Option<EditableSource> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_general {
+            if let Some(name) = section_header(trimmed) {
+                if !name.eq_ignore_ascii_case(GENERAL_SECTION) {
+                    // This line opens the first source section: it is the
+                    // section's own, not the header's.
+                    in_general = false;
+                    current = Some(EditableSource { name, pairs: Vec::new() });
+                    continue;
+                }
+            }
+            header.push_str(line);
+            header.push('\n');
+            continue;
+        }
+        if let Some(name) = section_header(trimmed) {
+            if let Some(done) = current.take() {
+                merge_source(&mut sources, done);
+            }
+            current = Some(EditableSource { name, pairs: Vec::new() });
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
+            continue;
+        }
+        // A key line, kept exactly as written: no case folding, no unescaping.
+        // A bare key with no '=' is not a value the loader can reach, and a
+        // bare-key line in a source section is rarer than the editor's own
+        // hand; it is dropped with the section's comments.
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if let Some(source) = current.as_mut() {
+                source.pairs.push((key.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+    if let Some(done) = current.take() {
+        merge_source(&mut sources, done);
+    }
+    ConfigModel { path: path.to_string(), header, sources }
+}
+
+/// The name inside a `[name]` header line, `None` for anything else.
+fn section_header(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// A section named twice: the loader's map merges its keys into the first,
+/// later keys winning, and the model does the same so `to_source` sees what
+/// `load` would.
+fn merge_source(sources: &mut Vec<EditableSource>, added: EditableSource) {
+    match sources.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&added.name)) {
+        Some(existing) => existing.pairs.extend(added.pairs),
+        None => sources.push(added),
+    }
+}
+
+/// Write the model: the header byte for byte, then one section per source in
+/// list order, `key = value` as stored. The write is one step: the new text
+/// goes to a side file, the old file moves to `path.bak`, the side file takes
+/// its place - so a crash mid-write leaves one of the two whole files, never
+/// a half-written config.
+pub fn save(model: &ConfigModel) -> Result<(), AppError> {
+    let mut text = String::new();
+    text.push_str(&model.header);
+    if !model.header.is_empty() && !model.header.ends_with('\n') {
+        text.push('\n');
+    }
+    for source in &model.sources {
+        // One blank line between blocks - and only one: a hand-written file
+        // already left its blank line at the header's end.
+        if !text.is_empty() && !text.ends_with("\n\n") {
+            text.push('\n');
+        }
+        text.push_str(&format!("[{}]\n", source.name));
+        for (key, value) in &source.pairs {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    let path = Path::new(&model.path);
+    let side = path.with_extension("saishin-tmp");
+    std::fs::write(&side, &text)
+        .map_err(|ex| AppError::Config(format!("Could not write {}: {ex}", model.path)))?;
+    if path.exists() {
+        let bak = path.with_extension("bak");
+        // The backup is a convenience; a failed copy must not block the save.
+        let _ = std::fs::copy(path, &bak);
+    }
+    std::fs::rename(&side, path)
+        .map_err(|ex| AppError::Config(format!("Could not replace {}: {ex}", model.path)))?;
+    Ok(())
+}
+
 /// What `[general] gui` asks for: which entry point opens the window when the
 /// command line says nothing. The two entry points are the icon's launcher
 /// (`saishin`, `saishin.exe` on a double-click, which starts the program with
@@ -558,6 +814,104 @@ fn get_list(sections: &Sections, section: &str, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_editor_round_trips_a_file() {
+        let original = "[general]\nout_dir = ./dl\n; comment kept\n\n[tables]\ntype = github\nowner = o\nrepo = r\nout = C:\\Saishin\\tables\n\n[media]\ntype = url\nurls = https://example.invalid/a.zip\n";
+        let path = write_ini("edit-roundtrip.ini", original);
+        let model = load_model(&path).expect("model");
+        save(&model).expect("save");
+        // Touched and untouched alike: the header rides byte for byte, the
+        // pairs come back exactly as they went in - and the Windows path is
+        // still a Windows path.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let config = load(&path).expect("the written file loads");
+        assert!(config.sources[0].out_dir.ends_with("C:\\Saishin\\tables"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn deleting_every_source_is_a_legal_edit() {
+        let path = write_ini(
+            "empty-after.ini",
+            "[general]\nout_dir = ./dl\n\n[one]\ntype = url\nurls = https://example.invalid/a.zip\n",
+        );
+        let mut model = load_model(&path).expect("model");
+        assert!(model.remove("ONE"));
+        save(&model).expect("a file with no sources writes");
+        let model2 = load_model(&path).expect("and reads back");
+        assert!(model2.sources.is_empty());
+        // The strict CLI rule stays the CLI's: a job with nothing to do is a
+        // loud error, exactly as before.
+        assert!(load(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_edited_section_keeps_untouched_keys_and_loses_only_its_comments() {
+        let path = write_ini(
+            "edit-keep.ini",
+            "[general]\n\n[a]\ntype = github\nowner = o\nrepo = r\n; a comment\nextract_as = *.exe -> app.exe\n",
+        );
+        let mut model = load_model(&path).expect("model");
+        model.find_mut("A").expect("section").set("keep", "3");
+        save(&model).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("extract_as = *.exe -> app.exe"));
+        assert!(text.contains("keep = 3"));
+        assert!(!text.contains("; a comment"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn names_are_made_safe_and_unique() {
+        let path = write_ini("names.ini", "[general]\n\n[demo]\ntype = url\nurls = https://example.invalid/a.zip\n");
+        let model = load_model(&path).expect("model");
+        assert_eq!(model.unique_name("demo"), "demo-2");
+        assert_eq!(model.unique_name("DEMO"), "DEMO-2");
+        assert_eq!(model.unique_name("new"), "new");
+        assert_eq!(model.unique_name("a[b]=c"), "a_b__c");
+        assert_eq!(ConfigModel::sanitize_name("  "), "source");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn set_replaces_in_place_removes_empty_and_appends() {
+        let mut s = EditableSource {
+            name: "a".to_string(),
+            pairs: vec![
+                ("type".to_string(), "url".to_string()),
+                ("OUT".to_string(), "C:\\x".to_string()),
+            ],
+        };
+        s.set("out", "D:\\y");
+        // The key keeps its written case and its place in the section.
+        assert_eq!(s.pairs[1], ("OUT".to_string(), "D:\\y".to_string()));
+        s.set("filters", "*.zip");
+        assert_eq!(s.pairs.last().expect("pair").0, "filters");
+        s.set("type", "");
+        assert_eq!(s.pairs.len(), 2);
+        assert_eq!(s.get("TYPE"), None);
+    }
+
+    #[test]
+    fn a_model_section_derives_the_typed_source_the_loader_would() {
+        let path = write_ini(
+            "to-source.ini",
+            "[general]\n\n[demo]\ntype = actions\nowner = o\nrepo = r\nworkflow = CI\nruns = 4\nkeep = 2\n",
+        );
+        let model = load_model(&path).expect("model");
+        let source = model
+            .find("demo")
+            .expect("section")
+            .to_source("./dl", "/tmp", 10)
+            .expect("derives");
+        assert_eq!(source.kind, SourceKind::Actions);
+        assert_eq!(source.workflow, "CI");
+        assert_eq!(source.max_runs, 4);
+        assert_eq!(source.keep, 2);
+        std::fs::remove_file(&path).ok();
+    }
 
     fn write_ini(name: &str, body: &str) -> String {
         let path = std::env::temp_dir().join(format!("saishin-cfg-{}-{name}", std::process::id()));

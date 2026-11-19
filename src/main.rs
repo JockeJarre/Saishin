@@ -340,7 +340,7 @@ async fn async_main_inner(options: &Options) -> Result<i32, AppError> {
         // strip shows a source as soon as it answers, which is the tell that a
         // run of several seconds is doing something. The window is the report; the
         // names it returns are the run's answer to nobody but itself.
-        gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone())?;
+        gui::run_gui(selected.clone(), config.clone(), token.clone(), options.clone(), config_path.clone())?;
     } else {
         // A source that refuses to answer is not the end of a headless run. The
         // sources that answer get their downloads, and the refusals are gathered
