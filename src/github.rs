@@ -153,6 +153,9 @@ pub struct GhRun {
     pub name: String,
     pub status: String,
     pub conclusion: String,
+    /// The branch the run stands on: the push's branch, a pull request's
+    /// head. The `branch` key of an actions source is read against this.
+    pub head_branch: String,
     pub run_number: i64,
     pub created_at: Option<DateTime<Utc>>,
     pub artifacts_url: String,
@@ -213,6 +216,8 @@ pub(crate) struct RunJson {
     status: String,
     #[serde(default, deserialize_with = "null_string")]
     conclusion: String,
+    #[serde(default, deserialize_with = "null_string", rename = "head_branch")]
+    head_branch: String,
     #[serde(default, deserialize_with = "null_i64", rename = "run_number")]
     run_number: i64,
     #[serde(default, rename = "created_at")]
@@ -413,17 +418,23 @@ pub(crate) fn convert_run(item: RunJson) -> GhRun {
         name: item.name,
         status: item.status,
         conclusion: item.conclusion,
+        head_branch: item.head_branch,
         run_number: item.run_number,
         created_at: item.created_at,
         artifacts_url: item.artifacts_url,
     }
 }
 
-/// The completed/successful/workflow filter from resolving `actions`
-/// sources. An empty workflow matches every run.
-pub(crate) fn run_matches(run: &GhRun, workflow: &str) -> bool {
+/// The completed/successful/workflow/branch filter from resolving `actions`
+/// sources. An empty workflow matches every run; so does an empty branch.
+/// `only_successful` asks the conclusion for 'success'; switched off, every
+/// finished run answers - a red build can carry the artifact someone wants.
+/// A run still in progress never matches: it has no conclusion, and its
+/// artifacts are still moving.
+pub(crate) fn run_matches(run: &GhRun, workflow: &str, only_successful: bool, branch: &str) -> bool {
     run.status.eq_ignore_ascii_case("completed")
-        && run.conclusion.eq_ignore_ascii_case("success")
+        && (!only_successful || run.conclusion.eq_ignore_ascii_case("success"))
+        && (branch.is_empty() || run.head_branch.eq_ignore_ascii_case(branch))
         && (workflow.is_empty() || crate::glob::matches(&run.name, workflow))
 }
 
@@ -613,7 +624,7 @@ mod tests {
         let runs: Vec<GhRun> = parsed.workflow_runs.into_iter().map(convert_run).collect();
         let matched: Vec<&GhRun> = runs
             .iter()
-            .filter(|run| run_matches(run, "vpinmame"))
+            .filter(|run| run_matches(run, "vpinmame", true, ""))
             .collect();
         assert!(!matched.is_empty(), "vpinmame workflow must match runs");
         for run in matched {
@@ -621,6 +632,42 @@ mod tests {
             assert!(run.conclusion.eq_ignore_ascii_case("success"));
             assert!(!run.artifacts_url.is_empty());
         }
+    }
+
+    fn shaped_run(status: &str, conclusion: &str, branch: &str) -> GhRun {
+        GhRun {
+            id: 1,
+            name: "CI".to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.to_string(),
+            head_branch: branch.to_string(),
+            run_number: 1,
+            created_at: None,
+            artifacts_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_successful_is_a_switch_not_a_law() {
+        let green = shaped_run("completed", "success", "main");
+        let red = shaped_run("completed", "failure", "main");
+        let moving = shaped_run("in_progress", "", "main");
+        assert!(run_matches(&green, "", true, ""));
+        assert!(run_matches(&red, "", false, ""), "a red build can carry the download");
+        assert!(!run_matches(&red, "", true, ""));
+        // A run still in progress stays out on both settings: no
+        // conclusion, and the artifacts are still moving.
+        assert!(!run_matches(&moving, "", false, ""));
+    }
+
+    #[test]
+    fn a_branch_asks_the_run_which_branch_it_stands_on() {
+        let main = shaped_run("completed", "success", "main");
+        let topic = shaped_run("completed", "success", "feature/x");
+        assert!(run_matches(&main, "", true, "main"));
+        assert!(run_matches(&main, "", true, "MAIN"), "branches are named case-insensitively, like the loader reads everything");
+        assert!(!run_matches(&topic, "", true, "main"));
+        assert!(run_matches(&topic, "", true, ""), "no branch named: every branch answers");
     }
 
         #[test]

@@ -2,7 +2,7 @@ use crate::downloader::format_bytes;
 use crate::error::AppError;
 use crate::PendingFile;
 use crate::Options;
-use crate::config::AppConfig;
+use crate::config::{self, AppConfig, ConfigModel, EditableSource, SourceKind};
 use crate::collect_new;
 use crate::sources_note;
 use crate::config::SourceConfig;
@@ -233,6 +233,12 @@ struct SelectionApp {
     progress: Arc<Mutex<GuiProgress>>,
     /// What the worker thread has found out about the sources.
     load: Arc<Mutex<LoadState>>,
+    /// saishin.ini as the editor sees it: the header verbatim, the sections
+    /// as editable pairs. Every add, rename and delete is applied here, then
+    /// written to the file.
+    model: ConfigModel,
+    /// The editor's modal state: closed, a form, or the delete question.
+    editor: Editor,
     /// The rows the last run was started with, as indexes into `entries`. This
     /// is what a resume starts again: the same files, picked as they now stand
     /// in the rows, so a version swapped in the dropdown is resumed as the
@@ -415,6 +421,732 @@ impl ProgressSink for GuiSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The source editor: the window's **Add source**, pencil and trash.
+//
+// The editor works on the file's own key/value pairs (`config::EditableSource`),
+// never on the resolved `SourceConfig`: paths stay exactly as written (a
+// Windows `C:\...` survives), and keys the form has no field for -
+// `extract_as`, keys of newer builds - ride through an edit untouched. Before
+// a save, every section is derived through the loader's own rules, so the file
+// is never left in a state the CLI would refuse. Deleting every source is a
+// legal edit: the window keeps working on the empty list, and the CLI's
+// "No sources defined" stays the CLI's own loud refusal.
+// ---------------------------------------------------------------------------
+
+/// The modal state of the editor: closed, filling the add form, filling the
+/// edit form (with the section it started from), or asking about a delete.
+enum Editor {
+    Closed,
+    Add(SourceForm),
+    Edit(String, SourceForm),
+    ConfirmDelete(String),
+}
+
+/// The form's fields as text and flags: what a person types, not what the
+/// loader would make of it. A count kept empty means "take the default", and
+/// that is written as "no key", so the file keeps saying the defaults by
+/// silence the way a hand-written ini does.
+struct SourceForm {
+    kind: SourceKind,
+    name: String,
+    owner: String,
+    repo: String,
+    tag: String,
+    private: bool,
+    workflow: String,
+    runs: String,
+    /// Actions only: the run's branch, empty for every branch.
+    branch: String,
+    /// Actions only: the run must have ended 'success' to show. Off lets
+    /// a finished red build offer its files too.
+    success_only: bool,
+    urls: String,
+    filters: String,
+    out: String,
+    releases: String,
+    keep: String,
+    changelog: bool,
+    version_suffix: bool,
+    extract: String,
+    extract_to: String,
+    strip_prefix: String,
+    overwrite: bool,
+    keep_zip: bool,
+    /// The reason the last **Save** was refused, shown inside the dialog.
+    error: String,
+}
+
+/// The form's one-line lists (`filters`, `urls`, `extract`) are the INI's
+/// comma-separated grammar: trimmed items, no empties, one space after each
+/// comma.
+fn clean_list(raw: &str) -> String {
+    raw.split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The loader's true words: 'true', 'yes', 'on', '1'.
+fn form_bool(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.to_lowercase()).as_deref(),
+        Some("true") | Some("yes") | Some("on") | Some("1")
+    )
+}
+
+fn parse_count(raw: &str, min: i64, what: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| format!("'{what}' must be a whole number, not '{raw}'."))?;
+    if value < min {
+        return Err(format!("'{what}' must be at least {min}."));
+    }
+    Ok(())
+}
+
+/// The hover documentation of one key: the same words as the template's
+/// comments, so the dialog and the file cannot drift apart.
+fn doc(key: &str) -> &'static str {
+    match key {
+        "type" => "Where the files come from: a GitHub release page, a workflow's uploaded artifacts, or plain web addresses.",
+        "name" => "The section's name: [name] in saishin.ini, and the label every row from this source wears.",
+        "owner" => "The GitHub account or organization that owns the repository.",
+        "repo" => "The repository that carries the files.",
+        "tag" => "Which releases the rows offer: empty (the default) is the newest release, 'all' lists every release.",
+        "private" => "The repository is private, so reading it needs a stored token: 'saishin --login', once.",
+        "workflow" => "A glob over the workflow name (the 'name:' line in the file), e.g. 'CI'. Empty reads every workflow of the repository.",
+        "runs" => "How many recent workflow runs the check reads. Default: 10.",
+        "branch" => "Only runs of this branch are offered, e.g. 'main'. Empty reads every branch.",
+        "only_successful_builds" => "Only runs that ended 'success' offer their files. Off offers a finished red run's files too - a failed build can carry the download you want. Default: on.",
+        "urls" => "The addresses to offer, comma separated. Each needs http:// or https://.",
+        "filters" => "Globs the file names are matched against, comma separated; a '!' before a glob refuses a match. Empty takes every file. An actions artifact always gets '.zip' appended.",
+        "out" => "The directory downloaded files land in. Empty takes [general]'s out_dir. A relative path here counts from the directory of the ini file.",
+        "releases" => "How many releases (or runs) the version dropdown offers per artifact. Default: [general]'s 'releases', 10.",
+        "keep" => "How many newest files the out directory keeps after a run; older ones are pruned. 0 keeps everything.",
+        "changelog" => "Offer the release notes as a file of their own next to each release's assets.",
+        "version_suffix" => "Append the version to the saved file name.",
+        "extract" => "Globs of the archive entries to unpack after the download, comma separated; '*' unpacks all. Empty leaves the archive alone.",
+        "extract_to" => "The directory archives unpack into. Empty unpacks into a directory named after the source, under out.",
+        "strip_prefix" => "How many leading path segments to drop from each entry: '1' unpacks a zip that keeps everything in one top folder flat.",
+        "overwrite" => "Replace files already at the destination. false skips them.",
+        "keep_zip" => "Keep the downloaded archive after unpacking. The default is true.",
+        _ => "",
+    }
+}
+
+impl SourceForm {
+    fn new() -> SourceForm {
+        SourceForm {
+            kind: SourceKind::GitHub,
+            name: String::new(),
+            owner: String::new(),
+            repo: String::new(),
+            tag: String::new(),
+            private: false,
+            workflow: String::new(),
+            runs: String::new(),
+            branch: String::new(),
+            success_only: true,
+            urls: String::new(),
+            filters: String::new(),
+            out: String::new(),
+            releases: String::new(),
+            keep: String::new(),
+            changelog: false,
+            version_suffix: false,
+            extract: String::new(),
+            extract_to: String::new(),
+            strip_prefix: String::new(),
+            overwrite: false,
+            keep_zip: true,
+            error: String::new(),
+        }
+    }
+
+    /// The form filled from a section: the keys the form owns are read back,
+    /// and values that equal the loader's default are shown as empty, so the
+    /// form says "default" and a Save can write the key away again.
+    fn from_source(source: &EditableSource) -> SourceForm {
+        let kind = match source.get("type").unwrap_or("github").to_lowercase().as_str() {
+            "actions" => SourceKind::Actions,
+            "url" => SourceKind::Url,
+            _ => SourceKind::GitHub,
+        };
+        let shown = |key: &str, default: &str| {
+            source
+                .get(key)
+                .filter(|v| *v != default)
+                .unwrap_or("")
+                .to_string()
+        };
+        SourceForm {
+            kind,
+            name: source.name.clone(),
+            owner: source.get("owner").unwrap_or("").to_string(),
+            repo: source.get("repo").unwrap_or("").to_string(),
+            tag: shown("tag", "latest"),
+            private: form_bool(source.get("private")),
+            workflow: source.get("workflow").unwrap_or("").to_string(),
+            runs: shown("runs", "10"),
+            branch: source.get("branch").unwrap_or("").to_string(),
+            // Absent means the loader's default, which is 'on'.
+            success_only: !matches!(
+                source.get("only_successful_builds").map(|v| v.to_lowercase()).as_deref(),
+                Some("false") | Some("no") | Some("off") | Some("0")
+            ),
+            urls: clean_list(source.get("urls").unwrap_or("")),
+            filters: clean_list(source.get("filters").unwrap_or("")),
+            out: source.get("out").unwrap_or("").to_string(),
+            releases: source.get("releases").unwrap_or("").to_string(),
+            keep: shown("keep", "0"),
+            changelog: form_bool(source.get("changelog")),
+            version_suffix: form_bool(source.get("version_suffix")),
+            extract: clean_list(source.get("extract").unwrap_or("")),
+            extract_to: source.get("extract_to").unwrap_or("").to_string(),
+            strip_prefix: shown("strip_prefix", "0"),
+            overwrite: form_bool(source.get("overwrite")),
+            keep_zip: !matches!(
+                source.get("keep_zip").map(|v| v.to_lowercase()).as_deref(),
+                Some("false") | Some("no") | Some("off") | Some("0")
+            ),
+            error: String::new(),
+        }
+    }
+
+    /// The form checked and turned into a section. The checks are the loader's
+    /// own requirements - the things `read_source` refuses - stated in the
+    /// dialog's words before the file is touched.
+    fn apply(&self, model: &ConfigModel, old_name: Option<&str>) -> Result<EditableSource, String> {
+        let base = if !self.name.trim().is_empty() {
+            ConfigModel::sanitize_name(&self.name)
+        } else {
+            match self.kind {
+                SourceKind::Url => {
+                    let tail = clean_list(&self.urls)
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    ConfigModel::sanitize_name(tail.split('.').next().unwrap_or("source"))
+                }
+                _ => ConfigModel::sanitize_name(&format!(
+                    "{}-{}",
+                    self.owner.trim(),
+                    self.repo.trim()
+                )),
+            }
+        };
+        if base.is_empty() {
+            return Err("Give the source a name, or owner and repo, or at least one url.".to_string());
+        }
+        let name = match old_name {
+            Some(old) if base.eq_ignore_ascii_case(old) => old.to_string(),
+            Some(_) => {
+                if model.find(&base).is_some() {
+                    return Err(format!("A section named [{base}] already exists."));
+                }
+                base
+            }
+            None => model.unique_name(&base),
+        };
+
+        match self.kind {
+            SourceKind::GitHub | SourceKind::Actions => {
+                if self.owner.trim().is_empty() || self.repo.trim().is_empty() {
+                    return Err("A GitHub source needs both owner and repo.".to_string());
+                }
+            }
+            SourceKind::Url => {
+                let urls = clean_list(&self.urls);
+                if urls.is_empty() {
+                    return Err("A web source needs at least one url.".to_string());
+                }
+                for url in urls.split(", ") {
+                    url::Url::parse(url).map_err(|ex| format!("'{url}' is not a web address: {ex}."))?;
+                }
+            }
+        }
+        parse_count(&self.runs, 1, "runs")?;
+        parse_count(&self.releases, 1, "releases")?;
+        parse_count(&self.keep, 0, "keep")?;
+        parse_count(&self.strip_prefix, 0, "strip_prefix")?;
+
+        // The pairs ride: an edit starts from the section as it stands, so the
+        // keys the form does not own keep their place, case and value.
+        let mut source = match old_name.and_then(|old| model.find(old)) {
+            Some(existing) => existing.clone(),
+            None => EditableSource { name: name.clone(), pairs: Vec::new() },
+        };
+        source.name = name;
+
+        const MANAGED: &[&str] = &[
+            "type", "owner", "repo", "tag", "private", "workflow", "runs", "branch",
+            "only_successful_builds", "urls", "filters", "out", "releases", "keep",
+            "changelog", "version_suffix", "extract", "extract_to", "strip_prefix",
+            "overwrite", "keep_zip",
+        ];
+        for key in MANAGED {
+            source.set(key, "");
+        }
+
+        let (kind_key, typed): (&str, Vec<(&str, String)>) = match self.kind {
+            SourceKind::GitHub => ("github", vec![
+                ("owner", self.owner.trim().to_string()),
+                ("repo", self.repo.trim().to_string()),
+                ("tag", self.tag.trim().to_string()),
+                ("private", if self.private { "true".to_string() } else { String::new() }),
+                ("changelog", if self.changelog { "true".to_string() } else { String::new() }),
+                ("version_suffix", if self.version_suffix { "true".to_string() } else { String::new() }),
+            ]),
+            SourceKind::Actions => ("actions", vec![
+                ("owner", self.owner.trim().to_string()),
+                ("repo", self.repo.trim().to_string()),
+                ("workflow", self.workflow.trim().to_string()),
+                ("runs", self.runs.trim().to_string()),
+                ("branch", self.branch.trim().to_string()),
+                // On is the default, said by silence; only off writes.
+                ("only_successful_builds", if self.success_only { String::new() } else { "false".to_string() }),
+            ]),
+            SourceKind::Url => ("url", vec![("urls", clean_list(&self.urls))]),
+        };
+        source.set("type", kind_key);
+        for (key, value) in typed {
+            source.set(key, &value);
+        }
+        source.set("filters", &clean_list(&self.filters));
+        source.set("out", self.out.trim());
+        source.set("releases", self.releases.trim());
+        source.set("keep", self.keep.trim());
+        let extract = clean_list(&self.extract);
+        source.set("extract", &extract);
+        if extract.is_empty() {
+            // No 'extract' means the loader never reads the rest of the block;
+            // writing the keys away keeps the section honest.
+            source.set("extract_to", "");
+            source.set("strip_prefix", "");
+            source.set("overwrite", "");
+            source.set("keep_zip", "");
+        } else {
+            source.set("extract_to", self.extract_to.trim());
+            source.set("strip_prefix", self.strip_prefix.trim());
+            source.set("overwrite", if self.overwrite { "true" } else { "" });
+            source.set("keep_zip", if self.keep_zip { "" } else { "false" });
+        }
+        Ok(source)
+    }
+}
+
+const FIELD_LABEL: f32 = 130.0;
+const FIELD_WIDTH: f32 = 300.0;
+const ICON_SIZE: f32 = 20.0;
+const TRASH_RED: egui::Color32 = egui::Color32::from_rgb(200, 70, 70);
+const PENCIL_BLUE: egui::Color32 = egui::Color32::from_rgb(90, 140, 210);
+
+/// One labeled line of the form: the name at the left, the box at the right,
+/// and the key's documentation on hover of the whole line.
+fn field(ui: &mut egui::Ui, label: &str, text: &str, hint: &str, value: &mut String) {
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_sized(
+                [FIELD_LABEL, 20.0],
+                egui::Label::new(egui::RichText::new(label).weak()).selectable(false),
+            );
+            let edit = egui::TextEdit::singleline(value).desired_width(FIELD_WIDTH - 8.0);
+            ui.add_sized(
+                [FIELD_WIDTH, 20.0],
+                if hint.is_empty() { edit } else { edit.hint_text(hint) },
+            );
+        })
+        .response;
+    response.on_hover_text(text);
+}
+
+/// A clipboard line made to fit a one-line field: the line breaks and tabs
+/// the copy carries become `", "` - the separator the list fields speak - and
+/// the ends of the whole are trimmed.
+fn paste_clean(text: &str) -> String {
+    text.split(['\n', '\r', '\t'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn check_field(ui: &mut egui::Ui, label: &str, text: &str, value: &mut bool) {
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_sized(
+                [FIELD_LABEL, 20.0],
+                egui::Label::new(egui::RichText::new(label).weak()).selectable(false),
+            );
+            ui.checkbox(value, "");
+        })
+        .response;
+    response.on_hover_text(text);
+}
+
+/// A small icon button, drawn with lines: the bundled font carries no icons,
+/// and the codebase already paints its own marks (the run's spinner, the
+/// unzip's square). The tint darkens on hover - red for the trash, blue for
+/// the pencil - so intent is visible before the click.
+fn icon_button(
+    ui: &mut egui::Ui,
+    salt: &str,
+    tooltip: &str,
+    hover: egui::Color32,
+    draw: fn(&egui::Painter, egui::Rect, egui::Color32),
+) -> bool {
+    let _ = salt;
+    // Click sense, not just hover: a hover-only response reports no clicks,
+    // and the mark would answer nothing.
+    let (rect, response) = ui.allocate_at_least(egui::vec2(ICON_SIZE, ICON_SIZE), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect.shrink(1.0), 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let tint = if response.hovered() { hover } else { ui.visuals().weak_text_color() };
+    draw(ui.painter(), rect.shrink(3.0), tint);
+    response.on_hover_text(tooltip).clicked()
+}
+
+fn paint_trash(painter: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3_f32, color);
+    let cx = r.center().x;
+    let lid = r.top() + r.height() * 0.3;
+    // The handle: a small bar on feet above the lid.
+    painter.line_segment(
+        [egui::pos2(cx - r.width() * 0.14, r.top()), egui::pos2(cx + r.width() * 0.14, r.top())],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(cx - r.width() * 0.14, r.top()), egui::pos2(cx - r.width() * 0.14, lid)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(cx + r.width() * 0.14, r.top()), egui::pos2(cx + r.width() * 0.14, lid)],
+        stroke,
+    );
+    // The lid, and the bucket narrowing to its base.
+    painter.line_segment([egui::pos2(r.left(), lid), egui::pos2(r.right(), lid)], stroke);
+    painter.add(egui::Shape::closed_line(
+        vec![
+            egui::pos2(cx - r.width() * 0.34, lid),
+            egui::pos2(cx - r.width() * 0.26, r.bottom()),
+            egui::pos2(cx + r.width() * 0.26, r.bottom()),
+            egui::pos2(cx + r.width() * 0.34, lid),
+        ],
+        stroke,
+    ));
+}
+
+fn paint_pencil(painter: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(2.2_f32, color);
+    let tip = egui::pos2(r.left() + r.width() * 0.15, r.bottom() - r.height() * 0.15);
+    let top = egui::pos2(r.left() + r.width() * 0.8, r.top() + r.height() * 0.25);
+    painter.line_segment([tip, top], stroke);
+    painter.circle_filled(tip, 1.4, color);
+}
+
+impl SelectionApp {
+    /// The modal dialogs, drawn over the panel of whichever phase is showing.
+    /// The editor is taken out and put back, as the log strip takes its lines:
+    /// the dialog writes while the app is read.
+    fn editor_windows(&mut self, ui: &mut egui::Ui) {
+        let mut editor = std::mem::replace(&mut self.editor, Editor::Closed);
+        let model = self.model.clone();
+        match &mut editor {
+            Editor::Closed => {}
+            Editor::ConfirmDelete(name) => {
+                // The name is taken out of the editor first: the arm writes
+                // the editor back at its end, and a borrow held into a modal
+                // closure would keep that assignment from being allowed.
+                let name = name.clone();
+                let mut close = false;
+                let mut remove = false;
+                // The id is from the name, not unique: a unique id would be
+                // a new one every frame, and the dialog's widgets - the
+                // fields above all - need to be the same widget between
+                // frames to be writable.
+                egui::Modal::new(egui::Id::new("delete_source")).show(ui.ctx(), |ui| {
+                    ui.heading("Delete source?");
+                    ui.label(format!("Remove [{name}] from saishin.ini?"));
+                        ui.label("Files already downloaded stay on disk.");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                            let del = ui.add_sized(
+                                egui::vec2(OK_WIDTH, OK_HEIGHT),
+                                egui::Button::new(egui::RichText::new("Delete").strong()),
+                            );
+                            if ui.ctx().memory(|m| m.focused().is_none()) {
+                                del.request_focus();
+                            }
+                            if del.clicked() {
+                                remove = true;
+                            }
+                        });
+                    });
+                if close {
+                    editor = Editor::Closed;
+                }
+                if remove {
+                    let mut next = model.clone();
+                    next.remove(&name);
+                    // A refused write is told in the strip; the dialog closes
+                    // either way - the list it offered was never the problem.
+                    let _ = self.commit(next);
+                    editor = Editor::Closed;
+                }
+            }
+            Editor::Add(form) => {
+                if self.form_window(ui, "Add source", None, &model, form) {
+                    editor = Editor::Closed;
+                }
+            }
+            Editor::Edit(old, form) => {
+                let old = old.clone();
+                if self.form_window(ui, "Edit source", Some(old), &model, form) {
+                    editor = Editor::Closed;
+                }
+            }
+        }
+        self.editor = editor;
+    }
+
+    fn form_window(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        old_name: Option<String>,
+        model: &ConfigModel,
+        form: &mut SourceForm,
+    ) -> bool {
+        let mut close = false;
+        // The id is from the name and stays: it is one window serving both
+        // **Add source** and **Edit source**, and its widgets - the text
+        // fields most of all - are only editable while the id says they are
+        // the same widget from frame to frame.
+        egui::Modal::new(egui::Id::new("source_form")).show(ui.ctx(), |ui| {
+            ui.heading(title);
+
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.weak("type:");
+                            ui.selectable_value(&mut form.kind, SourceKind::GitHub, "GitHub release")
+                                .on_hover_text(doc("type"));
+                            ui.selectable_value(&mut form.kind, SourceKind::Actions, "GitHub action")
+                                .on_hover_text(doc("type"));
+                            ui.selectable_value(&mut form.kind, SourceKind::Url, "Web URL")
+                                .on_hover_text(doc("type"));
+                        });
+                        ui.separator();
+                        field(ui, "name", doc("name"), "from owner, repo or url", &mut form.name);
+                        match form.kind {
+                            SourceKind::GitHub | SourceKind::Actions => {
+                                field(ui, "owner", doc("owner"), "", &mut form.owner);
+                                field(ui, "repo", doc("repo"), "", &mut form.repo);
+                            }
+                            SourceKind::Url => {
+                                field(ui, "urls", doc("urls"), "https://…/a.zip, …", &mut form.urls);
+                            }
+                        }
+                        match form.kind {
+                            SourceKind::GitHub => {
+                                field(ui, "tag", doc("tag"), "latest", &mut form.tag);
+                                check_field(ui, "private", doc("private"), &mut form.private);
+                                check_field(ui, "changelog", doc("changelog"), &mut form.changelog);
+                                check_field(ui, "version_suffix", doc("version_suffix"), &mut form.version_suffix);
+                            }
+                            SourceKind::Actions => {
+                                field(ui, "workflow", doc("workflow"), "CI", &mut form.workflow);
+                                field(ui, "runs", doc("runs"), "10", &mut form.runs);
+                                field(ui, "branch", doc("branch"), "main", &mut form.branch);
+                                check_field(ui, "success only", doc("only_successful_builds"), &mut form.success_only);
+                            }
+                            SourceKind::Url => {}
+                        }
+                        field(ui, "filters", doc("filters"), "*.zip, !*-dev-*", &mut form.filters);
+                        field(ui, "out", doc("out"), "[general] out_dir", &mut form.out);
+                        field(ui, "releases", doc("releases"), "10", &mut form.releases);
+                        field(ui, "keep", doc("keep"), "0", &mut form.keep);
+                        ui.separator();
+                        field(ui, "extract", doc("extract"), "*", &mut form.extract);
+                        field(ui, "extract_to", doc("extract_to"), "out/name", &mut form.extract_to);
+                        field(ui, "strip_prefix", doc("strip_prefix"), "0", &mut form.strip_prefix);
+                        check_field(ui, "overwrite", doc("overwrite"), &mut form.overwrite);
+                        check_field(ui, "keep_zip", doc("keep_zip"), &mut form.keep_zip);
+                        if form.private && matches!(form.kind, SourceKind::GitHub) {
+                            ui.weak("A private repository needs a token that can read it: run 'saishin --login' once.");
+                        }
+                        if !form.error.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(210, 80, 80), &form.error);
+                        }
+                    });
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let save = ui.add_sized(
+                        egui::vec2(OK_WIDTH, OK_HEIGHT),
+                        egui::Button::new(egui::RichText::new("Save").strong()),
+                    );
+                    // The keys are handed over only while the dialog holds
+                    // nothing focused: asked every frame, the request would
+                    // pull the caret out of any field the cursor picked, and
+                    // the fields could not be typed in at all.
+                    if ui.ctx().memory(|m| m.focused().is_none()) {
+                        save.request_focus();
+                    }
+                    if save.clicked() {
+                        match form.apply(model, old_name.as_deref()) {
+                            Err(msg) => form.error = msg,
+                            Ok(source) => {
+                                let mut next = model.clone();
+                                match &old_name {
+                                    Some(old) => {
+                                        // A rename keeps the section's place in
+                                        // the file: the order of the ini is the
+                                        // order of the run.
+                                        let at = next
+                                            .sources
+                                            .iter()
+                                            .position(|s| s.name.eq_ignore_ascii_case(old));
+                                        next.remove(old);
+                                        match at {
+                                            Some(i) => next.sources.insert(i.min(next.sources.len()), source),
+                                            None => next.sources.push(source),
+                                        }
+                                    }
+                                    None => next.sources.push(source),
+                                }
+                                match self.commit(next) {
+                                    Ok(()) => close = true,
+                                    Err(msg) => form.error = msg,
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        close
+    }
+
+    /// The sections with no rows, listed with the marks: a source that found
+    /// nothing new is invisible in the table above, and a person editing the
+    /// file from the window has to be able to reach those too - they are the
+    /// majority of it on a quiet day. One row per section, trash and pencil
+    /// at the left, the name saying which. `seen` is the table's sources,
+    /// lower-cased; the empty screen passes nothing and lists every section.
+    fn quiet_list(
+        &self,
+        ui: &mut egui::Ui,
+        model: &ConfigModel,
+        seen: &[String],
+    ) -> Option<(String, bool)> {
+        let quiet: Vec<&EditableSource> = model
+            .sources
+            .iter()
+            .filter(|section| !seen.contains(&section.name.to_lowercase()))
+            .collect();
+        if quiet.is_empty() {
+            return None;
+        }
+        let mut action: Option<(String, bool)> = None;
+        ui.add_space(10.0);
+        ui.weak("sources with no new artifacts:");
+        for section in quiet {
+            let name = section.name.clone();
+            ui.horizontal(|ui| {
+                let trash = icon_button(
+                    ui,
+                    &format!("trash-{name}"),
+                    &format!("Delete [{name}] from saishin.ini"),
+                    TRASH_RED,
+                    paint_trash,
+                );
+                let edit = icon_button(
+                    ui,
+                    &format!("edit-{name}"),
+                    &format!("Edit [{name}]"),
+                    PENCIL_BLUE,
+                    paint_pencil,
+                );
+                if trash {
+                    action = Some((name.clone(), false));
+                }
+                if edit {
+                    action = Some((name, true));
+                }
+                ui.label(section.name.clone());
+                ui.weak("no new artifacts");
+            });
+        }
+        action
+    }
+
+    /// Write the model and restart the check against it. The typed sources are
+    /// derived first, through the loader's own rules, so a section the CLI
+    /// would refuse never reaches the file; the write itself is atomic and
+    /// leaves the previous file in saishin.ini.bak. Comments inside an edited
+    /// source section are not kept; the header up to [general] is.
+    fn commit(&mut self, model: ConfigModel) -> Result<(), String> {
+        let cfg = &self.job.config;
+        let derived: Result<Vec<SourceConfig>, AppError> = model
+            .sources
+            .iter()
+            .map(|s| s.to_source(&cfg.default_out_dir, &cfg.base_directory, cfg.releases))
+            .collect();
+        let sources = match derived {
+            Ok(sources) => sources,
+            Err(ex) => {
+                let msg = error_message(ex);
+                log::error(&format!("The change was refused: {msg}"));
+                return Err(msg);
+            }
+        };
+        if let Err(ex) = config::save(&model) {
+            let msg = error_message(ex);
+            log::error(&format!("Could not save saishin.ini: {msg}"));
+            return Err(msg);
+        }
+        log::info("saishin.ini updated.");
+        self.model = model;
+        self.job = Arc::new(GuiJob {
+            sources,
+            config: cfg.clone(),
+            token: self.job.token.clone(),
+            options: self.job.options.clone(),
+        });
+        self.entries.clear();
+        self.families.clear();
+        self.chosen.clear();
+        {
+            let mut progress = self.progress.lock().unwrap_or_else(|guard| guard.into_inner());
+            progress.phase = Phase::Loading;
+            progress.heading.clear();
+            progress.message.clear();
+            progress.rows.clear();
+        }
+        self.start_load();
+        Ok(())
+    }
+}
+
 /// Text for one entry of the version dropdown. Versions of the same artifact
 /// often carry different file names (`dmdext-v2.5.0-x64.zip` per release), so
 /// the name is added next to the version whenever the group's names differ -
@@ -442,6 +1174,7 @@ impl SelectionApp {
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<GuiProgress>>,
         load: Arc<Mutex<LoadState>>,
+        model: ConfigModel,
         window_centered: bool,
         centered_at_startup: bool,
     ) -> SelectionApp {
@@ -514,6 +1247,8 @@ impl SelectionApp {
             cancel,
             progress,
             load,
+            model,
+            editor: Editor::Closed,
             chosen: Vec::new(),
             end_focused: false,
             log_lines: Vec::new(),
@@ -670,6 +1405,7 @@ impl SelectionApp {
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<GuiProgress>>,
         load: Arc<Mutex<LoadState>>,
+        model: ConfigModel,
         window_centered: bool,
         centered_at_startup: bool,
     ) -> SelectionApp {
@@ -681,6 +1417,7 @@ impl SelectionApp {
             cancel,
             progress,
             load,
+            model,
             window_centered,
             centered_at_startup,
         );
@@ -730,7 +1467,7 @@ impl SelectionApp {
     /// empty list at start-up and the full list when the fetch lands, and keeps
     /// the two fields it worked out.
     fn adopt_rows(&mut self, entries: Vec<PendingFile>, versions: HashMap<(String, String), Vec<PendingFile>>) {
-        let built = SelectionApp::new(entries, versions, Arc::clone(&self.job), Arc::clone(&self.result), Arc::clone(&self.cancel), Arc::clone(&self.progress), Arc::clone(&self.load), false, false);
+        let built = SelectionApp::new(entries, versions, Arc::clone(&self.job), Arc::clone(&self.result), Arc::clone(&self.cancel), Arc::clone(&self.progress), Arc::clone(&self.load), self.model.clone(), false, false);
         self.entries = built.entries;
         self.families = built.families;
     }
@@ -1060,6 +1797,19 @@ impl App for SelectionApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The clipboard hands over whole lines - browser address bars and ini
+        // snippets carry newlines and tabs - and the fields are one line
+        // wide, with the list fields read as comma separated. Straightening
+        // the paste here, before any field sees it, is what turns a pasted
+        // block of urls into one list field the loader can read.
+        ui.ctx().input_mut(|input| {
+            for event in &mut input.events {
+                if let egui::Event::Paste(text) = event {
+                    *text = paste_clean(text);
+                }
+            }
+        });
+
         let phase = self.progress.lock().unwrap_or_else(|guard| guard.into_inner()).phase;
 
         // The two kanji are outside egui's bundled font, so the glyphs have to
@@ -1101,23 +1851,34 @@ impl App for SelectionApp {
                         // The check is the whole run when it finds nothing: no
                         // rows to pick, nothing to download, so one button answers
                         // it. What the sources said is in the strip above, and the
-                        // heading says when one of them was refused.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let ok = ui.add_sized(
-                                egui::vec2(OK_WIDTH, OK_HEIGHT),
-                                egui::Button::new(egui::RichText::new("OK").strong()),
-                            );
-                            if !self.end_focused {
-                                ok.request_focus();
-                                self.end_focused = true;
+                        // heading says when one of them was refused. **Add
+                        // source** stays: the empty list is exactly when a source
+                        // is wanted, and with every source deleted this is the
+                        // window's only way out.
+                        ui.horizontal(|ui| {
+                            if ui.button("+ Add source").on_hover_text("Add a new download source to saishin.ini.").clicked() {
+                                self.editor = Editor::Add(SourceForm::new());
                             }
-                            if ok.clicked() {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ok = ui.add_sized(
+                                    egui::vec2(OK_WIDTH, OK_HEIGHT),
+                                    egui::Button::new(egui::RichText::new("OK").strong()),
+                                );
+                                if !self.end_focused {
+                                    ok.request_focus();
+                                    self.end_focused = true;
+                                }
+                                if ok.clicked() {
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            });
                         });
                         return;
                     }
                     ui.horizontal(|ui| {
+                        if ui.button("+ Add source").on_hover_text("Add a new download source to saishin.ini.").clicked() {
+                            self.editor = Editor::Add(SourceForm::new());
+                        }
                         if ui.button("Select all").clicked() {
                             for entry in self.entries.iter_mut() {
                                 entry.selected = true;
@@ -1149,7 +1910,28 @@ impl App for SelectionApp {
                     ui.heading("Saishin - new artifacts");
 
                     if self.entries.is_empty() {
+                        // Every source deleted is a legal state of the file, and
+                        // this is the window's one screen for saying so.
+                        if self.model.sources.is_empty() {
+                            ui.label("No sources in saishin.ini. Use **Add source** below.");
+                            return;
+                        }
                         ui.label("No new artifacts.");
+                        // The sections are all reachable here: none of them has
+                        // rows, so the list below is the whole file.
+                        let model = self.model.clone();
+                        if let Some((name, is_edit)) = self.quiet_list(ui, &model, &[]) {
+                            self.editor = if is_edit {
+                                match model.find(&name) {
+                                    Some(section) => {
+                                        Editor::Edit(name, SourceForm::from_source(section))
+                                    }
+                                    None => Editor::Closed,
+                                }
+                            } else {
+                                Editor::ConfirmDelete(name)
+                            };
+                        }
                         return;
                     }
 
@@ -1158,8 +1940,25 @@ impl App for SelectionApp {
 
                     // Picking a version changes rows, so the picks are
                     // collected while drawing and applied once the list is
-                    // rendered.
+                    // rendered. The same pattern serves the row's trash and
+                    // pencil: a click is remembered, and the editor opens
+                    // when the grid has let go of the entries.
                     let mut picks: Vec<(usize, usize)> = Vec::new();
+                    let mut row_action: Option<(String, bool)> = None;
+                    // The rows ask the model for the section a name edits,
+                    // and the drawing loop already borrows the app.
+                    let model = self.model.clone();
+                    // The marks ride the first row of each source only: the
+                    // rows of one source stand under one section, and the
+                    // marks above its name answer for all of them.
+                    let mut last_source: Option<String> = None;
+                    // Which sections have rows: the ones without are listed
+                    // under the table, where their marks can reach them too.
+                    let seen: Vec<String> = self
+                        .entries
+                        .iter()
+                        .map(|entry| entry.file.source_name.to_lowercase())
+                        .collect();
 
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -1175,7 +1974,40 @@ impl App for SelectionApp {
                                     ui.strong("file");
                                     ui.end_row();
                                     for (index, entry) in self.entries.iter_mut().enumerate() {
-                                        ui.checkbox(&mut entry.selected, "");
+                                        // Checkmark on every row; the trash and
+                                        // the pencil only where the source
+                                        // starts: the marks edit one section,
+                                        // and repeating them per row is noise.
+                                        let source = entry.file.source_name.clone();
+                                        let marks = last_source
+                                            .as_deref()
+                                            .map_or(true, |prev| !prev.eq_ignore_ascii_case(&source));
+                                        last_source = Some(source.clone());
+                                        ui.horizontal(|ui| {
+                                            ui.checkbox(&mut entry.selected, "");
+                                            if marks {
+                                                let trash = icon_button(
+                                                    ui,
+                                                    &format!("trash-{source}"),
+                                                    &format!("Delete [{source}] from saishin.ini"),
+                                                    TRASH_RED,
+                                                    paint_trash,
+                                                );
+                                                let edit = icon_button(
+                                                    ui,
+                                                    &format!("edit-{source}"),
+                                                    &format!("Edit [{source}]"),
+                                                    PENCIL_BLUE,
+                                                    paint_pencil,
+                                                );
+                                                if trash {
+                                                    row_action = Some((source.clone(), false));
+                                                }
+                                                if edit {
+                                                    row_action = Some((source, true));
+                                                }
+                                            }
+                                        });
                                         ui.label(entry.file.source_name.clone());
                                         let size = match entry.file.size {
                                             Some(bytes) => format_bytes(bytes),
@@ -1225,7 +2057,28 @@ impl App for SelectionApp {
                                         ui.end_row();
                                     }
                                 });
+
+                            // The sources the run found nothing new for stand
+                            // below the table, so the marks reach every section
+                            // in the file, not just the ones with rows.
+                            if let Some(action) = self.quiet_list(ui, &model, &seen) {
+                                row_action = Some(action);
+                            }
                         });
+
+                    if let Some((name, is_edit)) = row_action {
+                        self.editor = if is_edit {
+                            match model.find(&name) {
+                                Some(section) => Editor::Edit(name, SourceForm::from_source(section)),
+                                // A row whose section is gone (edited away in
+                                // this very frame) opens nothing.
+                                None => Editor::Closed,
+                            }
+                        } else {
+                            Editor::ConfirmDelete(name)
+                        };
+                        ui.ctx().request_repaint();
+                    }
 
                     if !picks.is_empty() {
                         apply_picks(&mut self.entries, &mut self.families, picks);
@@ -1403,6 +2256,10 @@ impl App for SelectionApp {
                 }
             }
         }
+
+        // The editor's dialogs sit over whichever phase is showing, drawn last
+        // so the modal covers the panels it borrows.
+        self.editor_windows(ui);
     }
 }
 
@@ -1445,8 +2302,12 @@ pub fn run_gui(
     config: AppConfig,
     token: Option<String>,
     options: Options,
+    config_path: String,
 ) -> Result<Vec<String>, AppError> {
     let window_centered = config.window_centered;
+    // The file as the editor sees it. Read before the window opens: a file
+    // that cannot be read at all is a start-up failure, told like any other.
+    let model = config::load_model(&config_path)?;
     let job = Arc::new(GuiJob { sources, config, token, options });
     let result = Arc::new(GuiResult { updated: Mutex::new(Vec::new()) });
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1494,7 +2355,7 @@ pub fn run_gui(
     let outcome = run_native(
         "Saishin",
         native_options,
-        Box::new(move |_| Ok(Box::new(SelectionApp::new_loading(job, gui_result, cancel, progress, load, window_centered, centered_at_startup)))),
+        Box::new(move |_| Ok(Box::new(SelectionApp::new_loading(job, gui_result, cancel, progress, load, model, window_centered, centered_at_startup)))),
     );
 
     if let Err(ex) = outcome {
@@ -1511,6 +2372,131 @@ pub fn run_gui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_model() -> ConfigModel {
+        ConfigModel { path: String::new(), header: String::new(), sources: Vec::new() }
+    }
+
+    #[test]
+    fn adding_a_source_needs_the_fields_its_type_requires() {
+        let model = empty_model();
+        let mut form = SourceForm::new();
+        assert!(form.apply(&model, None).unwrap_err().contains("owner and repo"));
+        form.owner = "o".to_string();
+        form.repo = "r".to_string();
+        let source = form.apply(&model, None).expect("a github with owner and repo applies");
+        assert_eq!(source.name, "o-r");
+        assert_eq!(source.get("type"), Some("github"));
+        // Defaults are written by silence: no key, not a key set to the default.
+        assert_eq!(source.get("tag"), None);
+        assert_eq!(source.get("private"), None);
+
+        form.kind = SourceKind::Url;
+        form.urls = "not a url".to_string();
+        assert!(form.apply(&model, None).unwrap_err().contains("not a web address"));
+        form.urls = "https://example.invalid/a.zip".to_string();
+        let url_source = form.apply(&model, None).expect("a url applies");
+        assert_eq!(url_source.get("urls"), Some("https://example.invalid/a.zip"));
+        assert_eq!(url_source.name, "a");
+    }
+
+    #[test]
+    fn counts_are_checked_before_the_file_is_written() {
+        let model = empty_model();
+        let mut form = SourceForm::new();
+        form.kind = SourceKind::Url;
+        form.urls = "https://example.invalid/a.zip".to_string();
+        form.keep = "-1".to_string();
+        assert!(form.apply(&model, None).unwrap_err().contains("'keep'"));
+        form.keep = String::new();
+        form.releases = "many".to_string();
+        assert!(form.apply(&model, None).unwrap_err().contains("'releases'"));
+    }
+
+    #[test]
+    fn an_edit_can_rename_and_renames_must_be_free() {
+        let model = ConfigModel {
+            path: String::new(),
+            header: String::new(),
+            sources: vec![
+                EditableSource {
+                    name: "demo".to_string(),
+                    pairs: vec![
+                        ("type".to_string(), "url".to_string()),
+                        ("urls".to_string(), "https://example.invalid/a.zip".to_string()),
+                        ("extract_as".to_string(), "*.exe -> app.exe".to_string()),
+                    ],
+                },
+                EditableSource {
+                    name: "taken".to_string(),
+                    pairs: vec![
+                        ("type".to_string(), "url".to_string()),
+                        ("urls".to_string(), "https://example.invalid/b.zip".to_string()),
+                    ],
+                },
+            ],
+        };
+        let mut form = SourceForm::from_source(model.find("demo").expect("section"));
+        assert_eq!(form.urls, "https://example.invalid/a.zip");
+        // The key the form has no field for rides through untouched.
+        let kept = form.apply(&model, Some("demo")).expect("staying named is fine");
+        assert_eq!(kept.name, "demo");
+        assert_eq!(kept.get("extract_as"), Some("*.exe -> app.exe"));
+        form.name = "taken".to_string();
+        assert!(form.apply(&model, Some("demo")).unwrap_err().contains("already exists"));
+        form.name = "fresh".to_string();
+        assert_eq!(form.apply(&model, Some("demo")).expect("rename").name, "fresh");
+    }
+
+    #[test]
+    fn the_form_reflects_what_a_section_says() {
+        let source = EditableSource {
+            name: "builds".to_string(),
+            pairs: vec![
+                ("type".to_string(), "actions".to_string()),
+                ("owner".to_string(), "o".to_string()),
+                ("repo".to_string(), "r".to_string()),
+                ("workflow".to_string(), "CI".to_string()),
+                ("runs".to_string(), "10".to_string()),
+                ("branch".to_string(), "main".to_string()),
+                ("only_successful_builds".to_string(), "false".to_string()),
+                ("filters".to_string(), "*win* , *linux*".to_string()),
+            ],
+        };
+        let form = SourceForm::from_source(&source);
+        assert_eq!(form.kind, SourceKind::Actions);
+        assert_eq!(form.branch, "main");
+        assert!(!form.success_only, "the file says red builds are wanted");
+        // The default count shows as empty, and writing it back keeps the
+        // section saying the defaults by silence.
+        assert_eq!(form.runs, "");
+        assert_eq!(form.filters, "*win*, *linux*");
+        let model = ConfigModel { path: String::new(), header: String::new(), sources: vec![source] };
+        let out = form.apply(&model, Some("builds")).expect("applies");
+        assert_eq!(out.get("runs"), None);
+        assert_eq!(out.get("workflow"), Some("CI"));
+        assert_eq!(out.get("branch"), Some("main"));
+        assert_eq!(out.get("only_successful_builds"), Some("false"));
+    }
+
+    #[test]
+    fn green_only_and_every_branch_say_themselves_by_silence() {
+        let mut form = SourceForm::new();
+        form.owner = "o".to_string();
+        form.repo = "r".to_string();
+        form.kind = SourceKind::Actions;
+        assert!(form.success_only, "the new source starts on the safe setting");
+        let model = empty_model();
+        let out = form.apply(&model, None).expect("applies");
+        // Defaults stay unwritten; branch empty means every branch, also unwritten.
+        assert_eq!(out.get("only_successful_builds"), None);
+        assert_eq!(out.get("branch"), None);
+        form.success_only = false;
+        form.branch = "develop".to_string();
+        let out = form.apply(&model, None).expect("applies again");
+        assert_eq!(out.get("only_successful_builds"), Some("false"));
+        assert_eq!(out.get("branch"), Some("develop"));
+    }
 
     /// A run that stopped offers to start again where it stopped, and only such a
     /// run: a finished run has nothing left to do, a run still going has its
