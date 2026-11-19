@@ -456,6 +456,11 @@ struct SourceForm {
     private: bool,
     workflow: String,
     runs: String,
+    /// Actions only: the run's branch, empty for every branch.
+    branch: String,
+    /// Actions only: the run must have ended 'success' to show. Off lets
+    /// a finished red build offer its files too.
+    success_only: bool,
     urls: String,
     filters: String,
     out: String,
@@ -517,6 +522,8 @@ fn doc(key: &str) -> &'static str {
         "private" => "The repository is private, so reading it needs a stored token: 'saishin --login', once.",
         "workflow" => "A glob over the workflow name (the 'name:' line in the file), e.g. 'CI'. Empty reads every workflow of the repository.",
         "runs" => "How many recent workflow runs the check reads. Default: 10.",
+        "branch" => "Only runs of this branch are offered, e.g. 'main'. Empty reads every branch.",
+        "only_successful_builds" => "Only runs that ended 'success' offer their files. Off offers a finished red run's files too - a failed build can carry the download you want. Default: on.",
         "urls" => "The addresses to offer, comma separated. Each needs http:// or https://.",
         "filters" => "Globs the file names are matched against, comma separated; a '!' before a glob refuses a match. Empty takes every file. An actions artifact always gets '.zip' appended.",
         "out" => "The directory downloaded files land in. Empty takes [general]'s out_dir. A relative path here counts from the directory of the ini file.",
@@ -544,6 +551,8 @@ impl SourceForm {
             private: false,
             workflow: String::new(),
             runs: String::new(),
+            branch: String::new(),
+            success_only: true,
             urls: String::new(),
             filters: String::new(),
             out: String::new(),
@@ -585,6 +594,12 @@ impl SourceForm {
             private: form_bool(source.get("private")),
             workflow: source.get("workflow").unwrap_or("").to_string(),
             runs: shown("runs", "10"),
+            branch: source.get("branch").unwrap_or("").to_string(),
+            // Absent means the loader's default, which is 'on'.
+            success_only: !matches!(
+                source.get("only_successful_builds").map(|v| v.to_lowercase()).as_deref(),
+                Some("false") | Some("no") | Some("off") | Some("0")
+            ),
             urls: clean_list(source.get("urls").unwrap_or("")),
             filters: clean_list(source.get("filters").unwrap_or("")),
             out: source.get("out").unwrap_or("").to_string(),
@@ -675,9 +690,10 @@ impl SourceForm {
         source.name = name;
 
         const MANAGED: &[&str] = &[
-            "type", "owner", "repo", "tag", "private", "workflow", "runs", "urls",
-            "filters", "out", "releases", "keep", "changelog", "version_suffix",
-            "extract", "extract_to", "strip_prefix", "overwrite", "keep_zip",
+            "type", "owner", "repo", "tag", "private", "workflow", "runs", "branch",
+            "only_successful_builds", "urls", "filters", "out", "releases", "keep",
+            "changelog", "version_suffix", "extract", "extract_to", "strip_prefix",
+            "overwrite", "keep_zip",
         ];
         for key in MANAGED {
             source.set(key, "");
@@ -697,6 +713,9 @@ impl SourceForm {
                 ("repo", self.repo.trim().to_string()),
                 ("workflow", self.workflow.trim().to_string()),
                 ("runs", self.runs.trim().to_string()),
+                ("branch", self.branch.trim().to_string()),
+                // On is the default, said by silence; only off writes.
+                ("only_successful_builds", if self.success_only { String::new() } else { "false".to_string() }),
             ]),
             SourceKind::Url => ("url", vec![("urls", clean_list(&self.urls))]),
         };
@@ -955,6 +974,8 @@ impl SelectionApp {
                             SourceKind::Actions => {
                                 field(ui, "workflow", doc("workflow"), "CI", &mut form.workflow);
                                 field(ui, "runs", doc("runs"), "10", &mut form.runs);
+                                field(ui, "branch", doc("branch"), "main", &mut form.branch);
+                                check_field(ui, "success only", doc("only_successful_builds"), &mut form.success_only);
                             }
                             SourceKind::Url => {}
                         }
@@ -2412,11 +2433,15 @@ mod tests {
                 ("repo".to_string(), "r".to_string()),
                 ("workflow".to_string(), "CI".to_string()),
                 ("runs".to_string(), "10".to_string()),
+                ("branch".to_string(), "main".to_string()),
+                ("only_successful_builds".to_string(), "false".to_string()),
                 ("filters".to_string(), "*win* , *linux*".to_string()),
             ],
         };
         let form = SourceForm::from_source(&source);
         assert_eq!(form.kind, SourceKind::Actions);
+        assert_eq!(form.branch, "main");
+        assert!(!form.success_only, "the file says red builds are wanted");
         // The default count shows as empty, and writing it back keeps the
         // section saying the defaults by silence.
         assert_eq!(form.runs, "");
@@ -2425,6 +2450,27 @@ mod tests {
         let out = form.apply(&model, Some("builds")).expect("applies");
         assert_eq!(out.get("runs"), None);
         assert_eq!(out.get("workflow"), Some("CI"));
+        assert_eq!(out.get("branch"), Some("main"));
+        assert_eq!(out.get("only_successful_builds"), Some("false"));
+    }
+
+    #[test]
+    fn green_only_and_every_branch_say_themselves_by_silence() {
+        let mut form = SourceForm::new();
+        form.owner = "o".to_string();
+        form.repo = "r".to_string();
+        form.kind = SourceKind::Actions;
+        assert!(form.success_only, "the new source starts on the safe setting");
+        let model = empty_model();
+        let out = form.apply(&model, None).expect("applies");
+        // Defaults stay unwritten; branch empty means every branch, also unwritten.
+        assert_eq!(out.get("only_successful_builds"), None);
+        assert_eq!(out.get("branch"), None);
+        form.success_only = false;
+        form.branch = "develop".to_string();
+        let out = form.apply(&model, None).expect("applies again");
+        assert_eq!(out.get("only_successful_builds"), Some("false"));
+        assert_eq!(out.get("branch"), Some("develop"));
     }
 
     /// A run that stopped offers to start again where it stopped, and only such a

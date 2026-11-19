@@ -44,6 +44,12 @@ pub struct SourceConfig {
     pub private: bool,
     pub workflow: String,
     pub max_runs: i64,
+    /// Actions only: a run must have ended 'success' to offer its files.
+    /// False offers a finished red run's files too - a failed build can
+    /// carry the artifact someone wants.
+    pub only_successful: bool,
+    /// Actions only: runs of this branch only. Empty reads every branch.
+    pub branch: String,
     pub releases: i64,
     pub keep: i64,
     pub changelog: bool,
@@ -471,6 +477,8 @@ fn read_source(
                 private: get_bool(sections, section, "private", false)?,
                 workflow: String::new(),
                 max_runs: 10,
+                only_successful: true,
+                branch: String::new(),
                 releases: get_int(sections, section, "releases", default_releases)?,
                 keep: 0,
                 changelog: false,
@@ -490,6 +498,8 @@ fn read_source(
             private: false,
             workflow: String::new(),
             max_runs: 10,
+            only_successful: true,
+            branch: String::new(),
             releases: get_int(sections, section, "releases", default_releases)?,
             keep: 0,
             changelog: false,
@@ -516,6 +526,8 @@ fn read_source(
                 private: false,
                 workflow: get_string(sections, section, "workflow", ""),
                 max_runs: get_int(sections, section, "runs", 10)?,
+                only_successful: get_bool(sections, section, "only_successful_builds", true)?,
+                branch: get_string(sections, section, "branch", ""),
                 releases: get_int(sections, section, "releases", default_releases)?,
                 keep: 0,
                 changelog: false,
@@ -910,6 +922,22 @@ mod tests {
         assert_eq!(source.workflow, "CI");
         assert_eq!(source.max_runs, 4);
         assert_eq!(source.keep, 2);
+        // The two run filters default to the old behavior: green only,
+        // every branch.
+        assert!(source.only_successful);
+        assert!(source.branch.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_red_build_and_a_named_branch_are_configurable() {
+        let path = write_ini(
+            "red-and-branch.ini",
+            "[general]\n\n[x]\ntype = actions\nowner = o\nrepo = r\nbranch = main\nonly_successful_builds = false\n",
+        );
+        let source = load(&path).expect("loads").sources.remove(0);
+        assert_eq!(source.branch, "main");
+        assert!(!source.only_successful, "false lets a red build offer its files");
         std::fs::remove_file(&path).ok();
     }
 

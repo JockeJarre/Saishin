@@ -976,7 +976,7 @@ async fn collect_versions(
                 token,
                 100,
                 source.releases,
-                |run| github::run_matches(run, &workflow),
+                |run| github::run_matches(run, &workflow, source.only_successful, &source.branch),
             )
             .await?;
             let fetched = join_all(runs.iter().map(|run| github::get_artifacts(http, run, token, 100))).await;
@@ -1285,7 +1285,7 @@ async fn resolve_actions(
         token,
         100,
         source.max_runs,
-        |run| github::run_matches(run, &workflow),
+        |run| github::run_matches(run, &workflow, source.only_successful, &source.branch),
     )
     .await?;
 
@@ -1539,6 +1539,8 @@ mod tests {
             private: false,
             workflow: String::new(),
             max_runs: 10,
+            only_successful: true,
+            branch: String::new(),
             releases: 10,
             keep: 0,
             changelog: false,
@@ -1565,6 +1567,7 @@ mod tests {
             name: "vpinmame".to_string(),
             status: "completed".to_string(),
             conclusion: "success".to_string(),
+            head_branch: "master".to_string(),
             run_number: number,
             created_at: None,
             artifacts_url: String::new(),
@@ -1713,6 +1716,7 @@ mod tests {
             name: "vpinmame".to_string(),
             status: "completed".to_string(),
             conclusion: "success".to_string(),
+            head_branch: "master".to_string(),
             run_number: number,
             created_at: None,
             artifacts_url: String::new(),
