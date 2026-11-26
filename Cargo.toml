@@ -55,6 +55,10 @@ eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "x11",
     "wayland",
+    # The OS clipboard. Off, egui-winit pastes from an in-app clipboard that
+    # starts empty, and Ctrl+V in a text field does nothing at all - which
+    # is invisible until someone tries to paste a path into the editor.
+    "clipboard",
 ] }
 # Cargo cannot enable features of a transitive dependency, so eframe's
 # `winit/default` is re-declared here: the same list winit ships as default.
