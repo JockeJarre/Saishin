@@ -1343,12 +1343,17 @@ impl SelectionApp {
                                 // a height that shrinks to its rows would leave
                                 // the space the divider's drag gained unused.
                                 .auto_shrink([false, false]);
-                            // The closure hands back the last line's response:
-                            // the jump below scrolls to it, which is egui's own
-                            // way in - the scroll area takes the request, lands
-                            // the line at its bottom edge and re-sticks there,
-                            // and the follow resumes with it: the click says
-                            // "catch up, and stay".
+                            // The click's order, kept for the one frame that
+                            // runs the list below: the last line is scrolled
+                            // to its bottom edge, the scroll area re-sticks on
+                            // arrival, and the follow resumes - the button
+                            // says "catch up, and stay". The request must be
+                            // made from inside the list's own layer: a
+                            // scroll area reads scroll requests from the
+                            // layer its content runs in, and one written
+                            // after show returns lands in the panel's, where
+                            // nothing ever reads it - which is why the first
+                            // two jumps went nowhere.
                             let tail = self.log_jump;
                             if tail {
                                 self.log_jump = false;
@@ -1359,13 +1364,12 @@ impl SelectionApp {
                                 for line in lines.iter() {
                                     last = Some(ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap()));
                                 }
-                                last
-                            });
-                            if tail {
-                                if let Some(last) = view.inner {
-                                    last.scroll_to_me(Some(egui::Align::Max));
+                                if tail {
+                                    if let Some(last) = &last {
+                                        last.scroll_to_me(Some(egui::Align::Max));
+                                    }
                                 }
-                            }
+                            });
                             // The end of the scroll, computed from the view:
                             // the offset has reached the distance the content
                             // exceeds the viewport by - within a line's slack,
