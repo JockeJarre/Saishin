@@ -90,6 +90,14 @@ runs = 10
 ; 'workflow' is a glob against the workflow name (the 'name:' line in the
 ; file); 'filters' match the artifact name, and the saved file gets .zip
 ; appended to it.
+; 'branch' offers only the runs of one branch ('main', 'develop', ...).
+; Empty - the default - reads every branch.
+branch = main
+; 'only_successful_builds' asks the run for a green light: on (the default)
+; only a run that ended 'success' offers its files. Off offers a finished
+; red run's files too - a failed build can carry the download you want.
+; Runs still in progress never show; their files are still moving.
+only_successful_builds = true
 filters = *windows-x64*
 out = ./builds/actions
 ; The artifact zip holds the executable and this file at its root.
