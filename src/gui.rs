@@ -2320,7 +2320,14 @@ pub fn run_gui(
     let mut builder = egui::ViewportBuilder::default()
         .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_min_inner_size([620.0, 380.0])
-        .with_icon(app_icon);
+        .with_icon(app_icon)
+        // The same identity `-V` answers: a screenshot, a bug report and a
+        // taskbar row can all name the build they came from.
+        .with_title(format!(
+            "Saishin {} ({})",
+            crate::BUILD_VERSION,
+            crate::BUILD_GIT
+        ));
     builder = match startup_center {
         Some([x, y]) => builder.with_position([x, y]).with_visible(false),
         None => builder.with_visible(!window_centered),
