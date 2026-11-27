@@ -1332,7 +1332,7 @@ impl SelectionApp {
                         .default_open(true)
                         .show_unindented(ui, |ui| {
                             let list_height = ui.available_height();
-                            let mut scroll = egui::ScrollArea::vertical()
+                            let scroll = egui::ScrollArea::vertical()
                                 .id_salt("log_scroll")
                                 .stick_to_bottom(self.log_stick)
                                 .max_height(list_height)
@@ -1343,21 +1343,29 @@ impl SelectionApp {
                                 // a height that shrinks to its rows would leave
                                 // the space the divider's drag gained unused.
                                 .auto_shrink([false, false]);
-                            if self.log_jump {
-                                // An offset past the last line lands on the
-                                // last line, and the follow resumes with it:
-                                // the click says "catch up, and stay" - the
-                                // lines that stream in after the jump pull
-                                // the view along as they always did.
-                                scroll = scroll.vertical_scroll_offset(f32::MAX);
+                            // The closure hands back the last line's response:
+                            // the jump below scrolls to it, which is egui's own
+                            // way in - the scroll area takes the request, lands
+                            // the line at its bottom edge and re-sticks there,
+                            // and the follow resumes with it: the click says
+                            // "catch up, and stay".
+                            let tail = self.log_jump;
+                            if tail {
                                 self.log_jump = false;
                                 self.log_stick = true;
                             }
                             let view = scroll.show(ui, |ui| {
+                                let mut last: Option<egui::Response> = None;
                                 for line in lines.iter() {
-                                    ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                                    last = Some(ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap()));
                                 }
+                                last
                             });
+                            if tail {
+                                if let Some(last) = view.inner {
+                                    last.scroll_to_me(Some(egui::Align::Max));
+                                }
+                            }
                             // The end of the scroll, computed from the view:
                             // the offset has reached the distance the content
                             // exceeds the viewport by - within a line's slack,
