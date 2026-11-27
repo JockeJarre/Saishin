@@ -6,6 +6,33 @@
 
 </div>
 
+**Saishin — keep your downloads up to date, automatically**
+
+Saishin is a small Windows/Linux/macOS tool that watches the places you get your files from and keeps them current: **GitHub releases**, **GitHub Actions artifacts** (yes, even from a specific branch, and red builds included if you want them), and **plain web URLs**.
+
+You describe what you want in a simple INI file — one section per source — and pick what to download with a filter like `*windows-x64*`. Saishin fetches, extracts where needed, renames what you tell it to, and can keep old versions around. A run looks like:
+
+```
+[taacop]
+type = actions
+owner = rmnclaus
+repo = Taacop
+branch = main
+filters = *win64-release*
+out = ./builds/taacop
+extract = *
+```
+
+One thing to know about Actions sources: **GitHub requires a token to list and download artifacts**, even on public repositories. Run `saishin --login` once, paste in a (read-only, public-repo `repo`-free) personal access token, and Saishin stores it — releases and URLs need no token at all.
+
+There's a **GUI** for the everyday case: check all sources at once, browse each artifact's version history in a dropdown, tick the ones you want, download. It doubles as a **config editor** — add, edit and delete sources from the window, and the INI file is saved back *with your comments, order and formatting intact*. No lock-in: everything the GUI does is a plain config file you can edit by hand, and a CLI that fits in a cron job.
+
+No accounts, no telemetry, no background service: it's a binary that does its thing and exits.
+
+Feedback, issues and PRs welcome: https://github.com/JockeJarre/Saishin
+
+---
+
 A small cross-platform Rust command line tool that keeps files up to date from
 official GitHub releases/actions — or from any other URL — using an INI configuration file.
 
