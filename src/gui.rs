@@ -1377,11 +1377,25 @@ impl SelectionApp {
                                 // offer the way back - the button is gone as
                                 // soon as the view is at the end again, by this
                                 // button or by the user's own scroll.
-                                ui.horizontal_centered(|ui| {
-                                    if ui.button("\u{2193} end of log").clicked() {
-                                        self.log_jump = true;
-                                    }
-                                });
+                                //
+                                // `put` lays it over the bottom edge of the
+                                // list, at a fixed rect: a row laid out in the
+                                // panel would grow the panel when the button
+                                // appears, and the list's fixed height has the
+                                // sources above paying for it. Overlaid, the
+                                // window's parts keep the sizes they had, and
+                                // the button borrows a finger's width of the
+                                // last log line it covers.
+                                let put = ui.put(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(view.inner_rect.center().x, view.inner_rect.max.y - 16.0),
+                                        egui::vec2(110.0, 24.0),
+                                    ),
+                                    egui::Button::new("\u{2193} end of log"),
+                                );
+                                if put.clicked() {
+                                    self.log_jump = true;
+                                }
                             }
                         });
                     // The body is `None` exactly while the header's click has
