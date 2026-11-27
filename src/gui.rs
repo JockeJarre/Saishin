@@ -252,6 +252,10 @@ struct SelectionApp {
     /// lines moved, so the list is not cloned on every frame.
     log_lines: Vec<log::Line>,
     log_revision: u64,
+    /// The one-frame order to throw the log view to its end: the scroll area
+    /// is asked for an offset past the last line, lands on it, and re-sticks
+    /// there on the following frame.
+    log_jump: bool,
     /// The header logo, uploaded to the GPU on the first frame.
     logo: Option<egui::TextureHandle>,
     shown: bool,
@@ -1253,6 +1257,7 @@ impl SelectionApp {
             end_focused: false,
             log_lines: Vec::new(),
             log_revision: 0,
+            log_jump: false,
             logo: None,
             shown: false,
             centered_at_startup,
@@ -1322,7 +1327,8 @@ impl SelectionApp {
                         .default_open(true)
                         .show_unindented(ui, |ui| {
                             let list_height = ui.available_height();
-                            egui::ScrollArea::vertical()
+                            let mut scroll = egui::ScrollArea::vertical()
+                                .id_salt("log_scroll")
                                 .stick_to_bottom(true)
                                 .max_height(list_height)
                                 // Fill both ways: a vertical scroll area hands
@@ -1331,12 +1337,40 @@ impl SelectionApp {
                                 // line that loses its end at the window's edge;
                                 // a height that shrinks to its rows would leave
                                 // the space the divider's drag gained unused.
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for line in lines.iter() {
-                                        ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                                .auto_shrink([false, false]);
+                            if self.log_jump {
+                                // An offset past the last line lands on the
+                                // last line; a frame later the handle touches
+                                // the end and sticks, so the lines that come
+                                // after the jump follow on their own.
+                                scroll = scroll.vertical_scroll_offset(f32::MAX);
+                                self.log_jump = false;
+                            }
+                            let view = scroll.show(ui, |ui| {
+                                for line in lines.iter() {
+                                    ui.add(egui::Label::new(log_line_text(line)).selectable(true).wrap());
+                                }
+                            });
+                            // The end of the scroll, computed from the view:
+                            // the offset has reached the distance the content
+                            // exceeds the viewport by - within a line's slack,
+                            // because a wheel tick that lands on the last line
+                            // is a scroll to its end, not a miss.
+                            let past = view.content_size.y - view.inner_rect.height();
+                            let at_end = view.state.clamped_offset().y >= past - 24.0;
+                            if !at_end {
+                                // Scrolled up: the newest line is off-screen,
+                                // and a download that keeps writing is a story
+                                // the window is no longer watching. Say so, and
+                                // offer the way back - the button is gone as
+                                // soon as the view is at the end again, by this
+                                // button or by the user's own scroll.
+                                ui.horizontal_centered(|ui| {
+                                    if ui.button("\u{2193} end of log").clicked() {
+                                        self.log_jump = true;
                                     }
                                 });
+                            }
                         });
                     // The body is `None` exactly while the header's click has
                     // closed it, and the strip's one-line side takes the next
