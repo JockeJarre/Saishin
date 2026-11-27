@@ -94,14 +94,16 @@ pub struct EditableSource {
 }
 
 /// The file as the editor sees it: everything up to and including the
-/// `[general]` block is kept verbatim - comments, blank lines, all of it - and
-/// the source sections are the editable pairs. `save` writes the header back
-/// byte for byte and regenerates the sections.
+/// `[general]` block is the header - not edited, not written over - and the
+/// source sections are the editable pairs. `save` edits the file in place
+/// through `ini-preserve`, so comments, order and spacing outside the model's
+/// reach survive untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigModel {
     pub path: String,
     /// The file text up to the first source section, header comments and the
-    /// `[general]` section included. Written back as it was read.
+    /// `[general]` section included. Kept for `load_model`'s own bookkeeping;
+    /// the save path never rewrites it.
     pub header: String,
     pub sources: Vec<EditableSource>,
 }
@@ -139,8 +141,10 @@ impl EditableSource {
         match hits.first() {
             Some(&first) => {
                 self.pairs[first].1 = value.to_string();
-                // Keep the one-winner contract the loader's map has.
-                for i in hits.into_iter().rev().skip(1) {
+                // Keep the one-winner contract the loader's map has: the
+                // written one stays, the others go - from the back, so the
+                // removals cannot shift the indices still to be removed.
+                for i in hits.into_iter().skip(1).rev() {
                     self.pairs.remove(i);
                 }
             }
@@ -264,9 +268,8 @@ fn parse_model(path: &str, text: &str) -> ConfigModel {
             continue;
         }
         // A key line, kept exactly as written: no case folding, no unescaping.
-        // A bare key with no '=' is not a value the loader can reach, and a
-        // bare-key line in a source section is rarer than the editor's own
-        // hand; it is dropped with the section's comments.
+        // A bare key with no '=' never reaches the loader, so the model does
+        // not carry it; on disk the save leaves it alone with the comments.
         if let Some((key, value)) = trimmed.split_once('=') {
             if let Some(source) = current.as_mut() {
                 source.pairs.push((key.trim().to_string(), value.trim().to_string()));
@@ -301,40 +304,80 @@ fn merge_source(sources: &mut Vec<EditableSource>, added: EditableSource) {
     }
 }
 
-/// Write the model: the header byte for byte, then one section per source in
-/// list order, `key = value` as stored. The write is one step: the new text
-/// goes to a side file, the old file moves to `path.bak`, the side file takes
-/// its place - so a crash mid-write leaves one of the two whole files, never
-/// a half-written config.
+/// Write the model by editing the file it came from, through `ini-preserve`:
+/// every line the model does not speak about - comments, blank lines, key
+/// order, the spacing around `=`, a file's CRLF - stays exactly as it was.
+/// Only the lines the model changes move: a changed value is written into
+/// its own line, a key emptied is taken away, a new key joins the section's
+/// keys, a new section is appended, and a removed section's header, keys and
+/// inner comments go together (the comment above a header survives, being as
+/// likely a banner as a caption). The old file is copied to `path.bak` first,
+/// and `ini-preserve` writes to a temp file and renames, so a crash leaves
+/// one whole file, never a half-written config.
+///
+/// The loader reads section and key names case-insensitively; the file is
+/// edited with its own spellings. A key written twice in one section, or a
+/// section written twice, is a fight the loader resolves by last-wins; the
+/// save settles it physically - copies removed, one answer written - so the
+/// edit on the screen is the edit on the disk.
 pub fn save(model: &ConfigModel) -> Result<(), AppError> {
-    let mut text = String::new();
-    text.push_str(&model.header);
-    if !model.header.is_empty() && !model.header.ends_with('\n') {
-        text.push('\n');
-    }
+    let text = std::fs::read_to_string(&model.path)
+        .map_err(|ex| AppError::Config(format!("Could not read {}: {ex}", model.path)))?;
+    let mut ini = ini_preserve::Ini::parse(&text)
+        .map_err(|ex| AppError::Config(format!("{}: {ex}", model.path)))?;
+    let on_disk: Vec<String> = ini.sections().iter().map(|s| s.to_string()).collect();
+
     for source in &model.sources {
-        // One blank line between blocks - and only one: a hand-written file
-        // already left its blank line at the header's end.
-        if !text.is_empty() && !text.ends_with("\n\n") {
-            text.push('\n');
+        // The section's own spelling on disk, if it has one; a new section
+        // is spelled as named.
+        let section = on_disk
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(&source.name))
+            .cloned()
+            .unwrap_or_else(|| source.name.clone());
+        // A header written twice splits the section across the file, and
+        // `set` would answer only the first: the loader reads the last.
+        // Settle it - take every copy, and the pairs write one section.
+        if on_disk.iter().filter(|n| n.eq_ignore_ascii_case(&source.name)).count() > 1 {
+            ini.remove_section(&section);
         }
-        text.push_str(&format!("[{}]\n", source.name));
         for (key, value) in &source.pairs {
-            text.push_str(&format!("{key} = {value}\n"));
+            let written: Vec<String> = ini
+                .keys(&section)
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(k, _)| k.to_string())
+                .collect();
+            if written.len() > 1 {
+                for k in &written {
+                    while ini.remove(&section, k) {}
+                }
+            }
+            let target = written.first().cloned().unwrap_or_else(|| key.clone());
+            if value.trim().is_empty() {
+                // Silence by omission: an empty value has no line.
+                ini.remove(&section, &target);
+            } else {
+                ini.set(&section, &target, value.trim());
+            }
         }
     }
-    let path = Path::new(&model.path);
-    let side = path.with_extension("saishin-tmp");
-    std::fs::write(&side, &text)
-        .map_err(|ex| AppError::Config(format!("Could not write {}: {ex}", model.path)))?;
-    if path.exists() {
-        let bak = path.with_extension("bak");
-        // The backup is a convenience; a failed copy must not block the save.
-        let _ = std::fs::copy(path, &bak);
+
+    for name in &on_disk {
+        // `[general]` is the model's header, not one of its sources.
+        if name.eq_ignore_ascii_case(GENERAL_SECTION) {
+            continue;
+        }
+        if !model.sources.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+            ini.remove_section(name);
+        }
     }
-    std::fs::rename(&side, path)
-        .map_err(|ex| AppError::Config(format!("Could not replace {}: {ex}", model.path)))?;
-    Ok(())
+
+    let path = Path::new(&model.path);
+    let bak = path.with_extension("bak");
+    // The backup is a convenience; a failed copy must not block the save.
+    let _ = std::fs::copy(path, &bak);
+    ini.save(path).map_err(|ex| AppError::Config(format!("Could not write {}: {ex}", model.path)))
 }
 
 /// What `[general] gui` asks for: which entry point opens the window when the
@@ -860,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edited_section_keeps_untouched_keys_and_loses_only_its_comments() {
+    fn an_edited_section_keeps_every_line_the_model_does_not_touch() {
         let path = write_ini(
             "edit-keep.ini",
             "[general]\n\n[a]\ntype = github\nowner = o\nrepo = r\n; a comment\nextract_as = *.exe -> app.exe\n",
@@ -871,7 +914,59 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("extract_as = *.exe -> app.exe"));
         assert!(text.contains("keep = 3"));
-        assert!(!text.contains("; a comment"));
+        assert!(text.contains("; a comment"), "the comment above a key stays with the key");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_edit_keeps_the_file_own_spacing_and_casings() {
+        // A file that writes 'Owner=x' is a file that writes 'Owner=x':
+        // the edit answers the key the file spelled, in the style the file
+        // uses, and does not add a line beside it.
+        let path = write_ini(
+            "style.ini",
+            "[general]\n\n[a]\ntype=url\nurls=https://example.invalid\nOwner=o\nRepo=r\n",
+        );
+        let mut model = load_model(&path).expect("model");
+        model.find_mut("A").expect("section").set("urls", "https://example.other");
+        save(&model).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("urls=https://example.other"), "the file's own spelling and spacing: {text}");
+        assert_eq!(text.matches("urls").count(), 1, "the key is answered in place, not appended");
+        assert_eq!(load(&path).expect("loads").sources[0].urls[0], "https://example.other");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_key_written_twice_is_settled_to_one_answer() {
+        // The loader reads a twice-written key last-wins; an edit must not
+        // be undone by the copy nobody sees.
+        let path = write_ini(
+            "dup.ini",
+            "[general]\n\n[a]\ntype = url\nurls = https://example.invalid/a.zip\nurls = https://example.invalid/b.zip\n",
+        );
+        let mut model = load_model(&path).expect("model");
+        model.find_mut("A").expect("section").set("urls", "https://example.invalid/c.zip");
+        save(&model).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("urls").count(), 1, "one line answers: {text}");
+        assert_eq!(load(&path).expect("loads").sources[0].urls[0], "https://example.invalid/c.zip", "file now reads:\n{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_removed_source_takes_its_section_and_leaves_the_banner() {
+        let path = write_ini(
+            "drop.ini",
+            "[general]\nout_dir = ./dl\n\n; about gone\n[kept]\ntype = url\nurls = https://example.invalid/a.zip\n\n[dropped]\ntype = url\nurls = https://example.invalid/b.zip\n; inner\n",
+        );
+        let mut model = load_model(&path).expect("model");
+        assert!(model.remove("dropped"));
+        save(&model).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[dropped]") && !text.contains("; inner"), "the section and its inside go");
+        assert!(text.contains("; about gone"), "the comment above a header outlives the header");
+        assert!(text.contains("out_dir = ./dl"), "[general] is nobody's to delete");
         std::fs::remove_file(&path).ok();
     }
 

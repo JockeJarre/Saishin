@@ -1579,6 +1579,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ini-preserve"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9573aa22fd13d5b2e32ec52923903b22225efce7034098b0c46470eb6113453a"
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2890,6 +2896,7 @@ dependencies = [
  "eframe",
  "embed-resource",
  "futures-util",
+ "ini-preserve",
  "keyring",
  "png",
  "regex",
