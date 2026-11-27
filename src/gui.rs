@@ -253,9 +253,13 @@ struct SelectionApp {
     log_lines: Vec<log::Line>,
     log_revision: u64,
     /// The one-frame order to throw the log view to its end: the scroll area
-    /// is asked for an offset past the last line, lands on it, and re-sticks
-    /// there on the following frame.
+    /// is asked for an offset past the last line and lands on it.
     log_jump: bool,
+    /// Whether the log follows new lines. On from the start; the jump button
+    /// takes it off - its one click answers one catch-up, and the lines that
+    /// stream in afterwards leave the view where it landed; a user scroll
+    /// that reaches the end puts it back.
+    log_stick: bool,
     /// The header logo, uploaded to the GPU on the first frame.
     logo: Option<egui::TextureHandle>,
     shown: bool,
@@ -1258,6 +1262,7 @@ impl SelectionApp {
             log_lines: Vec::new(),
             log_revision: 0,
             log_jump: false,
+            log_stick: true,
             logo: None,
             shown: false,
             centered_at_startup,
@@ -1329,7 +1334,7 @@ impl SelectionApp {
                             let list_height = ui.available_height();
                             let mut scroll = egui::ScrollArea::vertical()
                                 .id_salt("log_scroll")
-                                .stick_to_bottom(true)
+                                .stick_to_bottom(self.log_stick)
                                 .max_height(list_height)
                                 // Fill both ways: a vertical scroll area hands
                                 // its content an unbounded width by default, and
@@ -1340,11 +1345,11 @@ impl SelectionApp {
                                 .auto_shrink([false, false]);
                             if self.log_jump {
                                 // An offset past the last line lands on the
-                                // last line; a frame later the handle touches
-                                // the end and sticks, so the lines that come
-                                // after the jump follow on their own.
+                                // last line, and nowhere further: the follow
+                                // rides with the jump's one click.
                                 scroll = scroll.vertical_scroll_offset(f32::MAX);
                                 self.log_jump = false;
+                                self.log_stick = false;
                             }
                             let view = scroll.show(ui, |ui| {
                                 for line in lines.iter() {
@@ -1358,6 +1363,11 @@ impl SelectionApp {
                             // is a scroll to its end, not a miss.
                             let past = view.content_size.y - view.inner_rect.height();
                             let at_end = view.state.clamped_offset().y >= past - 24.0;
+                            // A view the user brought to the end themselves is
+                            // a view that wants what comes next.
+                            if at_end {
+                                self.log_stick = true;
+                            }
                             if !at_end {
                                 // Scrolled up: the newest line is off-screen,
                                 // and a download that keeps writing is a story
