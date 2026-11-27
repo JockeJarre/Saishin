@@ -255,10 +255,10 @@ struct SelectionApp {
     /// The one-frame order to throw the log view to its end: the scroll area
     /// is asked for an offset past the last line and lands on it.
     log_jump: bool,
-    /// Whether the log follows new lines. On from the start; the jump button
-    /// takes it off - its one click answers one catch-up, and the lines that
-    /// stream in afterwards leave the view where it landed; a user scroll
-    /// that reaches the end puts it back.
+    /// Whether the log follows new lines. On from the start - and on after
+    /// the jump button, whose click means "catch up and stay"; the follow is
+    /// only ever off while the view sits away from the end, reading the lines
+    /// the run has already written.
     log_stick: bool,
     /// The header logo, uploaded to the GPU on the first frame.
     logo: Option<egui::TextureHandle>,
@@ -1345,11 +1345,13 @@ impl SelectionApp {
                                 .auto_shrink([false, false]);
                             if self.log_jump {
                                 // An offset past the last line lands on the
-                                // last line, and nowhere further: the follow
-                                // rides with the jump's one click.
+                                // last line, and the follow resumes with it:
+                                // the click says "catch up, and stay" - the
+                                // lines that stream in after the jump pull
+                                // the view along as they always did.
                                 scroll = scroll.vertical_scroll_offset(f32::MAX);
                                 self.log_jump = false;
-                                self.log_stick = false;
+                                self.log_stick = true;
                             }
                             let view = scroll.show(ui, |ui| {
                                 for line in lines.iter() {
